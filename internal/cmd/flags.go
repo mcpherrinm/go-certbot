@@ -172,8 +172,11 @@ func registerFlags(fs *pflag.FlagSet, c *config.Config) {
 		"no-self-upgrade",
 		"no-bootstrap",
 		"no-permissions-check",
-		"dns-route53-propagation-seconds",
 		"manual-public-ip-logging-ok",
+		// `dns-route53-propagation-seconds` is in Certbot's
+		// DEPRECATED_OPTIONS list but is also the real flag name we use
+		// for the per-plugin propagation timeout, so we don't register
+		// it as deprecated to avoid a pflag duplicate-flag panic.
 	})
 }
 
