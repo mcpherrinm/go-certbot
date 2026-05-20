@@ -28,6 +28,7 @@ import (
 	dnsrfc2136 "github.com/letsencrypt/go-certbot/internal/plugins/dns/rfc2136"
 	dnsroute53 "github.com/letsencrypt/go-certbot/internal/plugins/dns/route53"
 	dnssakuracloud "github.com/letsencrypt/go-certbot/internal/plugins/dns/sakuracloud"
+	"github.com/letsencrypt/go-certbot/internal/plugins/apache"
 	"github.com/letsencrypt/go-certbot/internal/plugins/manual"
 	"github.com/letsencrypt/go-certbot/internal/plugins/nginx"
 	"github.com/letsencrypt/go-certbot/internal/plugins/standalone"
@@ -41,7 +42,7 @@ func Main(args []string) int {
 	// `--version` always prints and exits.
 	for _, a := range args {
 		if a == "--version" {
-			fmt.Println("go-certbot 0.5.0-phase5")
+			fmt.Println("go-certbot 0.6.0-phase6")
 			return 0
 		}
 	}
@@ -133,6 +134,9 @@ func Main(args []string) int {
 	nginxPlugin := nginx.New()
 	reg.RegisterAuthenticator(nginxPlugin)
 	reg.RegisterInstaller(nginxPlugin)
+	apachePlugin := apache.New()
+	reg.RegisterAuthenticator(apachePlugin)
+	reg.RegisterInstaller(apachePlugin)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
