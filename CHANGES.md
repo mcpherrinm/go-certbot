@@ -5,7 +5,33 @@ This file tracks every behavior in **go-certbot** that differs from upstream
 drop-in compatibility, so this file should stay short. Anything not listed
 here should behave identically to Certbot.
 
-## Phase 2 (current)
+## Phase 3 (current)
+
+### Implemented
+
+- `certificates` verb — iterates `renewal/*.conf`, prints
+  `Certificate Name / Serial Number / Key Type / Identifiers /
+  Expiry Date / Certificate Path / Private Key Path` in Certbot's
+  format. Status is `VALID: N days` / `VALID: N hour(s)` /
+  `INVALID: EXPIRED`. Filters: `--cert-name`, `-d`, `--ip-address`.
+- `delete` verb — `--cert-name` removes `live/<name>/`,
+  `archive/<name>/`, and `renewal/<name>.conf`. The renewal conf is
+  renamed to `.deleted` first so a crash leaves a clear marker
+  rather than half-baked state.
+- `revoke` verb — `--cert-name` or `--cert-path`, optional
+  `--reason {unspecified,keycompromise,affiliationchanged,
+  superseded,cessationofoperation}`, optional `--delete-after-revoke`
+  to also drop on-disk files. Backed by lego's `RevokeWithReason`.
+- Account verbs:
+  - `register` — explicit account creation (no-op if one already
+    exists for the server).
+  - `show_account` — prints id, ACME URL, contacts, creation
+    host/date.
+  - `update_account` — PATCHes the contact email at the ACME server.
+  - `unregister` — calls `DeleteRegistration` to deactivate, then
+    removes the local account directory.
+
+## Phase 2
 
 ### Implemented
 
@@ -61,7 +87,6 @@ here should behave identically to Certbot.
 | Verb | Planned phase |
 | --- | --- |
 | `run` (the default) | Phase 1 final (after installers) |
-| `certificates`, `delete`, `revoke`, `register`, `unregister`, `update_account`, `show_account` | Phase 3 |
 | `install`, `enhance`, `rollback` | Phase 5 (nginx) / Phase 6 (apache) |
 
 Plugins not yet implemented (using them returns a clear error):

@@ -15,14 +15,13 @@ rewritten in Go on top of [lego v5](https://github.com/go-acme/lego).
 
 ## Status
 
-**Phase 2.** Building on Phase 1, this version adds the `renew` and
-`reconfigure` verbs, `webroot` and `manual` authenticators, the full
-hooks framework (pre / post / deploy commands and
-`renewal-hooks/{pre,post,deploy}/` directories), and EFF email
-subscription. Other verbs (`certificates`, `delete`, `revoke`,
-account management) and the nginx/apache/DNS plugins return a clear
-"planned for Phase N" error. See [`CHANGES.md`](CHANGES.md) for the
-rollout plan.
+**Phase 3.** Builds on Phase 2 with the certificate-management verbs
+(`certificates`, `delete`, `revoke`) and the account-management verbs
+(`register`, `show_account`, `update_account`, `unregister`). What
+remains: DNS plugins (Phase 4), the nginx installer (Phase 5), the
+apache installer (Phase 6), and the default `run` verb that ties
+authenticator + installer together. See [`CHANGES.md`](CHANGES.md) for
+the rollout plan.
 
 The upstream Certbot source tree is vendored as a git submodule under
 `reference/certbot/` for cross-reference. (We avoid the Go-reserved

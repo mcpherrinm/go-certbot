@@ -65,6 +65,9 @@ type Config struct {
 	NewKey             bool
 	AllowSubsetOfNames bool
 	CSR                string
+	CertPath           string // existing fullchain PEM, e.g. for --revoke
+	Reason             string // revocation reason word
+	DeleteAfterRevoke  bool
 
 	// Plugin selection
 	Authenticator string

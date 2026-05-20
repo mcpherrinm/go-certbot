@@ -18,34 +18,6 @@ func Run(_ context.Context, _ *config.Config, _ *plugins.Registry) error {
 	return notImplemented("run", "Phase 1 final (requires installer)")
 }
 
-func Certificates(_ context.Context, _ *config.Config, _ *plugins.Registry) error {
-	return notImplemented("certificates", "Phase 3")
-}
-
-func Delete(_ context.Context, _ *config.Config, _ *plugins.Registry) error {
-	return notImplemented("delete", "Phase 3")
-}
-
-func Revoke(_ context.Context, _ *config.Config, _ *plugins.Registry) error {
-	return notImplemented("revoke", "Phase 3")
-}
-
-func Register(_ context.Context, _ *config.Config, _ *plugins.Registry) error {
-	return notImplemented("register", "Phase 3")
-}
-
-func Unregister(_ context.Context, _ *config.Config, _ *plugins.Registry) error {
-	return notImplemented("unregister", "Phase 3")
-}
-
-func UpdateAccount(_ context.Context, _ *config.Config, _ *plugins.Registry) error {
-	return notImplemented("update_account", "Phase 3")
-}
-
-func ShowAccount(_ context.Context, _ *config.Config, _ *plugins.Registry) error {
-	return notImplemented("show_account", "Phase 3")
-}
-
 func Install(_ context.Context, _ *config.Config, _ *plugins.Registry) error {
 	return notImplemented("install", "Phase 5 (nginx) / Phase 6 (apache)")
 }
