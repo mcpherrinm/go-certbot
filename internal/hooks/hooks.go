@@ -85,14 +85,32 @@ func RunCapture(ctx context.Context, command string, extraEnv []string) (string,
 }
 
 // RunDir executes every executable file under dir, in lexicographic order.
-// Missing dir is not an error.
-func RunDir(ctx context.Context, dir string, extraEnv []string) error {
+// Missing dir is not an error. dedupAgainst is the flag-hook command (if
+// any) — if a directory hook resolves to the same path (e.g. via symlink)
+// it's skipped so users who symlink their --deploy-hook into
+// renewal-hooks/deploy/ don't see it run twice.
+func RunDir(ctx context.Context, dir string, extraEnv []string, dedupAgainst ...string) error {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil
 		}
 		return fmt.Errorf("hooks: read %s: %w", dir, err)
+	}
+	skip := map[string]bool{}
+	for _, h := range dedupAgainst {
+		if h == "" {
+			continue
+		}
+		// dedup on absolute path of the command's first word.
+		first := strings.Fields(h)[0]
+		if abs, err := filepath.Abs(first); err == nil {
+			if real, err := filepath.EvalSymlinks(abs); err == nil {
+				skip[real] = true
+			} else {
+				skip[abs] = true
+			}
+		}
 	}
 	names := make([]string, 0, len(entries))
 	for _, e := range entries {
@@ -110,6 +128,16 @@ func RunDir(ctx context.Context, dir string, extraEnv []string) error {
 		}
 		if !isExecutable(info) {
 			slog.Warn("skipping non-executable hook", "path", full)
+			continue
+		}
+		// Check dedup match against the resolved target (the entry may be a
+		// symlink into ../../<somewhere-else>/<hook>).
+		resolved := full
+		if r, err := filepath.EvalSymlinks(full); err == nil {
+			resolved = r
+		}
+		if skip[resolved] {
+			slog.Info("skipping directory hook duplicating flag hook", "path", full)
 			continue
 		}
 		slog.Info("running hook", "path", full)

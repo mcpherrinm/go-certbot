@@ -1,15 +1,14 @@
 package verbs
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"github.com/letsencrypt/go-certbot/internal/config"
+	"github.com/letsencrypt/go-certbot/internal/display"
 	"github.com/letsencrypt/go-certbot/internal/plugins"
 )
 
@@ -33,7 +32,7 @@ func Delete(_ context.Context, cfg *config.Config, _ *plugins.Registry) error {
 				"  archive/%s/     (all historical versions of the cert)\n"+
 				"  renewal/%s.conf (configuration; auto-renewal stops)\n",
 			cfg.CertName, cfg.CertName, cfg.CertName, cfg.CertName)
-		if !confirmYesNo("Continue?") {
+		if !display.YesNo("Continue?") {
 			fmt.Println("delete: aborted by user.")
 			return nil
 		}
@@ -69,16 +68,4 @@ func Delete(_ context.Context, cfg *config.Config, _ *plugins.Registry) error {
 	}
 	fmt.Printf("Deleted all files relating to certificate %s.\n", cfg.CertName)
 	return nil
-}
-
-// confirmYesNo prompts on stderr and reads a y/n answer from stdin.
-// Returns false on any non-"y" reply (including EOF).
-func confirmYesNo(prompt string) bool {
-	fmt.Fprintf(os.Stderr, "%s [y/N]: ", prompt)
-	scanner := bufio.NewScanner(os.Stdin)
-	if !scanner.Scan() {
-		return false
-	}
-	ans := strings.ToLower(strings.TrimSpace(scanner.Text()))
-	return ans == "y" || ans == "yes"
 }

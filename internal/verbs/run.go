@@ -48,12 +48,12 @@ func Run(ctx context.Context, cfg *config.Config, reg *plugins.Registry) error {
 	if err := hooks.Run(ctx, cfg.PreHook, nil); err != nil {
 		return err
 	}
-	if err := hooks.RunDir(ctx, cfg.HookDir("pre"), nil); err != nil {
+	if err := hooks.RunDir(ctx, cfg.HookDir("pre"), nil, cfg.PreHook); err != nil {
 		return err
 	}
 	defer func() {
 		_ = hooks.Run(ctx, cfg.PostHook, nil)
-		_ = hooks.RunDir(ctx, cfg.HookDir("post"), nil)
+		_ = hooks.RunDir(ctx, cfg.HookDir("post"), nil, cfg.PostHook)
 	}()
 
 	accountsDir, err := cfg.AccountsDir()
@@ -103,7 +103,7 @@ func Run(ctx context.Context, cfg *config.Config, reg *plugins.Registry) error {
 	if err := hooks.Run(ctx, cfg.DeployHook, env); err != nil {
 		slog.Warn("deploy_hook failed", "err", err)
 	}
-	if err := hooks.RunDir(ctx, cfg.HookDir("deploy"), env); err != nil {
+	if err := hooks.RunDir(ctx, cfg.HookDir("deploy"), env, cfg.DeployHook); err != nil {
 		slog.Warn("deploy-hook directory failed", "err", err)
 	}
 

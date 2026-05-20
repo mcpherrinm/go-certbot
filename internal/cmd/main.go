@@ -42,7 +42,7 @@ func Main(args []string) int {
 	// `--version` always prints and exits.
 	for _, a := range args {
 		if a == "--version" {
-			fmt.Println("go-certbot 1.0.0")
+			fmt.Println("go-certbot 1.1.0")
 			return 0
 		}
 	}
@@ -74,8 +74,9 @@ func Main(args []string) int {
 	registerFlags(fs, cfg)
 
 	// pflag returns ErrHelp on --help/-h; we catch and reprint our help.
-	var configPath string
-	fs.StringVar(&configPath, "config", "", "Path to an additional cli.ini.")
+	// `--config` and `-c` are accepted, can repeat (matches Certbot).
+	var configPaths []string
+	fs.StringArrayVarP(&configPaths, "config", "c", nil, "Path to an additional cli.ini (repeatable).")
 
 	if err := fs.Parse(rest); err != nil {
 		if errors.Is(err, pflag.ErrHelp) {
@@ -95,8 +96,8 @@ func Main(args []string) int {
 			return 2
 		}
 	}
-	if configPath != "" {
-		if err := loadIni(configPath, fs, cfg); err != nil {
+	for _, p := range configPaths {
+		if err := loadIni(p, fs, cfg); err != nil {
 			fmt.Fprintln(os.Stderr, "go-certbot:", err)
 			return 2
 		}
