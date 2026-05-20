@@ -15,6 +15,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/go-acme/lego/v5/challenge"
 	"github.com/go-acme/lego/v5/providers/dns/dnsupdate"
@@ -46,11 +47,27 @@ func (a *Authenticator) Prepare(_ context.Context, cfg *config.Config, _ []strin
 	_ = os.Setenv("DNSUPDATE_NAMESERVER", server)
 	_ = cred.SetEnv("name", "DNSUPDATE_TSIG_KEY")
 	_ = cred.SetEnv("secret", "DNSUPDATE_TSIG_SECRET")
-	cred.SetEnvOpt("algorithm", "DNSUPDATE_TSIG_ALGORITHM")
+	// Certbot accepts algorithm names like "HMAC-SHA512" (uppercase, no dot);
+	// lego's dnsupdate (miekg/dns under the hood) expects "hmac-sha512."
+	// (lowercase, trailing dot). Translate or every RFC 2136 user breaks.
+	if alg := cred.Get("algorithm"); alg != "" {
+		_ = os.Setenv("DNSUPDATE_TSIG_ALGORITHM", normalizeTSIGAlg(alg))
+	}
 	common.PropagationEnv("DNSUPDATE_", common.PropagationFor(cfg, "rfc2136"))
 	p, err := dnsupdate.NewDNSProvider()
 	if err != nil {
 		return 0, nil, fmt.Errorf("rfc2136: %w", err)
 	}
 	return common.PluginKind, p, nil
+}
+
+// normalizeTSIGAlg converts a Certbot-style TSIG algorithm name to lego's
+// expected miekg/dns form (lowercase + trailing dot). "hmac-sha512." is
+// passed through as-is.
+func normalizeTSIGAlg(name string) string {
+	s := strings.ToLower(strings.TrimSpace(name))
+	if !strings.HasSuffix(s, ".") {
+		s += "."
+	}
+	return s
 }

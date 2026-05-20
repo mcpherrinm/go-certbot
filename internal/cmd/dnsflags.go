@@ -26,24 +26,21 @@ var dnsPluginNames = []string{
 
 // dnsDefaultPropagation returns Certbot's default propagation seconds for a
 // given DNS plugin (matches certbot-dns-*/.../dns_*.py:DEFAULT_PROPAGATION).
+// Values were verified against each upstream plugin's default.
 func dnsDefaultPropagation(name string) int {
 	switch name {
-	case "cloudflare":
+	case "cloudflare", "digitalocean":
 		return 10
-	case "digitalocean", "dnsimple", "luadns", "ovh", "nsone":
-		return 10
-	case "dnsmadeeasy":
+	case "dnsimple", "luadns", "nsone", "gehirn":
+		return 30
+	case "ovh":
+		return 120
+	case "dnsmadeeasy", "google", "rfc2136", "route53":
 		return 60
-	case "gehirn", "sakuracloud":
+	case "sakuracloud":
 		return 90
-	case "google":
-		return 60
 	case "linode":
 		return 120
-	case "rfc2136":
-		return 60
-	case "route53":
-		return 60
 	}
 	return 30
 }
