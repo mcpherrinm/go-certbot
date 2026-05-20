@@ -41,7 +41,9 @@ func (p *Plugin) Enhance(ctx context.Context, cfg *config.Config, domains []stri
 			case plugins.EnhanceHSTS:
 				addHSTS(srv)
 			case plugins.EnhanceUIR:
-				addUIR(srv)
+				// UIR is apache-only in Certbot. Accept the flag (so cli.ini
+				// from a mixed setup keeps parsing) but no-op here, matching
+				// Certbot's behavior when --uir is passed without --apache.
 			case plugins.EnhanceStaple:
 				addStaple(srv)
 			default:
@@ -87,9 +89,54 @@ func upsertAddHeader(srv *parser.Block, name, valueArgs string) {
 	})
 }
 
+// addStaple enables OCSP stapling. nginx requires ssl_trusted_certificate
+// to point at the issuer chain when ssl_stapling_verify is on (without it,
+// nginx refuses to staple). The chain path is derived from the per-server
+// ssl_certificate directive: replace fullchain.pem → chain.pem.
 func addStaple(srv *parser.Block) {
 	upsertDirective(srv, "ssl_stapling", "on")
 	upsertDirective(srv, "ssl_stapling_verify", "on")
+	chainPath := deriveChainPath(srv)
+	if chainPath != "" {
+		upsertDirective(srv, "ssl_trusted_certificate", chainPath)
+	}
+}
+
+// deriveChainPath finds the server's ssl_certificate directive and returns
+// the matching chain path (with "fullchain" → "chain"). Returns "" if no
+// ssl_certificate is set on this server.
+func deriveChainPath(srv *parser.Block) string {
+	for _, n := range srv.Body {
+		d, ok := n.(*parser.Directive)
+		if !ok || d.Name != "ssl_certificate" || len(d.Args) == 0 {
+			continue
+		}
+		v := d.Args[0]
+		// Strip outer quotes if present.
+		if len(v) >= 2 && (v[0] == '"' && v[len(v)-1] == '"' || v[0] == '\'' && v[len(v)-1] == '\'') {
+			v = v[1 : len(v)-1]
+		}
+		// fullchain.pem → chain.pem
+		if i := lastIndexByte(v, '/'); i >= 0 {
+			base := v[i+1:]
+			if base == "fullchain.pem" {
+				return v[:i+1] + "chain.pem"
+			}
+		} else if v == "fullchain.pem" {
+			return "chain.pem"
+		}
+		return v
+	}
+	return ""
+}
+
+func lastIndexByte(s string, b byte) int {
+	for i := len(s) - 1; i >= 0; i-- {
+		if s[i] == b {
+			return i
+		}
+	}
+	return -1
 }
 
 // upsertDirective replaces the named directive's args or appends new.

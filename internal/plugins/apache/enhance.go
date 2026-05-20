@@ -3,7 +3,6 @@ package apache
 import (
 	"context"
 	"fmt"
-	"os"
 	"strings"
 
 	"github.com/letsencrypt/go-certbot/internal/config"
@@ -12,78 +11,119 @@ import (
 )
 
 // Enhance applies HSTS / OCSP-stapling / upgrade-insecure-requests to every
-// matching :443 <VirtualHost>. Idempotent.
+// matching :443 <VirtualHost>. Idempotent. Header directives are wrapped in
+// <IfModule mod_headers.c> so configtest doesn't fail when mod_headers isn't
+// loaded; SSLStaplingCache is written at the global scope (Apache requires
+// it server-wide, not per-vhost).
 func (p *Plugin) Enhance(ctx context.Context, cfg *config.Config, domains []string, enhancements []string) error {
 	configPath := apacheConfigPath(cfg)
-	srcBytes, err := os.ReadFile(configPath)
+	files, err := loadAll(configPath)
 	if err != nil {
-		return fmt.Errorf("apache: %s: %w", configPath, err)
+		return err
 	}
-	root, err := parser.Parse(string(srcBytes))
-	if err != nil {
-		return fmt.Errorf("apache: parse %s: %w", configPath, err)
-	}
-
-	matched := findMatchingVHosts(root, domains, "443")
-	if len(matched) == 0 {
+	hits := findMatchingVHostsAcrossFiles(files, domains, "443")
+	if len(hits) == 0 {
 		return fmt.Errorf("apache: no <VirtualHost *:443> matched %v; install a cert first", domains)
 	}
 
-	for _, sec := range matched {
+	needStaple := false
+	for _, h := range hits {
 		for _, e := range enhancements {
 			switch e {
 			case plugins.EnhanceHSTS:
-				addHSTS(sec)
+				addHSTS(h.Sec)
 			case plugins.EnhanceUIR:
-				addUIR(sec)
+				addUIR(h.Sec)
 			case plugins.EnhanceStaple:
-				addStaple(sec)
+				addPerVHostStaple(h.Sec)
+				needStaple = true
 			default:
 				return fmt.Errorf("apache: unknown enhancement %q", e)
 			}
 		}
 	}
-	if err := os.WriteFile(configPath, []byte(root.String()), 0o644); err != nil {
-		return fmt.Errorf("apache: write %s: %w", configPath, err)
+	if needStaple {
+		// Apache requires SSLStaplingCache at server scope. Insert it into
+		// the root file at the top level (idempotent — skip if present).
+		ensureGlobalStaplingCache(files[0])
+	}
+	if err := writeAllFiles(files); err != nil {
+		return err
 	}
 	return testAndReload(ctx, cfg)
 }
 
-// addHSTS adds `Header always set Strict-Transport-Security "max-age=31536000"`.
-// Idempotent: replaces an existing line.
+// addHSTS adds `Header always set Strict-Transport-Security "max-age=31536000"`
+// wrapped in an `<IfModule mod_headers.c>` block. Idempotent.
 func addHSTS(sec *parser.Section) {
-	upsertHeader(sec, "always", "set", "Strict-Transport-Security", `"max-age=31536000"`)
+	addHeaderInIfModule(sec, "Strict-Transport-Security", `"max-age=31536000"`)
 }
 
 func addUIR(sec *parser.Section) {
-	upsertHeader(sec, "always", "set", "Content-Security-Policy", `"upgrade-insecure-requests"`)
+	addHeaderInIfModule(sec, "Content-Security-Policy", `"upgrade-insecure-requests"`)
 }
 
-// upsertHeader replaces a matching `Header [always] set <name> ...` directive
-// or appends a new one. The match is on (mode, op, name).
-func upsertHeader(sec *parser.Section, mode, op, name string, value string) {
-	for _, n := range sec.Body {
-		d, ok := n.(*parser.Directive)
-		if !ok || !strings.EqualFold(d.Name, "Header") {
-			continue
-		}
-		if matchHeader(d.Args, mode, op, name) {
-			d.Args = []string{mode, op, name, value}
-			return
-		}
+// addHeaderInIfModule emits:
+//
+//	<IfModule mod_headers.c>
+//	  Header always set <name> <value>
+//	</IfModule>
+//
+// Idempotent: if the same wrapping already exists with the same header name,
+// updates the value in place.
+func addHeaderInIfModule(sec *parser.Section, name, value string) {
+	if updateExistingHeader(sec, name, value) {
+		return
 	}
 	indent := childIndent(sec)
-	sec.Body = append(sec.Body, &parser.Directive{
-		Indent:  indent,
-		Name:    "Header",
-		Args:    []string{mode, op, name, value},
-		Newline: "\n",
-	})
+	wrapper := &parser.Section{
+		OpenIndent:  indent,
+		Name:        "IfModule",
+		Args:        []string{"mod_headers.c"},
+		OpenNewline: "\n",
+		Body: []parser.Node{
+			&parser.Directive{
+				Indent:  indent + "    ",
+				Name:    "Header",
+				Args:    []string{"always", "set", name, value},
+				Newline: "\n",
+			},
+		},
+		CloseIndent:  indent,
+		CloseNewline: "\n",
+	}
+	sec.Body = append(sec.Body, wrapper)
+}
+
+// updateExistingHeader walks the vhost body looking for an existing
+// IfModule-wrapped or bare Header directive matching the requested name and
+// updates its value. Returns true if found.
+func updateExistingHeader(sec *parser.Section, name, value string) bool {
+	for _, n := range sec.Body {
+		switch nn := n.(type) {
+		case *parser.Directive:
+			if strings.EqualFold(nn.Name, "Header") && matchHeader(nn.Args, "always", "set", name) {
+				nn.Args = []string{"always", "set", name, value}
+				return true
+			}
+		case *parser.Section:
+			if strings.EqualFold(nn.Name, "IfModule") && len(nn.Args) > 0 && strings.Contains(nn.Args[0], "mod_headers") {
+				for _, c := range nn.Body {
+					if d, ok := c.(*parser.Directive); ok &&
+						strings.EqualFold(d.Name, "Header") &&
+						matchHeader(d.Args, "always", "set", name) {
+						d.Args = []string{"always", "set", name, value}
+						return true
+					}
+				}
+			}
+		}
+	}
+	return false
 }
 
 // matchHeader returns true if args look like `[mode] op name ...` matching
-// the requested triple. mode is optional (e.g. "always") — if present in
-// args it must equal the requested mode.
+// the requested triple.
 func matchHeader(args []string, mode, op, name string) bool {
 	if len(args) < 2 {
 		return false
@@ -92,7 +132,6 @@ func matchHeader(args []string, mode, op, name string) bool {
 	if strings.EqualFold(args[i], mode) {
 		i++
 	} else if mode != "" {
-		// We want `always` but args don't have it: not a match.
 		return false
 	}
 	if i >= len(args) || !strings.EqualFold(args[i], op) {
@@ -105,14 +144,45 @@ func matchHeader(args []string, mode, op, name string) bool {
 	return strings.EqualFold(args[i], name)
 }
 
-// addStaple inserts OCSP-stapling directives. Apache requires both the
-// per-vhost SSLUseStapling on and a server-scope SSLStaplingCache somewhere
-// — for the simple in-vhost case we'll add both inside the vhost (Apache
-// permits it inside an IfModule wrapper but a single vhost-level entry is
-// accepted and matches what mod_ssl examples show).
-func addStaple(sec *parser.Section) {
+// addPerVHostStaple sets per-vhost `SSLUseStapling on` only. SSLStaplingCache
+// must live at the global scope.
+func addPerVHostStaple(sec *parser.Section) {
 	upsertDirective(sec, "SSLUseStapling", "on")
-	upsertDirective(sec, "SSLStaplingCache", `"shmcb:/var/run/ocsp(128000)"`)
+}
+
+// ensureGlobalStaplingCache adds `SSLStaplingCache "shmcb:..."` at the top
+// level of the root config file, wrapped in <IfModule mod_ssl.c>. Idempotent.
+func ensureGlobalStaplingCache(root *parsedFile) {
+	for _, n := range root.AST.Nodes {
+		switch nn := n.(type) {
+		case *parser.Directive:
+			if strings.EqualFold(nn.Name, "SSLStaplingCache") {
+				return
+			}
+		case *parser.Section:
+			if strings.EqualFold(nn.Name, "IfModule") && len(nn.Args) > 0 && strings.Contains(nn.Args[0], "mod_ssl") {
+				for _, c := range nn.Body {
+					if d, ok := c.(*parser.Directive); ok && strings.EqualFold(d.Name, "SSLStaplingCache") {
+						return
+					}
+				}
+			}
+		}
+	}
+	root.AST.Nodes = append(root.AST.Nodes, &parser.Section{
+		Name:        "IfModule",
+		Args:        []string{"mod_ssl.c"},
+		OpenNewline: "\n",
+		Body: []parser.Node{
+			&parser.Directive{
+				Indent:  "    ",
+				Name:    "SSLStaplingCache",
+				Args:    []string{`"shmcb:/var/run/apache2/stapling_cache(128000)"`},
+				Newline: "\n",
+			},
+		},
+		CloseNewline: "\n",
+	})
 }
 
 func upsertDirective(sec *parser.Section, name string, args ...string) {

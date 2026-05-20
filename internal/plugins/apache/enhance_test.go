@@ -32,12 +32,15 @@ func TestApacheStaple(t *testing.T) {
 `
 	cfg, _ := parser.Parse(src)
 	sec := cfg.Nodes[0].(*parser.Section)
-	addStaple(sec)
+	addPerVHostStaple(sec)
 	out := cfg.String()
-	for _, want := range []string{"SSLUseStapling on", "SSLStaplingCache"} {
-		if !strings.Contains(out, want) {
-			t.Errorf("missing %q:\n%s", want, out)
-		}
+	if !strings.Contains(out, "SSLUseStapling on") {
+		t.Errorf("missing SSLUseStapling:\n%s", out)
+	}
+	// SSLStaplingCache is now written at server scope (not per-vhost); we
+	// verify the per-vhost output is just SSLUseStapling.
+	if strings.Contains(out, "SSLStaplingCache") {
+		t.Errorf("SSLStaplingCache should be global-scope, not per-vhost:\n%s", out)
 	}
 }
 
