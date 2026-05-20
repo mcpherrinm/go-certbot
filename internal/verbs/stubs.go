@@ -14,14 +14,6 @@ func notImplemented(verb, phase string) error {
 	return fmt.Errorf("%s: not implemented in Phase 1; planned for %s", verb, phase)
 }
 
-func Install(_ context.Context, _ *config.Config, _ *plugins.Registry) error {
-	return notImplemented("install", "Phase 5 (nginx) / Phase 6 (apache)")
-}
-
-func Enhance(_ context.Context, _ *config.Config, _ *plugins.Registry) error {
-	return notImplemented("enhance", "Phase 5 (nginx) / Phase 6 (apache)")
-}
-
 func Rollback(_ context.Context, _ *config.Config, _ *plugins.Registry) error {
 	return notImplemented("rollback", "Phase 5 (nginx) / Phase 6 (apache)")
 }

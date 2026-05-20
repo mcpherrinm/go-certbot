@@ -9,8 +9,10 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"runtime"
+	"strings"
 	"time"
 
 	"github.com/go-acme/lego/v5/acme"
@@ -26,7 +28,7 @@ import (
 )
 
 // version is the go-certbot version string; used in the User-Agent.
-const version = "0.6.0-phase6"
+const version = "0.7.0-phase7"
 
 // Client bundles a lego Client with the loaded account.
 type Client struct {
@@ -132,8 +134,17 @@ func (c *Client) Obtain(ctx context.Context, auth plugins.Authenticator, domains
 	if err != nil {
 		return nil, err
 	}
+	identifiers := append([]string(nil), domains...)
+	// IP-address SANs (--ip-address) are added to the identifier list; lego
+	// auto-detects IP literals via net.ParseIP and switches Type to "ip".
+	for _, ip := range c.cfg.IPAddresses {
+		if net.ParseIP(ip) == nil {
+			return nil, fmt.Errorf("client: --ip-address %q is not a valid IP literal", ip)
+		}
+		identifiers = append(identifiers, ip)
+	}
 	req := certificate.ObtainRequest{
-		Domains:        domains,
+		Domains:        identifiers,
 		Bundle:         true,
 		MustStaple:     c.cfg.MustStaple,
 		PreferredChain: c.cfg.PreferredChain,
@@ -166,6 +177,21 @@ func (c *Client) Obtain(ctx context.Context, auth plugins.Authenticator, domains
 func (c *Client) RevokeWithReason(ctx context.Context, certPEM []byte, reason uint) error {
 	r := reason // lego wants *uint, distinguish unspecified from 0
 	return c.lego.Certificate.RevokeWithReason(ctx, certPEM, &r)
+}
+
+// RenewalInfo queries the ACME server's RFC 9773 renewalInfo endpoint for the
+// given leaf cert. Returns (nil, nil) if the server doesn't support ARI.
+func (c *Client) RenewalInfo(ctx context.Context, leaf *x509.Certificate) (*certificate.RenewalInfo, error) {
+	info, err := c.lego.Certificate.GetRenewalInfo(ctx, leaf)
+	if err != nil {
+		// Treat unsupported / 404 as "no ARI" rather than an error so renew
+		// falls back to renew_before_expiry.
+		if strings.Contains(err.Error(), "404") || strings.Contains(err.Error(), "not found") {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return info, nil
 }
 
 // UpdateAccount changes the account's contact email at the ACME server.

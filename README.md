@@ -15,17 +15,16 @@ rewritten in Go on top of [lego v5](https://github.com/go-acme/lego).
 
 ## Status
 
-**Phase 6.** Builds on Phase 5 with an **apache plugin** (acting as
-both authenticator and installer) and a hand-rolled Apache config
-parser (`internal/plugins/apache/parser/`). The plugin locates
-`<VirtualHost>` blocks by `ServerName` / `ServerAlias`, writes
-`SSLEngine` / `SSLCertificateFile` / `SSLCertificateKeyFile` (cloning
-the `:80` vhost as a new `:443` vhost when no `:443` match exists),
-then `apachectl configtest` + `apachectl graceful`. For http-01 it
-injects a temporary `Alias` + `<Directory>` block. What remains: the
-security-enhancements pass — HSTS, OCSP stapling, must-staple — plus
-the `enhance` verb (Phase 7). See [`CHANGES.md`](CHANGES.md) for the
-documented scope limits and the rollout plan.
+**Phase 7.** Builds on Phase 6 with the **`enhance` verb** (HSTS,
+upgrade-insecure-requests, OCSP stapling — implemented for both nginx
+and apache via a new `Enhancer` interface), the **`install` verb**
+(install an existing cert into a web server without re-issuing),
+**`--ip-address` SAN support** (lego v5 auto-detects IP literals in
+the identifier list), and **ACME Renewal Info (RFC 9773)** integration
+into `renew` so the ACME server's suggested renewal window is
+respected when supported. Only `rollback` remains stubbed (Phase 8,
+which also brings the comprehensive Pebble-driven integration
+harness). See [`CHANGES.md`](CHANGES.md) for the rollout plan.
 
 The upstream Certbot source tree is vendored as a git submodule under
 `reference/certbot/` for cross-reference. (We avoid the Go-reserved
