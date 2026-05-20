@@ -124,10 +124,11 @@ func Write(configDir, certName string, fullchainPEM, chainPEM, privkeyPEM []byte
 		chainPEM = rest
 	}
 
-	dirMode := os.FileMode(0o755)
-	if opts.StrictPermissions {
-		dirMode = 0o700
-	}
+	// Certbot's storage.RenewableCert.new_lineage hardcodes 0o700 for the
+	// live/, archive/, and renewal/ tree (storage.py:1038, :1062). We do the
+	// same regardless of StrictPermissions so a fresh install doesn't expose
+	// the private key directory listing to local users.
+	const dirMode = os.FileMode(0o700)
 	archive := ArchiveDir(configDir, certName)
 	live := LiveDir(configDir, certName)
 	if err := os.MkdirAll(archive, dirMode); err != nil {
@@ -135,6 +136,14 @@ func Write(configDir, certName string, fullchainPEM, chainPEM, privkeyPEM []byte
 	}
 	if err := os.MkdirAll(live, dirMode); err != nil {
 		return nil, fmt.Errorf("storage: mkdir live: %w", err)
+	}
+	// Drop a README in live/<name>/ matching what Certbot writes (storage.py
+	// :1085-1087) so users browsing the directory understand the symlinks.
+	if err := writeLiveCertReadme(live, certName); err != nil {
+		return nil, err
+	}
+	if err := writeLiveTopReadme(configDir); err != nil {
+		return nil, err
 	}
 
 	arc := archiveSet(configDir, certName, version)
@@ -190,6 +199,39 @@ func replaceSymlink(linkPath, target string) error {
 		return fmt.Errorf("storage: rename symlink: %w", err)
 	}
 	return nil
+}
+
+// writeLiveCertReadme writes README inside live/<certname>/. Matches
+// Certbot's _write_live_readme_to (storage.py:1086).
+func writeLiveCertReadme(liveDir, certName string) error {
+	path := filepath.Join(liveDir, "README")
+	if _, err := os.Stat(path); err == nil {
+		return nil
+	}
+	body := "This directory contains your keys and certificates.\n\n" +
+		"`privkey.pem`  : the private key for your certificate.\n" +
+		"`fullchain.pem`: the certificate file used in most server software.\n" +
+		"`chain.pem`    : used for OCSP stapling in Nginx >=1.3.7.\n" +
+		"`cert.pem`     : will break many server configurations, and should not be used\n" +
+		"                 without reading further documentation (see link below).\n\n" +
+		"WARNING: DO NOT MOVE OR RENAME THESE FILES!\n" +
+		"         Certbot expects these files to remain in this location in order\n" +
+		"         to function properly!\n\n" +
+		"We recommend not moving these files. For more information, see the Certbot\n" +
+		"User Guide at https://certbot.eff.org/docs/using.html#where-are-my-certificates.\n"
+	return writeFile(path, []byte(body), 0o644)
+}
+
+// writeLiveTopReadme writes README in <config_dir>/live/.
+func writeLiveTopReadme(configDir string) error {
+	path := filepath.Join(configDir, "live", "README")
+	if _, err := os.Stat(path); err == nil {
+		return nil
+	}
+	body := "This directory contains your Let's Encrypt certificates.\n\n" +
+		"Each subdirectory contains four symlinks pointing into archive/. Do not\n" +
+		"move or delete the files in here; they are managed by certbot.\n"
+	return writeFile(path, []byte(body), 0o644)
 }
 
 func writeFile(path string, data []byte, mode os.FileMode) error {

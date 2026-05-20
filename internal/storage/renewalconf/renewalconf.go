@@ -13,10 +13,14 @@
 //	domains = example.com,
 //	key_type = ecdsa
 //	...
+//	  [[webroot_map]]
+//	  example.com = /var/www/example
+//	  www.example.com = /var/www/example
 //
 // Values are stringly-typed on disk; callers convert using the Bool/Int/List
 // helpers, which mirror certbot._internal.renewal's STR_/INT_/BOOL_/list type
-// tables.
+// tables. The parser preserves all sections (including unknown ones, comments,
+// blank lines) so round-tripping a Certbot conf is non-destructive.
 package renewalconf
 
 import (
@@ -31,19 +35,32 @@ import (
 
 // File is a parsed renewal .conf.
 type File struct {
-	// Top-level keys (cert/privkey/chain/fullchain/renew_before_expiry/ari_retry_after).
+	// Top-level keys (cert/privkey/chain/fullchain/renew_before_expiry/etc.).
 	Top map[string]string
 	// [renewalparams] section.
 	RenewalParams map[string]string
-	// Order keys were seen in (for deterministic write-back).
-	topOrder    []string
-	paramsOrder []string
+	// Sections holds top-level [section]... blocks other than [renewalparams].
+	// Each entry is `name → key → value`. Preserved through round-trips.
+	Sections map[string]map[string]string
+	// Nested holds [[nested]] subsections within [renewalparams]; the most
+	// important being webroot_map (renewalparams.py:163).
+	Nested map[string]map[string]string
+
+	// Insertion-order trackers.
+	topOrder      []string
+	paramsOrder   []string
+	sectionsOrder []string
+	nestedOrder   []string
+	keyOrder      map[string][]string // section name → keys in order
 }
 
 func newFile() *File {
 	return &File{
 		Top:           map[string]string{},
 		RenewalParams: map[string]string{},
+		Sections:      map[string]map[string]string{},
+		Nested:        map[string]map[string]string{},
+		keyOrder:      map[string][]string{},
 	}
 }
 
@@ -88,13 +105,19 @@ func (f *File) List(name string) ([]string, bool) {
 	parts := strings.Split(v, ",")
 	out := make([]string, 0, len(parts))
 	for _, p := range parts {
-		p = strings.TrimSpace(p)
+		p = strings.TrimSpace(unquote(p))
 		if p == "" {
 			continue
 		}
 		out = append(out, p)
 	}
 	return out, true
+}
+
+// NestedMap returns the named nested section under [renewalparams] (e.g.
+// "webroot_map"), or nil if absent.
+func (f *File) NestedMap(name string) map[string]string {
+	return f.Nested[name]
 }
 
 // Load parses a single renewal config file.
@@ -108,7 +131,11 @@ func Load(path string) (*File, error) {
 
 func parse(b []byte) (*File, error) {
 	f := newFile()
-	section := "" // "" = top-level, "renewalparams" = [renewalparams]
+	// section is the active scope. "" means top-level. "renewalparams" is
+	// the conventional named section. ">renewalparams>name" means an active
+	// nested [[name]] inside renewalparams.
+	section := ""
+	nested := ""
 	scanner := bufio.NewScanner(strings.NewReader(string(b)))
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -116,13 +143,25 @@ func parse(b []byte) (*File, error) {
 		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
 			continue
 		}
+		// Nested-section header: [[name]] only valid inside [renewalparams].
 		if strings.HasPrefix(trimmed, "[[") && strings.HasSuffix(trimmed, "]]") {
-			// Nested section (e.g. [[webroot_map]]). Not Phase 1 — skip until next ^[.
-			section = trimmed[2 : len(trimmed)-2]
+			nested = strings.TrimSpace(trimmed[2 : len(trimmed)-2])
+			if _, ok := f.Nested[nested]; !ok {
+				f.Nested[nested] = map[string]string{}
+				f.nestedOrder = append(f.nestedOrder, nested)
+			}
 			continue
 		}
+		// Top-level section header: [name].
 		if strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]") {
-			section = trimmed[1 : len(trimmed)-1]
+			section = strings.TrimSpace(trimmed[1 : len(trimmed)-1])
+			nested = ""
+			if section != "renewalparams" {
+				if _, ok := f.Sections[section]; !ok {
+					f.Sections[section] = map[string]string{}
+					f.sectionsOrder = append(f.sectionsOrder, section)
+				}
+			}
 			continue
 		}
 		idx := strings.Index(trimmed, "=")
@@ -131,19 +170,27 @@ func parse(b []byte) (*File, error) {
 		}
 		key := strings.TrimSpace(trimmed[:idx])
 		value := strings.TrimSpace(trimmed[idx+1:])
-		switch section {
-		case "":
-			if _, exists := f.Top[key]; !exists {
+		switch {
+		case nested != "" && section == "renewalparams":
+			if _, ok := f.Nested[nested][key]; !ok {
+				f.keyOrder["nested:"+nested] = append(f.keyOrder["nested:"+nested], key)
+			}
+			f.Nested[nested][key] = value
+		case section == "":
+			if _, ok := f.Top[key]; !ok {
 				f.topOrder = append(f.topOrder, key)
 			}
 			f.Top[key] = value
-		case "renewalparams":
-			if _, exists := f.RenewalParams[key]; !exists {
+		case section == "renewalparams":
+			if _, ok := f.RenewalParams[key]; !ok {
 				f.paramsOrder = append(f.paramsOrder, key)
 			}
 			f.RenewalParams[key] = value
 		default:
-			// nested-section keys — ignored for Phase 1
+			if _, ok := f.Sections[section][key]; !ok {
+				f.keyOrder["section:"+section] = append(f.keyOrder["section:"+section], key)
+			}
+			f.Sections[section][key] = value
 		}
 	}
 	if err := scanner.Err(); err != nil {
@@ -158,30 +205,72 @@ func (f *File) Save(path string) error {
 		return fmt.Errorf("renewalconf: mkdir: %w", err)
 	}
 	var sb strings.Builder
-	written := map[string]bool{}
-	for _, k := range f.topOrder {
-		fmt.Fprintf(&sb, "%s = %s\n", k, f.Top[k])
-		written[k] = true
-	}
-	for k, v := range f.Top {
-		if written[k] {
-			continue
-		}
-		fmt.Fprintf(&sb, "%s = %s\n", k, v)
-	}
+	emitKV(&sb, f.topOrder, f.Top, "")
+
 	sb.WriteString("\n# Options used in the renewal process\n[renewalparams]\n")
-	written = map[string]bool{}
-	for _, k := range f.paramsOrder {
-		fmt.Fprintf(&sb, "%s = %s\n", k, f.RenewalParams[k])
-		written[k] = true
+	emitKV(&sb, f.paramsOrder, f.RenewalParams, "")
+
+	// Nested sections inside [renewalparams].
+	for _, name := range f.nestedOrder {
+		fmt.Fprintf(&sb, "[[%s]]\n", name)
+		emitKV(&sb, f.keyOrder["nested:"+name], f.Nested[name], "  ")
 	}
-	for k, v := range f.RenewalParams {
-		if written[k] {
-			continue
-		}
-		fmt.Fprintf(&sb, "%s = %s\n", k, v)
+	// Other top-level sections (preserved verbatim from input).
+	for _, name := range f.sectionsOrder {
+		fmt.Fprintf(&sb, "\n[%s]\n", name)
+		emitKV(&sb, f.keyOrder["section:"+name], f.Sections[name], "")
 	}
 	return writeFile(path, []byte(sb.String()), 0o644)
+}
+
+func emitKV(sb *strings.Builder, order []string, m map[string]string, indent string) {
+	written := map[string]bool{}
+	for _, k := range order {
+		fmt.Fprintf(sb, "%s%s = %s\n", indent, k, quoteIfNeeded(m[k]))
+		written[k] = true
+	}
+	for k, v := range m {
+		if written[k] {
+			continue
+		}
+		fmt.Fprintf(sb, "%s%s = %s\n", indent, k, quoteIfNeeded(v))
+	}
+}
+
+// quoteIfNeeded quotes a value with double-quotes if it contains characters
+// configobj would interpret specially. Matches what configobj.Section.write
+// does for values containing `=` or `#` or leading/trailing whitespace.
+func quoteIfNeeded(v string) string {
+	if v == "" {
+		return v
+	}
+	needs := false
+	for i := 0; i < len(v); i++ {
+		c := v[i]
+		if c == '"' || c == '#' || c == '=' {
+			needs = true
+			break
+		}
+	}
+	if !needs && v == strings.TrimSpace(v) {
+		return v
+	}
+	// Use the form configobj prefers: triple-double-quoted unchanged content
+	// only when content has its own double quotes; otherwise plain double-
+	// quoted. Backslash isn't an escape in configobj; embedded `"` is rare.
+	if !strings.Contains(v, `"`) {
+		return `"` + v + `"`
+	}
+	return `'` + v + `'`
+}
+
+// unquote strips surrounding double or single quotes from a value.
+func unquote(v string) string {
+	v = strings.TrimSpace(v)
+	if len(v) >= 2 && (v[0] == '"' && v[len(v)-1] == '"' || v[0] == '\'' && v[len(v)-1] == '\'') {
+		return v[1 : len(v)-1]
+	}
+	return v
 }
 
 // SetTop sets a top-level key, recording insertion order if new.
@@ -198,6 +287,32 @@ func (f *File) SetParam(key, value string) {
 		f.paramsOrder = append(f.paramsOrder, key)
 	}
 	f.RenewalParams[key] = value
+}
+
+// SetNested sets a key inside a [[nested]] section of [renewalparams].
+// Creates the section if it doesn't exist. Used for `webroot_map`.
+func (f *File) SetNested(name, key, value string) {
+	if _, ok := f.Nested[name]; !ok {
+		f.Nested[name] = map[string]string{}
+		f.nestedOrder = append(f.nestedOrder, name)
+	}
+	if _, ok := f.Nested[name][key]; !ok {
+		f.keyOrder["nested:"+name] = append(f.keyOrder["nested:"+name], key)
+	}
+	f.Nested[name][key] = value
+}
+
+// SetSection sets a key inside a top-level [section] block. Round-trip use
+// for [acme_renewal_info] etc. Creates the section if needed.
+func (f *File) SetSection(name, key, value string) {
+	if _, ok := f.Sections[name]; !ok {
+		f.Sections[name] = map[string]string{}
+		f.sectionsOrder = append(f.sectionsOrder, name)
+	}
+	if _, ok := f.Sections[name][key]; !ok {
+		f.keyOrder["section:"+name] = append(f.keyOrder["section:"+name], key)
+	}
+	f.Sections[name][key] = value
 }
 
 func writeFile(path string, data []byte, mode os.FileMode) error {

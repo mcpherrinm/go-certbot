@@ -72,18 +72,30 @@ func (c *Client) EnsureRegistered(ctx context.Context, accountStorage *account.F
 		return errors.New("client: --email is required (or pass --register-unsafely-without-email)")
 	}
 
-	opts := registration.RegisterOptions{TermsOfServiceAgreed: true}
-	reg, err := c.lego.Registration.Register(ctx, opts)
+	var (
+		reg *acme.ExtendedAccount
+		err error
+	)
+	if c.cfg.EABKid != "" {
+		// External Account Binding: required by Sectigo/ZeroSSL and
+		// optionally by Let's Encrypt for some profile types. lego's
+		// RegisterWithExternalAccountBinding wraps the EAB JWS.
+		reg, err = c.lego.Registration.RegisterWithExternalAccountBinding(ctx, registration.RegisterEABOptions{
+			TermsOfServiceAgreed: true,
+			Kid:                  c.cfg.EABKid,
+			HmacEncoded:          c.cfg.EABHMACKey,
+		})
+	} else {
+		reg, err = c.lego.Registration.Register(ctx, registration.RegisterOptions{TermsOfServiceAgreed: true})
+	}
 	if err != nil {
 		return fmt.Errorf("client: ACME register: %w", err)
 	}
 	c.account.Registration.URI = reg.Location
-	c.account.Registration.Body.Status = "valid"
 	if c.cfg.Email != "" {
-		c.account.Registration.Body.Contact = []string{"mailto:" + c.cfg.Email}
+		c.account.Contact = []string{"mailto:" + c.cfg.Email}
 	}
-	c.account.Registration.Body.TermsOfServiceAgreed = true
-	c.account.Meta.CreationDT = time.Now().UTC().Round(time.Second)
+	c.account.Meta.CreationDT.Time = time.Now().UTC().Round(time.Second)
 	if h, err := os.Hostname(); err == nil {
 		c.account.Meta.CreationHost = h
 	}
@@ -134,7 +146,7 @@ func (c *Client) Obtain(ctx context.Context, auth plugins.Authenticator, domains
 		return nil, err
 	}
 
-	if err := writeRenewalConf(c.cfg, certName, domains, lineage); err != nil {
+	if err := writeRenewalConf(c.cfg, certName, c.account.ID, domains, lineage); err != nil {
 		return nil, err
 	}
 	return lineage, nil

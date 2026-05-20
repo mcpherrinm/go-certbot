@@ -18,9 +18,9 @@ type legoUser struct {
 
 func userFromAccount(a *account.Account) *legoUser {
 	email := ""
-	if len(a.Registration.Body.Contact) > 0 {
+	if len(a.Contact) > 0 {
 		// Contact entries are "mailto:foo@bar"; lego wants the bare email.
-		first := a.Registration.Body.Contact[0]
+		first := a.Contact[0]
 		if len(first) > 7 && first[:7] == "mailto:" {
 			email = first[7:]
 		} else {

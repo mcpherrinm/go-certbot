@@ -62,12 +62,16 @@ func MarshalJWK(key crypto.PrivateKey) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
+		// josepy pads EC scalars to the curve's byte length (32/48/66 for
+		// P-256/P-384/P-521); a leading zero byte must not be stripped or
+		// josepy's strict length check rejects the JWK.
+		size := ecCoordinateSize(k.Curve)
 		return json.Marshal(rawJWK{
 			Kty: "EC",
 			Crv: crv,
-			X:   b64uInt(k.X),
-			Y:   b64uInt(k.Y),
-			D:   b64uInt(k.D),
+			X:   b64uIntPadded(k.X, size),
+			Y:   b64uIntPadded(k.Y, size),
+			D:   b64uIntPadded(k.D, size),
 		})
 	default:
 		return nil, fmt.Errorf("account: unsupported private key type %T", key)
@@ -192,6 +196,28 @@ func b64uInt(n *big.Int) string {
 		b = []byte{0}
 	}
 	return base64.RawURLEncoding.EncodeToString(b)
+}
+
+// b64uIntPadded encodes n with leading-zero padding to exactly `size` bytes
+// (or one extra leading byte if n is larger than expected). Used for EC
+// scalars where josepy enforces a fixed length per curve.
+func b64uIntPadded(n *big.Int, size int) string {
+	if n == nil {
+		return ""
+	}
+	b := n.Bytes()
+	if len(b) < size {
+		pad := make([]byte, size-len(b))
+		b = append(pad, b...)
+	}
+	return base64.RawURLEncoding.EncodeToString(b)
+}
+
+// ecCoordinateSize returns the field-element byte length for a curve, used to
+// pad x/y/d in EC JWKs to a fixed length matching josepy.
+func ecCoordinateSize(c elliptic.Curve) int {
+	bits := c.Params().BitSize
+	return (bits + 7) / 8
 }
 
 func b64uToInt(s string) (*big.Int, error) {

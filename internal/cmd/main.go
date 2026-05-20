@@ -22,13 +22,23 @@ import (
 // Main runs the CLI with the given args (omit os.Args[0]). Returns the
 // process exit code.
 func Main(args []string) int {
+	// `--version` always prints and exits.
 	for _, a := range args {
-		switch a {
-		case "--help", "-h":
-			printHelp(os.Stdout, "")
-			return 0
-		case "--version":
+		if a == "--version" {
 			fmt.Println("go-certbot 0.1.0-phase1")
+			return 0
+		}
+	}
+	// `--help` / `-h` may carry a topic as the next arg (e.g. `-h security`).
+	// `help` as a positional verb behaves the same: `certbot help renew`.
+	for i, a := range args {
+		switch a {
+		case "--help", "-h", "help":
+			topic := ""
+			if i+1 < len(args) {
+				topic = args[i+1]
+			}
+			printHelp(os.Stdout, topic)
 			return 0
 		}
 	}
@@ -77,6 +87,9 @@ func Main(args []string) int {
 		return 2
 	}
 	trackSources(fs, cfg)
+	for _, h := range cfg.PostParseHooks {
+		h()
+	}
 
 	configureLogging(cfg)
 
@@ -150,19 +163,31 @@ func extractVerb(args []string) (string, []string) {
 }
 
 func printHelp(out io.Writer, topic string) {
-	printUsage(out)
-	if topic == "" || topic == "all" || topic == "commands" {
-		printCommands(out)
-	}
+	printHelpTopic(out, topic)
 }
 
+// configureLogging maps Certbot's --verbose / --quiet / --verbose-level onto
+// slog. Note that Certbot's --debug controls TRACEBACK display (not log
+// level); we honor that by leaving log level alone when only --debug is set.
 func configureLogging(cfg *config.Config) {
 	level := slog.LevelInfo
 	switch {
 	case cfg.Quiet:
 		level = slog.LevelError
-	case cfg.Debug || cfg.Verbose > 0:
+	case cfg.Verbose >= 2:
 		level = slog.LevelDebug
+	case cfg.Verbose == 1:
+		level = slog.LevelInfo // already default
+	}
+	switch cfg.VerboseLevel {
+	case "debug":
+		level = slog.LevelDebug
+	case "info":
+		level = slog.LevelInfo
+	case "warning", "warn":
+		level = slog.LevelWarn
+	case "error":
+		level = slog.LevelError
 	}
 	h := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})
 	slog.SetDefault(slog.New(h))

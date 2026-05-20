@@ -105,7 +105,7 @@ type Config struct {
 	EABHMACKey string
 	EABHMACAlg string
 
-	// Preserved-but-not-yet-wired
+	// Lifecycle / behavior flags Certbot accepts.
 	Duplicate           bool
 	Expand              bool
 	ForceRenewal        bool
@@ -113,25 +113,73 @@ type Config struct {
 	IssuanceTimeout     int
 	PreferredChallenges []string
 
+	// Tri-state booleans (nil = "Ask", true = yes, false = no). Mirrors
+	// Certbot's None default for HSTS/UIR/staple/EFF-subscribe/redirect.
+	EFFEmail *bool // --eff-email / --no-eff-email
+
+	// CSR-driven certonly destination paths.
+	AuthCertPath  string // --cert-path under certonly --csr
+	AuthChainPath string // --chain-path under certonly --csr
+	FullchainPath string // --fullchain-path
+
+	// `certificates`, `delete`, `revoke` numeric controls.
+	Num                int
+	BreakMyCerts       bool
+	ReinstallExisting  bool
+	RenewWithNewDomains bool
+	RunDeployHooks     bool
+	AutoHSTS           bool
+	DisableRenewUpdates bool
+
+	// Three-state defaults-True flags (`--no-X` flips them off). Stored as
+	// non-pointer booleans seeded True in NewDefault().
+	RandomSleepOnRenew bool // --no-random-sleep-on-renew
+	DirectoryHooks     bool // --no-directory-hooks
+	Autorenew          bool // --no-autorenew
+	ValidateHooks      bool // --no-validate-hooks / --disable-hook-validation
+
+	// Plugins-verb scoped state.
+	PluginsInit    bool
+	PluginsPrepare bool
+	PluginIfaces   []string // --authenticators / --installers selector
+
+	// Logging.
+	VerboseLevel      string
+	TextMode          bool
+	MaxLogBackups     int
+	PreconfiguredRenew bool
+	DebugChallenges   bool
+
 	// Sources tracks which fields were user-set, for renewal merge logic.
 	Sources map[string]ArgumentSource
+
+	// PostParseHooks run after CLI parsing completes. Used by tri-state and
+	// default-True bool flags (--no-X) that need a post-pass to resolve.
+	PostParseHooks []func()
 }
 
 // NewDefault returns a Config seeded with Certbot's CLI_DEFAULTS for the host OS.
 func NewDefault() *Config {
 	return &Config{
-		ConfigDir:       DefaultConfigDir(),
-		WorkDir:         DefaultWorkDir(),
-		LogsDir:         DefaultLogsDir(),
-		Server:          DefaultLetsEncryptDirectory,
-		KeyType:         "ecdsa",
-		RSAKeySize:      2048,
-		EllipticCurve:   "secp256r1",
-		HTTP01Port:      80,
-		HTTPSPort:       443,
-		EABHMACAlg:      "HS256",
-		IssuanceTimeout: 90,
-		Sources:         map[string]ArgumentSource{},
+		ConfigDir:          DefaultConfigDir(),
+		WorkDir:            DefaultWorkDir(),
+		LogsDir:            DefaultLogsDir(),
+		Server:             DefaultLetsEncryptDirectory,
+		KeyType:            "ecdsa",
+		RSAKeySize:         2048,
+		EllipticCurve:      "secp256r1",
+		HTTP01Port:         80,
+		HTTPSPort:          443,
+		EABHMACAlg:         "HS256",
+		IssuanceTimeout:    90,
+		MaxLogBackups:      1000,
+		RandomSleepOnRenew: true,
+		DirectoryHooks:     true,
+		Autorenew:          true,
+		ValidateHooks:      true,
+		AuthCertPath:       "./cert.pem",
+		AuthChainPath:      "./chain.pem",
+		Sources:            map[string]ArgumentSource{},
 	}
 }
 
@@ -163,14 +211,15 @@ func (c *Config) EffectiveServer() string {
 
 // ServerPath returns the on-disk path component for the current server,
 // matching certbot.configuration.NamespaceConfig.server_path: netloc + path
-// with '/' replaced by os.PathSeparator. Used inside accounts/.
+// with '/' replaced by os.PathSeparator. Used inside accounts/. The
+// underscore-substitution step is applied separately by AccountsDir, matching
+// certbot.configuration.accounts_dir_for_server_path.
 func (c *Config) ServerPath() (string, error) {
 	u, err := url.Parse(c.EffectiveServer())
 	if err != nil {
 		return "", fmt.Errorf("parse server URL %q: %w", c.EffectiveServer(), err)
 	}
 	combined := u.Host + u.Path
-	combined = underscoresForUnsupportedChars(combined)
 	return strings.ReplaceAll(combined, "/", string(filepath.Separator)), nil
 }
 
@@ -180,6 +229,7 @@ func (c *Config) AccountsDir() (string, error) {
 	if err != nil {
 		return "", err
 	}
+	sp = underscoresForUnsupportedChars(sp)
 	return filepath.Join(c.ConfigDir, "accounts", sp), nil
 }
 
@@ -194,23 +244,23 @@ func (c *Config) HookDir(kind string) string {
 	return filepath.Join(c.ConfigDir, "renewal-hooks", kind)
 }
 
-// underscoresForUnsupportedChars replaces characters not permitted in Windows
-// paths with underscores. Mirrors Certbot's
-// underscores_for_unsupported_characters_in_path.
+// underscoresForUnsupportedChars replaces ':' characters in path with '_'
+// after the optional drive prefix. Matches Certbot's
+// underscores_for_unsupported_characters_in_path (compat/misc.py:121-135),
+// which only touches ':' (and only in the tail after splitdrive). No-op on
+// non-Windows.
 func underscoresForUnsupportedChars(p string) string {
 	if runtime.GOOS != "windows" {
 		return p
 	}
-	const bad = `<>:"|?*`
-	out := make([]byte, len(p))
-	for i := 0; i < len(p); i++ {
-		if strings.IndexByte(bad, p[i]) >= 0 {
-			out[i] = '_'
-		} else {
-			out[i] = p[i]
-		}
+	// Equivalent of Python os.path.splitdrive: drive is `X:` or `\\server\share`.
+	drive := ""
+	tail := p
+	if len(p) >= 2 && p[1] == ':' && ((p[0] >= 'a' && p[0] <= 'z') || (p[0] >= 'A' && p[0] <= 'Z')) {
+		drive = p[:2]
+		tail = p[2:]
 	}
-	return string(out)
+	return drive + strings.ReplaceAll(tail, ":", "_")
 }
 
 func DefaultConfigDir() string {
