@@ -1,0 +1,24 @@
+# Binaries
+*.exe
+*.dll
+*.so
+*.dylib
+/go-certbot
+/bin/
+
+# Test artifacts
+*.test
+*.out
+coverage.*
+
+# Go workspace / build
+/vendor/
+!/vendor/certbot/
+go.work
+go.work.sum
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
