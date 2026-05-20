@@ -34,6 +34,7 @@ import (
 	"github.com/go-acme/lego/v5/challenge"
 	"github.com/go-acme/lego/v5/challenge/http01"
 
+	"github.com/letsencrypt/go-certbot/internal/checkpoint"
 	"github.com/letsencrypt/go-certbot/internal/config"
 	"github.com/letsencrypt/go-certbot/internal/plugins"
 	"github.com/letsencrypt/go-certbot/internal/plugins/apache/parser"
@@ -109,41 +110,106 @@ func (p *Plugin) CleanUp(_ context.Context, _, token, _ string) error {
 	return os.Remove(filepath.Join(p.challengeDir, http01.ChallengePath(token)))
 }
 
-// Install implements plugins.Installer.
+// Install implements plugins.Installer. Walks Include / IncludeOptional so
+// the default Debian/Ubuntu layout (vhosts in sites-enabled/*.conf) works.
+// If a matching :443 vhost exists it's edited in place; otherwise the
+// matching :80 vhost is cloned as a new :443 vhost written to a sibling
+// <basename>-le-ssl.conf wrapped in <IfModule mod_ssl.c> so the install is
+// safe when mod_ssl is disabled.
 func (p *Plugin) Install(ctx context.Context, cfg *config.Config, domains []string, fullchainPath, privkeyPath string) error {
 	configPath := apacheConfigPath(cfg)
-	srcBytes, err := os.ReadFile(configPath)
+	files, err := loadAll(configPath)
 	if err != nil {
-		return fmt.Errorf("apache: %s: %w", configPath, err)
+		return err
 	}
-	root, err := parser.Parse(string(srcBytes))
-	if err != nil {
-		return fmt.Errorf("apache: parse %s: %w", configPath, err)
-	}
-
-	matched443 := findMatchingVHosts(root, domains, "443")
-	matched80 := findMatchingVHosts(root, domains, "80")
-
-	if len(matched443) == 0 && len(matched80) == 0 {
-		return fmt.Errorf("apache: no <VirtualHost> matched any of %v in %s", domains, configPath)
+	hits443 := findMatchingVHostsAcrossFiles(files, domains, "443")
+	hits80 := findMatchingVHostsAcrossFiles(files, domains, "80")
+	if len(hits443) == 0 && len(hits80) == 0 {
+		return fmt.Errorf("apache: no <VirtualHost> matched any of %v in %s (or its includes)", domains, configPath)
 	}
 
-	if len(matched443) > 0 {
-		for _, sec := range matched443 {
-			applySSLDirectives(sec, fullchainPath, privkeyPath)
+	// Track new -le-ssl.conf files so we write them too.
+	type extraFile struct{ path, body string }
+	var extras []extraFile
+
+	if len(hits443) > 0 {
+		for _, h := range hits443 {
+			applySSLDirectives(h.Sec, fullchainPath, privkeyPath)
 		}
 	} else {
-		// Clone every matching :80 vhost as a new :443 vhost.
-		for _, sec := range matched80 {
-			clone := cloneAsSSLVHost(sec, fullchainPath, privkeyPath)
-			root.Nodes = append(root.Nodes, clone)
+		// Clone each :80 vhost as a :443 vhost in a separate <basename>-le-ssl.conf.
+		for _, h := range hits80 {
+			clone := cloneAsSSLVHost(h.Sec, fullchainPath, privkeyPath)
+			leSSLPath := strings.TrimSuffix(h.File.Path, filepath.Ext(h.File.Path)) + "-le-ssl.conf"
+			body := wrapInIfModuleSSL(clone)
+			extras = append(extras, extraFile{path: leSSLPath, body: body})
+		}
+	}
+	// Add HTTP-→HTTPS redirect to matching :80 vhosts if --redirect is set.
+	if cfg.Redirect != nil && *cfg.Redirect {
+		for _, h := range hits80 {
+			addRewriteRedirect(h.Sec)
 		}
 	}
 
-	if err := os.WriteFile(configPath, []byte(root.String()), 0o644); err != nil {
-		return fmt.Errorf("apache: write %s: %w", configPath, err)
+	// Checkpoint every file we're about to write so rollback can revert.
+	paths := make([]string, 0, len(files))
+	for _, f := range files {
+		paths = append(paths, f.Path)
+	}
+	for _, e := range extras {
+		paths = append(paths, e.path)
+	}
+	if _, err := checkpoint.Save(cfg.WorkDir, "apache-install", paths); err != nil {
+		return fmt.Errorf("apache: checkpoint: %w", err)
+	}
+	if err := writeAllFiles(files); err != nil {
+		return err
+	}
+	for _, e := range extras {
+		if err := os.WriteFile(e.path, []byte(e.body), 0o644); err != nil {
+			return fmt.Errorf("apache: write %s: %w", e.path, err)
+		}
 	}
 	return testAndReload(ctx, cfg)
+}
+
+// wrapInIfModuleSSL returns the section serialized inside an <IfModule
+// mod_ssl.c> wrapper.
+func wrapInIfModuleSSL(sec *parser.Section) string {
+	wrapped := &parser.Config{
+		Nodes: []parser.Node{
+			&parser.Section{
+				Name:        "IfModule",
+				Args:        []string{"mod_ssl.c"},
+				OpenNewline: "\n",
+				Body:        []parser.Node{sec},
+				CloseNewline: "\n",
+			},
+		},
+	}
+	return wrapped.String()
+}
+
+// addRewriteRedirect inserts a `RewriteEngine on` + `RewriteCond` + `RewriteRule`
+// trio into a matching :80 vhost, redirecting HTTP requests to HTTPS. Matches
+// Certbot's _set_https_redirection. Idempotent: skips if a redirect already
+// exists.
+func addRewriteRedirect(sec *parser.Section) {
+	for _, n := range sec.Body {
+		if d, ok := n.(*parser.Directive); ok && strings.EqualFold(d.Name, "RewriteRule") {
+			for _, a := range d.Args {
+				if strings.HasPrefix(strings.TrimSpace(a), `https://`) {
+					return
+				}
+			}
+		}
+	}
+	indent := childIndent(sec)
+	sec.Body = append(sec.Body,
+		&parser.Directive{Indent: indent, Name: "RewriteEngine", Args: []string{"on"}, Newline: "\n"},
+		&parser.Directive{Indent: indent, Name: "RewriteRule", Args: []string{"^", "https://%{SERVER_NAME}%{REQUEST_URI}", "[END,NE,R=permanent]"}, Newline: "\n"},
+	)
 }
 
 // apacheConfigPath returns where to read/write.
@@ -271,25 +337,45 @@ func cloneAsSSLVHost(src *parser.Section, fullchain, privkey string) *parser.Sec
 	return dst
 }
 
-// rewriteArgsTo443 turns `*:80` → `*:443`, leaving other args alone.
+// rewriteArgsTo443 turns each `:80` listener arg into `:443`. Handles `*`
+// (no port), `_default_:80`, `1.2.3.4:80`, `[::1]:80` (IPv6 bracketed), and
+// quoted variants. Args without a port (like `unix:/...` or bare `*`) are
+// passed through.
 func rewriteArgsTo443(in []string) []string {
 	out := make([]string, len(in))
 	for i, a := range in {
-		v := a
-		quoted := false
-		if strings.HasPrefix(v, `"`) && strings.HasSuffix(v, `"`) {
-			v = strings.Trim(v, `"`)
-			quoted = true
-		}
-		if j := strings.LastIndex(v, ":"); j >= 0 && v[j+1:] == "80" {
-			v = v[:j+1] + "443"
-		}
-		if quoted {
-			v = `"` + v + `"`
-		}
-		out[i] = v
+		out[i] = rewritePortIn(a, "80", "443")
 	}
 	return out
+}
+
+func rewritePortIn(v, oldPort, newPort string) string {
+	quoted := false
+	if strings.HasPrefix(v, `"`) && strings.HasSuffix(v, `"`) {
+		v = strings.Trim(v, `"`)
+		quoted = true
+	}
+	rewrite := func(in string) string {
+		// Find the trailing :<port> sequence; for bracketed IPv6 it's after `]:`.
+		idx := -1
+		if strings.HasSuffix(in, "]:"+oldPort) {
+			idx = len(in) - len(oldPort) - 1
+		} else if !strings.HasPrefix(in, "[") {
+			// Not bracketed: scan for last ':'.
+			if j := strings.LastIndex(in, ":"); j >= 0 && in[j+1:] == oldPort {
+				idx = j + 1
+			}
+		}
+		if idx < 0 {
+			return in
+		}
+		return in[:idx] + newPort
+	}
+	v = rewrite(v)
+	if quoted {
+		v = `"` + v + `"`
+	}
+	return v
 }
 
 func copyNode(n parser.Node) parser.Node {
