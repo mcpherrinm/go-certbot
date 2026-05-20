@@ -14,10 +14,6 @@ func notImplemented(verb, phase string) error {
 	return fmt.Errorf("%s: not implemented in Phase 1; planned for %s", verb, phase)
 }
 
-func Rollback(_ context.Context, _ *config.Config, _ *plugins.Registry) error {
-	return notImplemented("rollback", "Phase 5 (nginx) / Phase 6 (apache)")
-}
-
 func Plugins(_ context.Context, _ *config.Config, reg *plugins.Registry) error {
 	fmt.Println("Built-in authenticators:")
 	for _, a := range reg.Authenticators() {

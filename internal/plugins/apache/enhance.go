@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/letsencrypt/go-certbot/internal/checkpoint"
 	"github.com/letsencrypt/go-certbot/internal/config"
 	"github.com/letsencrypt/go-certbot/internal/plugins"
 	"github.com/letsencrypt/go-certbot/internal/plugins/apache/parser"
@@ -46,6 +47,13 @@ func (p *Plugin) Enhance(ctx context.Context, cfg *config.Config, domains []stri
 		// Apache requires SSLStaplingCache at server scope. Insert it into
 		// the root file at the top level (idempotent — skip if present).
 		ensureGlobalStaplingCache(files[0])
+	}
+	paths := make([]string, 0, len(files))
+	for _, f := range files {
+		paths = append(paths, f.Path)
+	}
+	if _, err := checkpoint.Save(cfg.WorkDir, "apache-enhance", paths); err != nil {
+		return fmt.Errorf("apache: checkpoint: %w", err)
 	}
 	if err := writeAllFiles(files); err != nil {
 		return err
