@@ -6,10 +6,14 @@
 //
 // Environment passed to hooks (matches certbot/_internal/plugins/manual.py:188):
 //
-//	CERTBOT_DOMAIN        the domain being authenticated
-//	CERTBOT_VALIDATION    keyAuth (http-01) / sha256-of-keyAuth (dns-01)
-//	CERTBOT_TOKEN         the http-01 challenge token (http-01 only; unset for dns-01)
-//	CERTBOT_AUTH_OUTPUT   stdout of the auth script, passed to cleanup
+//	CERTBOT_DOMAIN              the domain being authenticated
+//	CERTBOT_VALIDATION          keyAuth (http-01) / sha256-of-keyAuth (dns-01)
+//	CERTBOT_TOKEN               http-01 challenge token (http-01 only)
+//	CERTBOT_AUTH_OUTPUT         stdout of the auth script, passed to cleanup
+//	CERTBOT_ALL_DOMAINS         space-separated list of all domains in the order
+//	CERTBOT_REMAINING_CHALLENGES count of remaining challenges (for batched cleanup)
+//	CERTBOT_IDENTIFIER          alias for CERTBOT_DOMAIN (used by ACME v2)
+//	CERTBOT_ALL_IDENTIFIERS     alias for CERTBOT_ALL_DOMAINS
 package manual
 
 import (
@@ -17,7 +21,10 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/go-acme/lego/v5/challenge"
 
@@ -29,6 +36,8 @@ import (
 type Authenticator struct {
 	authHook    string
 	cleanupHook string
+	allDomains  []string
+	remaining   atomic.Int64
 
 	mu          sync.Mutex
 	authOutputs map[string]string // domain → stdout of auth hook, for cleanup env
@@ -36,36 +45,32 @@ type Authenticator struct {
 
 func New() *Authenticator { return &Authenticator{authOutputs: map[string]string{}} }
 
-func (a *Authenticator) Name() string        { return "manual" }
-func (a *Authenticator) Description() string { return "Manual configuration or running of shell scripts to fulfill ACME challenges." }
+func (a *Authenticator) Name() string { return "manual" }
+func (a *Authenticator) Description() string {
+	return "Manual configuration or running of shell scripts to fulfill ACME challenges."
+}
 
 // PrepareHTTP01 returns the plugin acting as a lego http-01 challenge.Provider.
-// The same plugin also services dns-01 via a separate code path (not yet wired
-// because Phase 2 doesn't introduce DNS challenges into go-certbot; lego's
-// dns-01 path is reached automatically when the only configured provider is
-// us — Phase 4 will revisit when DNS plugins ship).
-func (a *Authenticator) PrepareHTTP01(_ context.Context, cfg *config.Config, _ []string) (challenge.Provider, error) {
+// The domains slice is stored so Present/CleanUp can emit
+// CERTBOT_ALL_DOMAINS / CERTBOT_REMAINING_CHALLENGES.
+func (a *Authenticator) PrepareHTTP01(_ context.Context, cfg *config.Config, domains []string) (challenge.Provider, error) {
 	if cfg.ManualAuthHook == "" {
-		return nil, errors.New("manual: --manual-auth-hook is required (interactive mode is not yet implemented in Phase 2)")
+		return nil, errors.New("manual: --manual-auth-hook is required (interactive mode is not yet implemented)")
 	}
 	a.authHook = cfg.ManualAuthHook
 	a.cleanupHook = cfg.ManualCleanupHook
+	a.allDomains = append([]string(nil), domains...)
+	a.remaining.Store(int64(len(domains)))
 	return a, nil
 }
 
 func (a *Authenticator) Cleanup(_ context.Context) error { return nil }
 
-// Present runs the auth hook for the given domain. The hook is expected to
-// publish the challenge response somewhere reachable by the CA (e.g. drop the
-// http-01 file in a webroot, or update a DNS TXT record).
+// Present runs the auth hook for the given domain. The hook publishes the
+// challenge response somewhere reachable by the CA (e.g. drop the http-01
+// file in a webroot, or update a DNS TXT record).
 func (a *Authenticator) Present(ctx context.Context, domain, token, keyAuth string) error {
-	env := []string{
-		"CERTBOT_DOMAIN=" + domain,
-		"CERTBOT_VALIDATION=" + keyAuth,
-	}
-	if token != "" {
-		env = append(env, "CERTBOT_TOKEN="+token)
-	}
+	env := a.baseEnv(domain, keyAuth, token)
 	out, err := hooks.RunCapture(ctx, a.authHook, env)
 	if err != nil {
 		return fmt.Errorf("manual: auth hook for %s: %w", domain, err)
@@ -86,17 +91,30 @@ func (a *Authenticator) CleanUp(ctx context.Context, domain, token, keyAuth stri
 	delete(a.authOutputs, domain)
 	a.mu.Unlock()
 
+	env := a.baseEnv(domain, keyAuth, token)
+	env = append(env, "CERTBOT_AUTH_OUTPUT="+authOutput)
+	// Decrement remaining now that we're cleaning this one up. After Present
+	// for N domains we'll do N CleanUps; the env var counts down so hooks
+	// know when they're on the last call.
+	a.remaining.Add(-1)
+	if err := hooks.Run(ctx, a.cleanupHook, env); err != nil {
+		fmt.Fprintf(os.Stderr, "manual: cleanup hook for %s failed: %v\n", domain, err)
+	}
+	return nil
+}
+
+func (a *Authenticator) baseEnv(domain, keyAuth, token string) []string {
+	all := strings.Join(a.allDomains, " ")
 	env := []string{
 		"CERTBOT_DOMAIN=" + domain,
+		"CERTBOT_IDENTIFIER=" + domain,
 		"CERTBOT_VALIDATION=" + keyAuth,
-		"CERTBOT_AUTH_OUTPUT=" + authOutput,
+		"CERTBOT_ALL_DOMAINS=" + all,
+		"CERTBOT_ALL_IDENTIFIERS=" + all,
+		"CERTBOT_REMAINING_CHALLENGES=" + strconv.FormatInt(a.remaining.Load(), 10),
 	}
 	if token != "" {
 		env = append(env, "CERTBOT_TOKEN="+token)
 	}
-	if err := hooks.Run(ctx, a.cleanupHook, env); err != nil {
-		// Match Certbot: cleanup failures are logged but don't abort.
-		fmt.Fprintf(os.Stderr, "manual: cleanup hook for %s failed: %v\n", domain, err)
-	}
-	return nil
+	return env
 }

@@ -48,6 +48,9 @@ func Main(args []string) int {
 
 	cfg := config.NewDefault()
 	cfg.Verb = verb
+	// Pre-scan argv to capture -w/-d interleaving for the webroot plugin
+	// before pflag flattens the slices and loses cross-flag order.
+	applyWebrootMap(cfg, args)
 
 	fs := pflag.NewFlagSet("go-certbot", pflag.ContinueOnError)
 	fs.Usage = func() { printHelp(os.Stderr, verb) }

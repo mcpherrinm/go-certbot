@@ -75,7 +75,12 @@ type Config struct {
 	Standalone    bool
 	Webroot       bool
 	WebrootPath   []string
-	Manual        bool
+	// WebrootMap is the resolved domain → webroot path map. Built before
+	// pflag parsing from the `-w`/`-d` interleaving order in os.Args; mirrors
+	// Certbot's _WebrootPathProcessor. Persisted under [[webroot_map]] in the
+	// renewal conf and restored on `renew`.
+	WebrootMap map[string]string
+	Manual     bool
 
 	// HTTP-01
 	HTTP01Port    int

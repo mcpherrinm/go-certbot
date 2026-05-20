@@ -85,6 +85,20 @@ func writeRenewalConf(cfg *config.Config, certName, accountID string, domains []
 	// `domains = a,b,c,` — configobj treats trailing-comma values as lists.
 	f.SetParam("domains", strings.Join(domains, ",")+",")
 
+	// Persist webroot_map as a nested section under [renewalparams] so
+	// `certbot renew` (and `go-certbot renew`) can restore the per-domain
+	// path map. Matches certbot._internal.renewal._restore_webroot_config
+	// (renewal.py:163).
+	if len(cfg.WebrootMap) > 0 {
+		for d, p := range cfg.WebrootMap {
+			f.SetNested("webroot_map", d, p)
+		}
+	} else if len(cfg.WebrootPath) > 0 {
+		// Single path: also record under webroot_path so older Certbot
+		// versions can restore.
+		f.SetParam("webroot_path", strings.Join(cfg.WebrootPath, ",")+",")
+	}
+
 	path := filepath.Join(cfg.RenewalConfigsDir(), certName+".conf")
 	return f.Save(path)
 }

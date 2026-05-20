@@ -43,7 +43,9 @@ func TestPerDomainMap(t *testing.T) {
 	dirB := t.TempDir()
 	auth := New()
 	cfg := config.NewDefault()
-	cfg.WebrootPath = []string{dirA, dirB}
+	// Use the new WebrootMap path (the CLI builds this from -w/-d
+	// interleaving; tests construct it directly).
+	cfg.WebrootMap = map[string]string{"a.test": dirA, "b.test": dirB}
 	if _, err := auth.PrepareHTTP01(context.Background(), cfg, []string{"a.test", "b.test"}); err != nil {
 		t.Fatal(err)
 	}

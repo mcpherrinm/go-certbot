@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -239,23 +240,68 @@ func mergeFromRenewalConf(cfg *config.Config, conf *renewalconf.File) {
 	if v := rp["deploy_hook"]; v != "" && !cfg.SetByUser("deploy-hook") {
 		cfg.DeployHook = v
 	}
+	// Certbot writes the deploy hook on disk under `renew_hook` (the
+	// historical name). Accept either spelling on read.
+	if v := rp["renew_hook"]; v != "" && cfg.DeployHook == "" {
+		cfg.DeployHook = v
+	}
+	if v := rp["user_agent"]; v != "" && !cfg.SetByUser("user-agent") {
+		cfg.UserAgent = v
+	}
+	if v, ok := conf.Bool("allow_subset_of_names"); ok && !cfg.SetByUser("allow-subset-of-names") {
+		cfg.AllowSubsetOfNames = v
+	}
+	if !cfg.SetByUser("preferred-challenges") {
+		if list, ok := conf.List("pref_challs"); ok {
+			cfg.PreferredChallenges = list
+		}
+	}
 	// Domains: prefer the conf-recorded list unless cli set them.
 	if !cfg.SetByUser("domain") {
 		if list, ok := conf.List("domains"); ok {
 			cfg.Domains = list
 		}
 	}
-	// Webroot path.
+	// Webroot path + per-domain map.
 	if !cfg.SetByUser("webroot-path") {
 		if list, ok := conf.List("webroot_path"); ok {
 			cfg.WebrootPath = list
 		}
 	}
+	if m := conf.NestedMap("webroot_map"); len(m) > 0 && len(cfg.WebrootMap) == 0 {
+		cfg.WebrootMap = map[string]string{}
+		for k, v := range m {
+			cfg.WebrootMap[k] = v
+		}
+	}
+	// Ancient lineages from pre-Certbot-1.25 don't have key_type — Certbot
+	// defaults to RSA in that case (renewal.py:135).
+	if rp["key_type"] == "" && cfg.KeyType == "" {
+		cfg.KeyType = "rsa"
+	}
+	// Strip deprecated keys so a downstream restore doesn't act on them
+	// (renewal.py:139, :250-260).
+	for _, k := range deprecatedRenewalParams {
+		delete(rp, k)
+	}
+}
+
+// deprecatedRenewalParams mirrors the keys Certbot strips on load
+// (cli_constants.DEPRECATED_OPTIONS).
+var deprecatedRenewalParams = []string{
+	"manual_public_ip_logging_ok",
+	"os_packages_only",
+	"no_self_upgrade",
+	"no_bootstrap",
+	"no_permissions_check",
+	"dns_route53_propagation_seconds",
+	"certbot_route53:auth_propagation_seconds",
 }
 
 // needsRenewal returns true if the cert is near expiry, with the cert's
-// NotAfter for logging. Uses the renew_before_expiry top-level key if present
-// (defaulting to 30 days).
+// NotAfter for logging. Uses renew_before_expiry from the conf if present;
+// otherwise falls back to Certbot's 1/3-of-lifetime rule (renewal.py:413-431)
+// for short-lived certs and defaultRenewBefore for standard ones.
 func needsRenewal(certPath string, conf *renewalconf.File) (bool, time.Time, error) {
 	b, err := os.ReadFile(certPath)
 	if err != nil {
@@ -269,44 +315,70 @@ func needsRenewal(certPath string, conf *renewalconf.File) (bool, time.Time, err
 	if err != nil {
 		return false, time.Time{}, fmt.Errorf("renew: parse cert: %w", err)
 	}
-	window := defaultRenewBefore
+	var window time.Duration
 	if raw := conf.Top["renew_before_expiry"]; raw != "" {
-		if d, err := parseRenewBefore(raw); err == nil {
+		if d, perr := parseRenewBefore(raw); perr == nil {
 			window = d
+		}
+	}
+	if window == 0 {
+		// Fallback per Certbot _default_renewal_time: 1/3 of the cert's
+		// lifetime, capped by the 30-day default. For short-lived certs
+		// (< 90 days) this picks a sensible window instead of "30 days"
+		// which would be longer than the cert itself.
+		lifetime := cert.NotAfter.Sub(cert.NotBefore)
+		oneThird := lifetime / 3
+		window = defaultRenewBefore
+		if oneThird < window {
+			window = oneThird
 		}
 	}
 	return time.Now().Add(window).After(cert.NotAfter), cert.NotAfter, nil
 }
 
-// parseRenewBefore parses Certbot's English-language interval ("30 days",
-// "6 weeks", "3 months"). Only the unit prefix is parsed; bare integers mean
-// days, matching parsedatetime's behavior in storage.add_time_interval.
+// parseRenewBefore parses Certbot's English-language interval, including
+// concatenated sequences like "6 months 1 week" (storage.add_time_interval).
+// Bare integers mean days.
 func parseRenewBefore(s string) (time.Duration, error) {
 	s = strings.TrimSpace(strings.ToLower(s))
-	var n int
-	var unit string
-	if _, err := fmt.Sscanf(s, "%d %s", &n, &unit); err != nil {
-		// Maybe bare integer.
-		if _, err2 := fmt.Sscanf(s, "%d", &n); err2 == nil {
-			return time.Duration(n) * 24 * time.Hour, nil
-		}
-		return 0, err
+	if s == "" {
+		return 0, errors.New("empty interval")
 	}
-	switch strings.TrimSuffix(unit, "s") {
-	case "second", "sec":
-		return time.Duration(n) * time.Second, nil
-	case "minute", "min":
-		return time.Duration(n) * time.Minute, nil
-	case "hour", "hr":
-		return time.Duration(n) * time.Hour, nil
-	case "day":
+	// Bare integer (no unit) = days.
+	if n, err := strconv.Atoi(s); err == nil {
 		return time.Duration(n) * 24 * time.Hour, nil
-	case "week":
-		return time.Duration(n) * 7 * 24 * time.Hour, nil
-	case "month":
-		return time.Duration(n) * 30 * 24 * time.Hour, nil
-	case "year":
-		return time.Duration(n) * 365 * 24 * time.Hour, nil
 	}
-	return 0, fmt.Errorf("unknown unit %q", unit)
+	tokens := strings.Fields(s)
+	var total time.Duration
+	for i := 0; i < len(tokens)-1; i += 2 {
+		n, err := strconv.Atoi(tokens[i])
+		if err != nil {
+			return 0, fmt.Errorf("expected integer at %q: %w", tokens[i], err)
+		}
+		unit := strings.TrimSuffix(tokens[i+1], "s")
+		var step time.Duration
+		switch unit {
+		case "second", "sec":
+			step = time.Second
+		case "minute", "min":
+			step = time.Minute
+		case "hour", "hr":
+			step = time.Hour
+		case "day":
+			step = 24 * time.Hour
+		case "week":
+			step = 7 * 24 * time.Hour
+		case "month":
+			step = 30 * 24 * time.Hour
+		case "year":
+			step = 365 * 24 * time.Hour
+		default:
+			return 0, fmt.Errorf("unknown unit %q", unit)
+		}
+		total += time.Duration(n) * step
+	}
+	if total == 0 {
+		return 0, fmt.Errorf("could not parse interval %q", s)
+	}
+	return total, nil
 }
