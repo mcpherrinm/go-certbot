@@ -142,11 +142,17 @@ func resolveAuthenticatorName(cfg *config.Config) (string, error) {
 			picked = name
 		}
 	}
+	for name, on := range cfg.DNSSelected {
+		if on {
+			count++
+			picked = "dns-" + name
+		}
+	}
 	if count > 1 {
-		return "", errors.New("certonly: more than one authenticator selected; pick one of --standalone/--webroot/--manual")
+		return "", errors.New("certonly: more than one authenticator selected; pick one of --standalone/--webroot/--manual/--dns-*")
 	}
 	if count == 0 {
-		return "", errors.New("certonly: an authenticator is required (--standalone / --webroot / --manual / --authenticator)")
+		return "", errors.New("certonly: an authenticator is required (--standalone / --webroot / --manual / --dns-* / --authenticator)")
 	}
 	return picked, nil
 }

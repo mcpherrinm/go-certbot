@@ -86,6 +86,13 @@ type Config struct {
 	WebrootMap map[string]string
 	Manual     bool
 
+	// DNS plugins. Selected[name]=true means --dns-<name> was set.
+	// Credentials[name]=path is --dns-<name>-credentials. Propagation[name]
+	// is --dns-<name>-propagation-seconds.
+	DNSSelected           map[string]bool
+	DNSCredentials        map[string]string
+	DNSPropagationSeconds map[string]int
+
 	// HTTP-01
 	HTTP01Port    int
 	HTTP01Address string
@@ -175,25 +182,28 @@ type Config struct {
 // NewDefault returns a Config seeded with Certbot's CLI_DEFAULTS for the host OS.
 func NewDefault() *Config {
 	return &Config{
-		ConfigDir:          DefaultConfigDir(),
-		WorkDir:            DefaultWorkDir(),
-		LogsDir:            DefaultLogsDir(),
-		Server:             DefaultLetsEncryptDirectory,
-		KeyType:            "ecdsa",
-		RSAKeySize:         2048,
-		EllipticCurve:      "secp256r1",
-		HTTP01Port:         80,
-		HTTPSPort:          443,
-		EABHMACAlg:         "HS256",
-		IssuanceTimeout:    90,
-		MaxLogBackups:      1000,
-		RandomSleepOnRenew: true,
-		DirectoryHooks:     true,
-		Autorenew:          true,
-		ValidateHooks:      true,
-		AuthCertPath:       "./cert.pem",
-		AuthChainPath:      "./chain.pem",
-		Sources:            map[string]ArgumentSource{},
+		ConfigDir:             DefaultConfigDir(),
+		WorkDir:               DefaultWorkDir(),
+		LogsDir:               DefaultLogsDir(),
+		Server:                DefaultLetsEncryptDirectory,
+		KeyType:               "ecdsa",
+		RSAKeySize:            2048,
+		EllipticCurve:         "secp256r1",
+		HTTP01Port:            80,
+		HTTPSPort:             443,
+		EABHMACAlg:            "HS256",
+		IssuanceTimeout:       90,
+		MaxLogBackups:         1000,
+		RandomSleepOnRenew:    true,
+		DirectoryHooks:        true,
+		Autorenew:             true,
+		ValidateHooks:         true,
+		AuthCertPath:          "./cert.pem",
+		AuthChainPath:         "./chain.pem",
+		Sources:               map[string]ArgumentSource{},
+		DNSSelected:           map[string]bool{},
+		DNSCredentials:        map[string]string{},
+		DNSPropagationSeconds: map[string]int{},
 	}
 }
 

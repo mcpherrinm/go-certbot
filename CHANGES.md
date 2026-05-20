@@ -5,7 +5,53 @@ This file tracks every behavior in **go-certbot** that differs from upstream
 drop-in compatibility, so this file should stay short. Anything not listed
 here should behave identically to Certbot.
 
-## Phase 3 (current)
+## Phase 4 (current)
+
+### Implemented
+
+- All 13 DNS-01 authenticator plugins that Certbot bundles, each backed
+  by the matching [lego v5](https://github.com/go-acme/lego) provider:
+
+  | go-certbot plugin | lego provider |
+  | --- | --- |
+  | `dns-cloudflare`   | `cloudflare`   |
+  | `dns-digitalocean` | `digitalocean` |
+  | `dns-dnsimple`     | `dnsimple`     |
+  | `dns-dnsmadeeasy`  | `dnsmadeeasy`  |
+  | `dns-gehirn`       | `gehirn`       |
+  | `dns-google`       | `gcloud`       |
+  | `dns-linode`       | `linode`       |
+  | `dns-luadns`       | `luadns`       |
+  | `dns-nsone`        | `ns1`          |
+  | `dns-ovh`          | `ovh`          |
+  | `dns-rfc2136`      | `dnsupdate`    |
+  | `dns-route53`      | `route53`      |
+  | `dns-sakuracloud`  | `sakuracloud`  |
+
+- For each plugin: `--dns-<name>`, `--dns-<name>-credentials`,
+  `--dns-<name>-propagation-seconds` (defaults match Certbot's
+  per-plugin defaults).
+- Credentials file format matches Certbot's `dns_common.CredentialsConfiguration`:
+  a single INI file with keys prefixed `dns_<name>_`. Permissions are
+  warned if not 0600 (file is still accepted).
+- Authenticator interface was refactored to support DNS-01:
+  `Prepare(ctx, cfg, domains) (kind, provider, error)` replaces the
+  old `PrepareHTTP01`. Standalone/webroot/manual updated to return the
+  right kind. The client dispatches to `SetHTTP01Provider` or
+  `SetDNS01Provider` on lego accordingly.
+- `--manual` plus `--preferred-challenges=dns-01` now drives lego's
+  DNS-01 path via auth/cleanup hooks — the third-party-DNS-plugin
+  escape hatch described in Phase 2 is fully wired.
+
+### `dns-google` compatibility caveat
+
+Certbot's `dns-google` plugin requires `--dns-google-credentials` (a
+service-account JSON path). Ours accepts the same flag *and* falls back
+to Application Default Credentials on GCE/GKE when the flag is omitted
+— a deliberate convenience improvement, but worth flagging here as a
+small behavioral difference.
+
+## Phase 3
 
 ### Implemented
 
@@ -93,7 +139,6 @@ Plugins not yet implemented (using them returns a clear error):
 
 | Plugin | Planned phase |
 | --- | --- |
-| `dns-{cloudflare,digitalocean,dnsimple,dnsmadeeasy,gehirn,google,linode,luadns,nsone,ovh,rfc2136,route53,sakuracloud}` | Phase 4 (wraps lego providers) |
 | `nginx` | Phase 5 |
 | `apache` | Phase 6 |
 

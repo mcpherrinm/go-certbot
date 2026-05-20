@@ -15,6 +15,19 @@ import (
 
 	"github.com/letsencrypt/go-certbot/internal/config"
 	"github.com/letsencrypt/go-certbot/internal/plugins"
+	dnscloudflare "github.com/letsencrypt/go-certbot/internal/plugins/dns/cloudflare"
+	dnsdigitalocean "github.com/letsencrypt/go-certbot/internal/plugins/dns/digitalocean"
+	dnsdnsimple "github.com/letsencrypt/go-certbot/internal/plugins/dns/dnsimple"
+	dnsdnsmadeeasy "github.com/letsencrypt/go-certbot/internal/plugins/dns/dnsmadeeasy"
+	dnsgehirn "github.com/letsencrypt/go-certbot/internal/plugins/dns/gehirn"
+	dnsgoogle "github.com/letsencrypt/go-certbot/internal/plugins/dns/google"
+	dnslinode "github.com/letsencrypt/go-certbot/internal/plugins/dns/linode"
+	dnsluadns "github.com/letsencrypt/go-certbot/internal/plugins/dns/luadns"
+	dnsnsone "github.com/letsencrypt/go-certbot/internal/plugins/dns/nsone"
+	dnsovh "github.com/letsencrypt/go-certbot/internal/plugins/dns/ovh"
+	dnsrfc2136 "github.com/letsencrypt/go-certbot/internal/plugins/dns/rfc2136"
+	dnsroute53 "github.com/letsencrypt/go-certbot/internal/plugins/dns/route53"
+	dnssakuracloud "github.com/letsencrypt/go-certbot/internal/plugins/dns/sakuracloud"
 	"github.com/letsencrypt/go-certbot/internal/plugins/manual"
 	"github.com/letsencrypt/go-certbot/internal/plugins/standalone"
 	"github.com/letsencrypt/go-certbot/internal/plugins/webroot"
@@ -27,7 +40,7 @@ func Main(args []string) int {
 	// `--version` always prints and exits.
 	for _, a := range args {
 		if a == "--version" {
-			fmt.Println("go-certbot 0.3.0-phase3")
+			fmt.Println("go-certbot 0.4.0-phase4")
 			return 0
 		}
 	}
@@ -92,6 +105,7 @@ func Main(args []string) int {
 		return 2
 	}
 	trackSources(fs, cfg)
+	materializeDNSMaps(cfg)
 	for _, h := range cfg.PostParseHooks {
 		h()
 	}
@@ -102,6 +116,19 @@ func Main(args []string) int {
 	reg.RegisterAuthenticator(standalone.New())
 	reg.RegisterAuthenticator(webroot.New())
 	reg.RegisterAuthenticator(manual.New())
+	reg.RegisterAuthenticator(dnscloudflare.New())
+	reg.RegisterAuthenticator(dnsdigitalocean.New())
+	reg.RegisterAuthenticator(dnsdnsimple.New())
+	reg.RegisterAuthenticator(dnsdnsmadeeasy.New())
+	reg.RegisterAuthenticator(dnsgehirn.New())
+	reg.RegisterAuthenticator(dnsgoogle.New())
+	reg.RegisterAuthenticator(dnslinode.New())
+	reg.RegisterAuthenticator(dnsluadns.New())
+	reg.RegisterAuthenticator(dnsnsone.New())
+	reg.RegisterAuthenticator(dnsovh.New())
+	reg.RegisterAuthenticator(dnsrfc2136.New())
+	reg.RegisterAuthenticator(dnsroute53.New())
+	reg.RegisterAuthenticator(dnssakuracloud.New())
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()

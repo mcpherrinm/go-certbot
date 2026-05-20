@@ -26,7 +26,7 @@ import (
 )
 
 // version is the go-certbot version string; used in the User-Agent.
-const version = "0.3.0-phase3"
+const version = "0.4.0-phase4"
 
 // Client bundles a lego Client with the loaded account.
 type Client struct {
@@ -110,13 +110,22 @@ func (c *Client) EnsureRegistered(ctx context.Context, accountStorage *account.F
 // authenticator and writes the result to disk as a new lineage version.
 // Returns the lineage path information.
 func (c *Client) Obtain(ctx context.Context, auth plugins.Authenticator, domains []string, certName string) (*storage.Lineage, error) {
-	provider, err := auth.PrepareHTTP01(ctx, c.cfg, domains)
+	kind, provider, err := auth.Prepare(ctx, c.cfg, domains)
 	if err != nil {
 		return nil, fmt.Errorf("client: authenticator %s: %w", auth.Name(), err)
 	}
 	defer func() { _ = auth.Cleanup(ctx) }()
-	if err := c.lego.Challenge.SetHTTP01Provider(provider); err != nil {
-		return nil, fmt.Errorf("client: SetHTTP01Provider: %w", err)
+	switch kind {
+	case plugins.HTTP01:
+		if err := c.lego.Challenge.SetHTTP01Provider(provider); err != nil {
+			return nil, fmt.Errorf("client: SetHTTP01Provider: %w", err)
+		}
+	case plugins.DNS01:
+		if err := c.lego.Challenge.SetDNS01Provider(provider); err != nil {
+			return nil, fmt.Errorf("client: SetDNS01Provider: %w", err)
+		}
+	default:
+		return nil, fmt.Errorf("client: authenticator %s returned unknown challenge kind %d", auth.Name(), kind)
 	}
 
 	kt, err := certKeyType(c.cfg)

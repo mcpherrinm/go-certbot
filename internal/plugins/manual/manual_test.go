@@ -43,7 +43,7 @@ echo "$CERTBOT_DOMAIN $CERTBOT_AUTH_OUTPUT" > CLEANFILE
 	cfg := config.NewDefault()
 	cfg.ManualAuthHook = authScript
 	cfg.ManualCleanupHook = cleanupScript
-	if _, err := a.PrepareHTTP01(context.Background(), cfg, []string{"example.test"}); err != nil {
+	if _, _, err := a.Prepare(context.Background(), cfg, []string{"example.test"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := a.Present(context.Background(), "example.test", "thetoken", "thekeyauth"); err != nil {
@@ -72,7 +72,7 @@ echo "$CERTBOT_DOMAIN $CERTBOT_AUTH_OUTPUT" > CLEANFILE
 func TestPrepareWithoutAuthHookErrors(t *testing.T) {
 	a := New()
 	cfg := config.NewDefault()
-	if _, err := a.PrepareHTTP01(context.Background(), cfg, []string{"x"}); err == nil {
+	if _, _, err := a.Prepare(context.Background(), cfg, []string{"x"}); err == nil {
 		t.Errorf("expected error without --manual-auth-hook")
 	}
 }
