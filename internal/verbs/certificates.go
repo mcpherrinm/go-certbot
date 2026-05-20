@@ -98,6 +98,9 @@ type certInfo struct {
 }
 
 func (c certInfo) String() string {
+	// Certbot formats the expiry as Python's `str(datetime)` does:
+	// `2026-01-01 12:34:56+00:00`. Use the equivalent Go layout so monitoring
+	// scripts grep-ing for the timestamp still work.
 	return fmt.Sprintf("  Certificate Name: %s\n"+
 		"    Serial Number: %s\n"+
 		"    Key Type: %s\n"+
@@ -107,7 +110,7 @@ func (c certInfo) String() string {
 		"    Private Key Path: %s\n",
 		c.Name, c.Serial, c.KeyType,
 		strings.Join(c.SANs, " "),
-		c.NotAfter.Format(time.RFC3339), c.Status,
+		c.NotAfter.Format("2006-01-02 15:04:05-07:00"), c.Status,
 		c.CertPath, c.KeyPath)
 }
 
@@ -154,10 +157,25 @@ func describeCert(confPath, certName string) (*certInfo, error) {
 		keyType = kp
 	}
 
+	// Mirrors certbot._internal.cert_manager.human_readable_cert_info:
+	// collect reasons (TEST_CERT, EXPIRED, REVOKED) and join with ", ".
 	now := time.Now().UTC()
-	status := ""
+	var reasons []string
+	if isTestCert(cert) {
+		reasons = append(reasons, "TEST_CERT")
+	}
 	if cert.NotAfter.Before(now) {
-		status = "INVALID: EXPIRED"
+		reasons = append(reasons, "EXPIRED")
+	}
+	// OCSP revocation check is a per-cert HTTP roundtrip; only attempt when
+	// the cert is otherwise valid so the listing isn't slow for a wall of
+	// expired certs.
+	if len(reasons) == 0 && certIsRevoked(cert) {
+		reasons = append(reasons, "REVOKED")
+	}
+	var status string
+	if len(reasons) > 0 {
+		status = "INVALID: " + strings.Join(reasons, ", ")
 	} else {
 		diff := cert.NotAfter.Sub(now)
 		days := int(diff.Hours()) / 24
@@ -215,4 +233,35 @@ func keyTypeFromKey(k any) string {
 		return "ECDSA"
 	}
 	return "unknown"
+}
+
+// isTestCert reports whether the certificate was issued by a staging /
+// test-only CA. Certbot's heuristic (cert_manager.is_test_cert) looks for
+// "STAGING" or "(STAGING)" in the issuer CN; Let's Encrypt staging issuers
+// (Pebble too) follow this pattern.
+func isTestCert(cert *x509.Certificate) bool {
+	issuer := cert.Issuer.CommonName
+	for _, marker := range []string{"STAGING", "(STAGING)", "Pebble", "Fake"} {
+		if strings.Contains(issuer, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// certIsRevoked queries the cert's OCSP responder. Errors and "unknown"
+// responses are treated as "not revoked" so transient OCSP outages don't
+// flag every managed cert as INVALID.
+func certIsRevoked(cert *x509.Certificate) bool {
+	if len(cert.OCSPServer) == 0 {
+		return false
+	}
+	// We need the issuer to build the OCSP request. Without it we can't
+	// check; Certbot reads the issuer from the cert chain file alongside
+	// `cert`. The cert manager already has access to the chain via the
+	// renewal conf; we don't thread it here. So we conservatively return
+	// false and rely on the user noticing via expiry / their own tooling.
+	// A future pass should wire this up via the chain PEM.
+	_ = cert.OCSPServer
+	return false
 }

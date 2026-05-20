@@ -65,7 +65,8 @@ type Config struct {
 	NewKey             bool
 	AllowSubsetOfNames bool
 	CSR                string
-	CertPath           string // existing fullchain PEM, e.g. for --revoke
+	CertPath           string // existing fullchain PEM, e.g. for --revoke / --install
+	KeyPath            string // private key, e.g. for --install or --revoke --key-path
 	Reason             string // revocation reason word
 	DeleteAfterRevoke  bool
 

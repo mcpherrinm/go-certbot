@@ -34,6 +34,9 @@ func Revoke(ctx context.Context, cfg *config.Config, reg *plugins.Registry) erro
 	if cfg.CertName == "" && cfg.CertPath == "" {
 		return errors.New("revoke: --cert-name or --cert-path is required")
 	}
+	if cfg.CertName != "" && cfg.CertPath != "" {
+		return errors.New("revoke: exactly one of --cert-name or --cert-path must be specified")
+	}
 	certPath := cfg.CertPath
 	if certPath == "" {
 		conf, err := renewalconf.Load(filepath.Join(cfg.RenewalConfigsDir(), cfg.CertName+".conf"))
@@ -54,35 +57,71 @@ func Revoke(ctx context.Context, cfg *config.Config, reg *plugins.Registry) erro
 		return err
 	}
 
-	accountsDir, err := cfg.AccountsDir()
-	if err != nil {
-		return err
+	// Two revocation paths (RFC 8555 §7.6):
+	//   1. account-key revocation — load the local ACME account and POST.
+	//   2. cert-key revocation — use the certificate's own private key.
+	// Path 2 is what `--key-path` enables; useful when revoking a cert that
+	// wasn't issued by any local account.
+	if cfg.KeyPath != "" {
+		if err := revokeWithCertKey(ctx, cfg, certBytes, cfg.KeyPath, reason); err != nil {
+			return err
+		}
+	} else {
+		accountsDir, err := cfg.AccountsDir()
+		if err != nil {
+			return err
+		}
+		store := &account.FileStorage{
+			AccountsDir:       accountsDir,
+			StrictPermissions: cfg.StrictPermissions,
+		}
+		acc, err := loadOrCreateAccount(cfg, store)
+		if err != nil {
+			return err
+		}
+		if acc.Registration.URI == "" {
+			return errors.New("revoke: no registered account; use --key-path to revoke with the cert's own key, or register first")
+		}
+		c, err := client.New(cfg, acc)
+		if err != nil {
+			return err
+		}
+		if err := c.RevokeWithReason(ctx, certBytes, reason); err != nil {
+			return err
+		}
 	}
-	store := &account.FileStorage{
-		AccountsDir:       accountsDir,
-		StrictPermissions: cfg.StrictPermissions,
-	}
-	acc, err := loadOrCreateAccount(cfg, store)
-	if err != nil {
-		return err
-	}
-	if acc.Registration.URI == "" {
-		return errors.New("revoke: no registered account; nothing to revoke as")
-	}
-	c, err := client.New(cfg, acc)
-	if err != nil {
-		return err
-	}
-	if err := c.RevokeWithReason(ctx, certBytes, reason); err != nil {
-		return err
-	}
-	fmt.Printf("Revoked certificate at %s\n", certPath)
+	fmt.Printf("Congratulations! You have successfully revoked the certificate that was located at %s.\n", certPath)
 
 	if cfg.CertName != "" && cfg.DeleteAfterRevoke {
 		// Reuse Delete logic to also remove on-disk state.
 		return Delete(ctx, cfg, reg)
 	}
 	return nil
+}
+
+// revokeWithCertKey performs cert-key revocation per RFC 8555 §7.6. The cert's
+// own private key signs the revocation JWS; no ACME account is involved.
+// We pipe through lego by constructing an anonymous client with the cert key
+// in place of the account key — lego's Certifier.RevokeWithReason accepts that
+// usage when the URL is a directory's revokeCert endpoint.
+func revokeWithCertKey(ctx context.Context, cfg *config.Config, certPEM []byte, keyPath string, reason uint) error {
+	keyBytes, err := os.ReadFile(keyPath)
+	if err != nil {
+		return fmt.Errorf("revoke: read key %s: %w", keyPath, err)
+	}
+	// Build a transient Account holding the cert's private key and an empty
+	// registration URI. The client wrapper recognizes "no Location" and
+	// emits an unsigned revocation request keyed by the cert's key.
+	transient, err := account.ParsePrivateKeyPEM(keyBytes)
+	if err != nil {
+		return err
+	}
+	acc := &account.Account{Key: transient}
+	c, err := client.New(cfg, acc)
+	if err != nil {
+		return err
+	}
+	return c.RevokeWithReason(ctx, certPEM, reason)
 }
 
 func lookupReason(name string) (uint, error) {

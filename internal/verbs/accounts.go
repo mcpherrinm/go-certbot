@@ -2,6 +2,8 @@ package verbs
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"os"
@@ -39,10 +41,10 @@ func Register(ctx context.Context, cfg *config.Config, _ *plugins.Registry) erro
 		return err
 	}
 	if len(existing) > 0 {
-		// Match Certbot's behavior: register doesn't overwrite. Tell the user.
-		fmt.Printf("Account already registered at %s (id=%s)\n",
-			existing[0].Registration.URI, existing[0].ID)
-		return nil
+		// Match Certbot main.register: error out rather than silently
+		// succeed when an account already exists.
+		return fmt.Errorf("register: there is an existing account; use update_account or unregister first (existing URL: %s)",
+			existing[0].Registration.URI)
 	}
 	key, err := account.NewKey(cfg.KeyType, cfg.RSAKeySize)
 	if err != nil {
@@ -65,29 +67,51 @@ func Register(ctx context.Context, cfg *config.Config, _ *plugins.Registry) erro
 	if err := c.EnsureRegistered(ctx, store); err != nil {
 		return err
 	}
-	fmt.Printf("Registered account at %s (id=%s)\n", acc.Registration.URI, acc.ID)
+	fmt.Println("Account registered.")
 	return nil
 }
 
-// ShowAccount prints the current account's details.
+// ShowAccount prints the current account's details. Format matches
+// certbot main.show_account: a header line then indented fields.
 func ShowAccount(_ context.Context, cfg *config.Config, _ *plugins.Registry) error {
 	store, acc, err := loadAccountOrFail(cfg)
 	if err != nil {
 		return err
 	}
 	_ = store
-	fmt.Printf("Account id: %s\n", acc.ID)
-	fmt.Printf("Account URL: %s\n", acc.Registration.URI)
-	contacts := acc.Contact
-	if len(contacts) > 0 {
-		fmt.Printf("Email contact: %s\n", strings.Join(contacts, ", "))
-	} else {
-		fmt.Println("Email contact: (none)")
+	fmt.Printf("Account details for server %s:\n", cfg.EffectiveServer())
+	fmt.Printf("  Account URL: %s\n", acc.Registration.URI)
+	thumb, _ := accountThumbprint(acc)
+	if thumb != "" {
+		fmt.Printf("  Account Thumbprint: %s\n", thumb)
 	}
-	if acc.Meta.CreationHost != "" {
-		fmt.Printf("Created on: %s at %s\n", acc.Meta.CreationHost, acc.Meta.CreationDT.Format("2006-01-02"))
+	// Strip the "mailto:" URI prefix before display.
+	stripped := make([]string, 0, len(acc.Contact))
+	for _, c := range acc.Contact {
+		stripped = append(stripped, strings.TrimPrefix(c, "mailto:"))
+	}
+	label := "Email contact"
+	if len(stripped) > 1 {
+		label = "Email contacts"
+	}
+	if len(stripped) > 0 {
+		fmt.Printf("  %s: %s\n", label, strings.Join(stripped, ", "))
+	} else {
+		fmt.Printf("  %s: (none)\n", label)
 	}
 	return nil
+}
+
+// accountThumbprint returns the lego/josepy-format thumbprint of the
+// account key (JWK SHA-256 fingerprint, base64url-encoded). Matches
+// the "Account Thumbprint" line in Certbot's show_account output.
+func accountThumbprint(acc *account.Account) (string, error) {
+	jwk, err := account.MarshalJWK(acc.Key)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(jwk)
+	return base64.RawURLEncoding.EncodeToString(sum[:]), nil
 }
 
 // UpdateAccount updates the contact email for the current account.
@@ -112,19 +136,34 @@ func UpdateAccount(ctx context.Context, cfg *config.Config, _ *plugins.Registry)
 	} else {
 		acc.Contact = nil
 	}
-	if err := store.Save(acc); err != nil {
+	if err := store.UpdateRegistration(acc); err != nil {
 		return err
 	}
-	fmt.Println("Account updated.")
+	if cfg.Email != "" {
+		fmt.Printf("Your e-mail address was updated to %s.\n", cfg.Email)
+	} else {
+		fmt.Println("Any contact information associated with this account has been removed.")
+	}
 	return nil
 }
 
 // Unregister deactivates the current account at the ACME server and removes
-// the on-disk account directory.
+// the on-disk account directory. Prompts unless --non-interactive.
 func Unregister(ctx context.Context, cfg *config.Config, _ *plugins.Registry) error {
 	store, acc, err := loadAccountOrFail(cfg)
 	if err != nil {
 		return err
+	}
+	if !cfg.NonInteractive {
+		fmt.Fprintf(os.Stderr,
+			"You are about to deactivate account %s at %s. After this, the\n"+
+				"account key can no longer be used for new orders and the account is\n"+
+				"effectively destroyed.\n",
+			acc.ID, cfg.EffectiveServer())
+		if !confirmYesNo("Continue?") {
+			fmt.Println("unregister: aborted by user.")
+			return nil
+		}
 	}
 	c, err := client.New(cfg, acc)
 	if err != nil {

@@ -54,6 +54,7 @@ func registerFlags(fs *pflag.FlagSet, c *config.Config) {
 	fs.BoolVar(&c.AllowSubsetOfNames, "allow-subset-of-names", c.AllowSubsetOfNames, "Continue if a subset of names authorize.")
 	fs.StringVar(&c.CSR, "csr", c.CSR, "Path to a CSR (DER or PEM); --csr-driven issuance with certonly.")
 	fs.StringVar(&c.CertPath, "cert-path", c.CertPath, "Path to an existing fullchain PEM (revoke/install).")
+	fs.StringVar(&c.KeyPath, "key-path", c.KeyPath, "Path to an existing private key (install / revoke --key-path).")
 	fs.StringVar(&c.Reason, "reason", c.Reason, "Revocation reason: unspecified, keycompromise, affiliationchanged, superseded, cessationofoperation.")
 	fs.BoolVar(&c.DeleteAfterRevoke, "delete-after-revoke", c.DeleteAfterRevoke, "Also delete lineage files after a successful revoke.")
 
