@@ -35,6 +35,7 @@ import (
 	"github.com/go-acme/lego/v5/challenge"
 	"github.com/go-acme/lego/v5/challenge/http01"
 
+	"github.com/letsencrypt/go-certbot/internal/checkpoint"
 	"github.com/letsencrypt/go-certbot/internal/config"
 	"github.com/letsencrypt/go-certbot/internal/plugins"
 	"github.com/letsencrypt/go-certbot/internal/plugins/nginx/parser"
@@ -133,36 +134,140 @@ func (p *Plugin) CleanUp(_ context.Context, _, token, _ string) error {
 
 // Install implements plugins.Installer: inserts the issued cert into every
 // matching server block. fullchainPath / privkeyPath point at the live/
-// symlinks the storage layer just wrote.
+// symlinks the storage layer just wrote. Follows `include` directives so the
+// standard Debian/Ubuntu layout (vhosts under sites-enabled/*.conf) works.
 func (p *Plugin) Install(ctx context.Context, cfg *config.Config, domains []string, fullchainPath, privkeyPath string) error {
 	configPath := nginxConfigPath(cfg)
-	srcBytes, err := os.ReadFile(configPath)
+	files, err := loadAll(configPath)
 	if err != nil {
-		return fmt.Errorf("nginx: %s: %w", configPath, err)
+		return err
 	}
-	root, err := parser.Parse(string(srcBytes))
-	if err != nil {
-		return fmt.Errorf("nginx: parse %s: %w", configPath, err)
+	hits := findMatchingServersAcrossFiles(files, domains)
+	if len(hits) == 0 {
+		return fmt.Errorf("nginx: no server block matched any of %v in %s (or its includes)", domains, configPath)
 	}
-
-	matched := findMatchingServers(root, domains)
-	if len(matched) == 0 {
-		return fmt.Errorf("nginx: no server block matched any of %v in %s", domains, configPath)
-	}
-	for _, srv := range matched {
-		insertSSLDirectives(srv, fullchainPath, privkeyPath, cfg.HTTPSPort)
+	// Find the chain path to enable OCSP stapling correctly later. For
+	// install we accept it implicitly: the fullchain IS the chain we want
+	// nginx to use for ssl_trusted_certificate.
+	for _, h := range hits {
+		insertSSLDirectives(h.Server, fullchainPath, privkeyPath, cfg.HTTPSPort)
 		if cfg.Redirect != nil && *cfg.Redirect {
-			// We don't *create* a redirect server; instead, on the existing
-			// :80 server we rewrite "return 301 https://$host$request_uri" if
-			// it isn't already redirecting. Simplified vs Certbot's
-			// auto-create-redirect-server behavior — documented in CHANGES.
-			addRedirectIfHTTPOnly(srv)
+			addRedirectIfHTTPOnly(h.Server)
 		}
 	}
-	if err := os.WriteFile(configPath, []byte(root.String()), 0o644); err != nil {
-		return fmt.Errorf("nginx: write %s: %w", configPath, err)
+	// If --redirect was set and we found only HTTPS-shaped servers (e.g.
+	// only :443 exists), clone the matched server to a new HTTP-only
+	// :80 sibling that 301s — matches Certbot's _enable_redirect.
+	if cfg.Redirect != nil && *cfg.Redirect {
+		ensureRedirectExists(files, hits)
+	}
+	// Checkpoint every file before writing so rollback can undo this.
+	paths := make([]string, 0, len(files))
+	for _, f := range files {
+		paths = append(paths, f.Path)
+	}
+	if _, err := checkpoint.Save(cfg.WorkDir, "nginx-install", paths); err != nil {
+		return fmt.Errorf("nginx: checkpoint: %w", err)
+	}
+	if err := writeAllFiles(files); err != nil {
+		return err
 	}
 	return testAndReload(ctx, cfg)
+}
+
+// serverIsHTTPS reports whether the server block listens on :443 or has any
+// listen directive with the `ssl` keyword.
+func serverIsHTTPS(srv *parser.Block) bool {
+	for _, n := range srv.Body {
+		d, ok := n.(*parser.Directive)
+		if !ok || d.Name != "listen" || len(d.Args) == 0 {
+			continue
+		}
+		if containsArg(d.Args, "ssl") {
+			return true
+		}
+		_, port, _ := splitListenAddr(d.Args[0])
+		if port == "443" {
+			return true
+		}
+	}
+	return false
+}
+
+// ensureRedirectExists adds a sibling :80 server block that 301s to https
+// when a matched server has no HTTP-only counterpart. Called only after
+// install when --redirect is true.
+func ensureRedirectExists(files []*parsedFile, hits []serverHit) {
+	// For each unique ServerName in our hits, check whether any file has
+	// an HTTP-only :80 server with that name. If not, append a redirect
+	// server to the file the hit lives in.
+	for _, h := range hits {
+		if !serverIsHTTPS(h.Server) {
+			continue // hit is HTTP; addRedirectIfHTTPOnly already handled it
+		}
+		names := serverNames(h.Server)
+		if hasHTTPRedirectAlready(files, names) {
+			continue
+		}
+		h.File.AST.Nodes = append(h.File.AST.Nodes, newRedirectServer(names))
+	}
+}
+
+func serverNames(b *parser.Block) []string {
+	for _, n := range b.Body {
+		if d, ok := n.(*parser.Directive); ok && d.Name == "server_name" {
+			return append([]string(nil), d.Args...)
+		}
+	}
+	return nil
+}
+
+func hasHTTPRedirectAlready(files []*parsedFile, names []string) bool {
+	for _, f := range files {
+		for _, n := range f.AST.Nodes {
+			b, ok := n.(*parser.Block)
+			if !ok || b.Name != "server" {
+				continue
+			}
+			hasHTTP := false
+			for _, c := range b.Body {
+				d, ok := c.(*parser.Directive)
+				if !ok || d.Name != "listen" {
+					continue
+				}
+				if !containsArg(d.Args, "ssl") {
+					_, port, _ := splitListenAddr(d.Args[0])
+					if port == "80" {
+						hasHTTP = true
+					}
+				}
+			}
+			if !hasHTTP {
+				continue
+			}
+			for _, want := range serverNames(b) {
+				for _, n := range names {
+					if want == n {
+						return true
+					}
+				}
+			}
+		}
+	}
+	return false
+}
+
+func newRedirectServer(names []string) *parser.Block {
+	return &parser.Block{
+		Whitespace: "\n",
+		Name:       "server",
+		Body: []parser.Node{
+			&parser.Directive{Whitespace: "\n    ", Name: "listen", Args: []string{"80"}, Semicolon: true},
+			&parser.Directive{Whitespace: "\n    ", Name: "server_name", Args: names, Semicolon: true},
+			&parser.Directive{Whitespace: "\n    ", Name: "return", Args: []string{"301", "https://$host$request_uri"}, Semicolon: true},
+		},
+		BeforeClose: "\n",
+	}
 }
 
 // nginxConfigPath returns the file the user pointed us at. Honors
@@ -320,8 +425,13 @@ func addListenSSL(b *parser.Block, indent string, port int) {
 }
 
 // splitListenAddr parses an nginx listen value into host/port.
-// Accepts plain "80", "127.0.0.1:80", "[::]:80".
+// Accepts plain "80", "127.0.0.1:80", "[::]:80". Returns ok=false for
+// unix:/... socket forms so callers skip those vhosts (we can't SSL-upgrade
+// a unix listener).
 func splitListenAddr(v string) (host, port string, ok bool) {
+	if strings.HasPrefix(v, "unix:") {
+		return "", "", false
+	}
 	if strings.HasPrefix(v, "[") {
 		i := strings.Index(v, "]:")
 		if i < 0 {
@@ -391,7 +501,9 @@ func addRedirectIfHTTPOnly(srv *parser.Block) {
 	})
 }
 
-// testAndReload runs `nginx -t` then `nginx -s reload`. Uses cfg.NginxCtl if set.
+// testAndReload runs `nginx -t` then `nginx -s reload`. If reload fails
+// (typically because nginx isn't running yet), fall back to `nginx -c <conf>`
+// to start it — matches Certbot's restart() behavior.
 func testAndReload(ctx context.Context, cfg *config.Config) error {
 	ctl := cfg.NginxCtl
 	if ctl == "" {
@@ -400,53 +512,74 @@ func testAndReload(ctx context.Context, cfg *config.Config) error {
 	if out, err := exec.CommandContext(ctx, ctl, "-t").CombinedOutput(); err != nil {
 		return fmt.Errorf("nginx: `%s -t` failed: %w\n%s", ctl, err, string(out))
 	}
-	if out, err := exec.CommandContext(ctx, ctl, "-s", "reload").CombinedOutput(); err != nil {
-		return fmt.Errorf("nginx: `%s -s reload` failed: %w\n%s", ctl, err, string(out))
+	if out, err := exec.CommandContext(ctx, ctl, "-s", "reload").CombinedOutput(); err == nil {
+		_ = out
+		return nil
+	}
+	// Reload failed — likely nginx isn't running. Try to start it.
+	cmd := exec.CommandContext(ctx, ctl)
+	if cfg.NginxConfig != "" {
+		cmd = exec.CommandContext(ctx, ctl, "-c", cfg.NginxConfig)
+	}
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("nginx: reload failed and `%s` (start) also failed: %w\n%s", ctl, err, string(out))
 	}
 	return nil
 }
 
-// injectChallengeLocations parses the config and inserts a temporary
+// injectChallengeLocations follows include directives, inserts a temporary
 // `location /.well-known/acme-challenge/` block into every server matching
-// any requested domain. The state is recorded so Cleanup can undo it.
+// any requested domain across all files, and writes them back. State is
+// tracked so Cleanup can undo each file. A checkpoint is taken so the
+// rollback verb can also recover.
 func (p *Plugin) injectChallengeLocations(configPath, webroot string) error {
-	srcBytes, err := os.ReadFile(configPath)
+	files, err := loadAll(configPath)
 	if err != nil {
 		return err
 	}
-	root, err := parser.Parse(string(srcBytes))
-	if err != nil {
-		return err
+	hits := findMatchingServersAcrossFiles(files, p.domains)
+	if len(hits) == 0 {
+		return fmt.Errorf("nginx: no server block in %s (or its includes) matches any of %v", configPath, p.domains)
 	}
-	matched := findMatchingServers(root, p.domains)
-	if len(matched) == 0 {
-		return fmt.Errorf("nginx: no server block in %s matches any of %v", configPath, p.domains)
-	}
-	for _, srv := range matched {
-		injectChallengeLocation(srv, webroot)
+	for _, h := range hits {
+		injectChallengeLocation(h.Server, webroot)
 		p.mu.Lock()
-		p.addedLocations = append(p.addedLocations, &serverLocation{confPath: configPath, server: srv})
+		p.addedLocations = append(p.addedLocations, &serverLocation{confPath: h.File.Path, server: h.Server})
 		p.mu.Unlock()
 	}
-	return os.WriteFile(configPath, []byte(root.String()), 0o644)
+	// Checkpoint before mutation so rollback recovers if reload fails.
+	paths := make([]string, 0, len(files))
+	for _, f := range files {
+		paths = append(paths, f.Path)
+	}
+	if _, err := checkpoint.Save(p.cfg.WorkDir, "nginx-challenge", paths); err != nil {
+		return fmt.Errorf("nginx: checkpoint: %w", err)
+	}
+	return writeAllFiles(files)
 }
 
 func (p *Plugin) removeChallengeLocations() error {
-	// Each call mutates the same config file; re-parse + strip + write.
-	if len(p.addedLocations) == 0 {
-		return nil
+	// Strip the marker location across every file we touched.
+	seen := map[string]bool{}
+	for _, sl := range p.addedLocations {
+		if seen[sl.confPath] {
+			continue
+		}
+		seen[sl.confPath] = true
+		srcBytes, err := os.ReadFile(sl.confPath)
+		if err != nil {
+			return err
+		}
+		root, err := parser.Parse(string(srcBytes))
+		if err != nil {
+			return err
+		}
+		stripChallengeLocations(root.Nodes)
+		if err := os.WriteFile(sl.confPath, []byte(root.String()), 0o644); err != nil {
+			return err
+		}
 	}
-	confPath := p.addedLocations[0].confPath
-	srcBytes, err := os.ReadFile(confPath)
-	if err != nil {
-		return err
-	}
-	root, err := parser.Parse(string(srcBytes))
-	if err != nil {
-		return err
-	}
-	stripChallengeLocations(root.Nodes)
-	return os.WriteFile(confPath, []byte(root.String()), 0o644)
+	return nil
 }
 
 // injectChallengeLocation appends a sentinel location block to the server.
