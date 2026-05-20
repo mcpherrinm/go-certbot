@@ -48,6 +48,7 @@ type Config struct {
 	TOS                          bool
 	Account                      string
 	NoEFFEmail                   bool
+	EFFEmailExplicit             bool // --eff-email was passed (vs unset)
 
 	// Certificate request
 	Domains            []string
@@ -92,9 +93,13 @@ type Config struct {
 	Verbose          int
 
 	// Hooks
-	PreHook    string
-	PostHook   string
-	DeployHook string
+	PreHook            string
+	PostHook           string
+	DeployHook         string
+	DisableHookValidation bool
+	ManualAuthHook     string
+	ManualCleanupHook  string
+	ManualPublicIPLoggingOK bool
 
 	// User agent
 	UserAgent        string

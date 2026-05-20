@@ -15,7 +15,9 @@ import (
 
 	"github.com/letsencrypt/go-certbot/internal/config"
 	"github.com/letsencrypt/go-certbot/internal/plugins"
+	"github.com/letsencrypt/go-certbot/internal/plugins/manual"
 	"github.com/letsencrypt/go-certbot/internal/plugins/standalone"
+	"github.com/letsencrypt/go-certbot/internal/plugins/webroot"
 	"github.com/letsencrypt/go-certbot/internal/verbs"
 )
 
@@ -95,6 +97,8 @@ func Main(args []string) int {
 
 	reg := plugins.NewRegistry()
 	reg.RegisterAuthenticator(standalone.New())
+	reg.RegisterAuthenticator(webroot.New())
+	reg.RegisterAuthenticator(manual.New())
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
