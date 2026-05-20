@@ -76,6 +76,11 @@ type Config struct {
 	Configurator  string
 	Apache        bool
 	Nginx         bool
+	// Nginx-specific
+	NginxConfig     string // explicit nginx.conf path; overrides NginxServerRoot
+	NginxServerRoot string // /etc/nginx default
+	NginxCtl        string // nginx binary (default "nginx")
+	Redirect        *bool  // tri-state: nil = ask/auto, true = add 301, false = skip
 	Standalone    bool
 	Webroot       bool
 	WebrootPath   []string

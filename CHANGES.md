@@ -5,7 +5,46 @@ This file tracks every behavior in **go-certbot** that differs from upstream
 drop-in compatibility, so this file should stay short. Anything not listed
 here should behave identically to Certbot.
 
-## Phase 4 (current)
+## Phase 5 (current)
+
+### Implemented
+
+- **`nginx` plugin** acting as both authenticator and installer.
+  - http-01 authentication: injects a temporary `location
+    /.well-known/acme-challenge/` block into every matching server,
+    serves the challenge from a scratch dir, reloads nginx, and
+    removes the location block on cleanup.
+  - Install: locates server blocks via `server_name` matching (exact
+    + `*.example.com` suffix wildcard), writes
+    `ssl_certificate` / `ssl_certificate_key` /
+    `listen <port> ssl`, then `nginx -t` + `nginx -s reload`.
+  - `--redirect` / `--no-redirect`: when set, plain-HTTP server
+    blocks (listening on :80 only) get
+    `return 301 https://$host$request_uri`.
+- **`run` verb** (the default subcommand): picks an authenticator +
+  installer from `--nginx` / `--apache` / `--authenticator` /
+  `--installer` / `--configurator`, calls `obtain`, then `install`.
+  Hooks pre/post/deploy + `renewal-hooks/{pre,post,deploy}/` fire at
+  the same boundaries as in `certonly`.
+- **Hand-rolled nginx config parser** in `internal/plugins/nginx/parser/`.
+  Tokenizer + AST + emitter that round-trips real-world configs
+  preserving comments and whitespace where reasonable.
+
+### Known scope limits (documented now, planned for follow-ups)
+
+- **`include` directives** are not yet resolved — we operate on the
+  single file you point us at (default `/etc/nginx/nginx.conf`). If
+  your server blocks live under `sites-enabled/*.conf`, set
+  `--nginx-config /etc/nginx/sites-enabled/example.conf` for now.
+- **Auto-creating a server block** when no match exists is not yet
+  supported; we error out with a clear message.
+- **Auto-redirect server-block creation** (Certbot will create a new
+  `server { listen 80; return 301; }` if needed) is not implemented;
+  Phase 5 only upgrades an existing HTTP-only server.
+- **HSTS / OCSP-stapling / Auto-HSTS / Must-Staple insertion** and the
+  `enhance` verb come in Phase 7.
+
+## Phase 4
 
 ### Implemented
 
@@ -132,14 +171,12 @@ small behavioral difference.
 
 | Verb | Planned phase |
 | --- | --- |
-| `run` (the default) | Phase 1 final (after installers) |
-| `install`, `enhance`, `rollback` | Phase 5 (nginx) / Phase 6 (apache) |
+| `install`, `enhance`, `rollback` | Phase 6 (apache) / Phase 7 |
 
 Plugins not yet implemented (using them returns a clear error):
 
 | Plugin | Planned phase |
 | --- | --- |
-| `nginx` | Phase 5 |
 | `apache` | Phase 6 |
 
 ### Breaking changes (documented and intentional)
