@@ -48,6 +48,14 @@ const acmeV1Directory = "https://acme-v01.api.letsencrypt.org/directory"
 //   - renewal-hooks/{pre,post,deploy}/* dirs alongside the flag hooks,
 //     gated by --directory-hooks (default on)
 func Renew(ctx context.Context, cfg *config.Config, reg *plugins.Registry) error {
+	// Clear `domains` if it came from cli.ini (NOT from -d on argv). Some
+	// users keep `domains = X` in cli.ini for their certonly runs and don't
+	// expect `certbot renew` to die. certbot helpful.py
+	// remove_config_file_domains_for_renewal does the same. We only clear
+	// when the source is the config file — explicit -d on argv still errors.
+	if cfg.Sources["domain"] == config.SourceConfigFile {
+		cfg.Domains = nil
+	}
 	// Reject -d / --ip-address with `renew` (matches certbot renewal.py:641
 	// after #10225). The renew verb selects lineages by --cert-name only;
 	// users who want to renew by SAN should use `certonly`. --allow-subset-

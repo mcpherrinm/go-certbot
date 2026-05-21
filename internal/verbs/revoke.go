@@ -2,6 +2,10 @@ package verbs
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"os"
@@ -244,10 +248,52 @@ func revokeWithCertKey(ctx context.Context, cfg *config.Config, certPEM []byte, 
 	if err != nil {
 		return err
 	}
+	// Verify the supplied key matches the cert's public key before sending
+	// the revocation request. Otherwise the ACME server rejects the JWS
+	// with "unauthorized" and the user gets an opaque error. Mirrors certbot
+	// crypto_util.verify_cert_matches_priv_key (crypto_util.py:375).
+	if err := verifyCertMatchesKey(certPEM, transient); err != nil {
+		return fmt.Errorf("verifying the certificate matches the private key located at %s has failed: %w", keyPath, err)
+	}
 	acc := &account.Account{Key: transient}
 	c, err := client.New(cfg, acc)
 	if err != nil {
 		return err
 	}
 	return c.RevokeWithReason(ctx, certPEM, reason)
+}
+
+// verifyCertMatchesKey returns nil iff `key` is the private counterpart of the
+// public key in the leaf certificate of `certPEM`. Mirrors certbot's
+// SSL.Context.check_privatekey check.
+func verifyCertMatchesKey(certPEM []byte, key any) error {
+	block, _ := pem.Decode(certPEM)
+	if block == nil {
+		return errors.New("revoke: empty cert PEM")
+	}
+	leaf, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return err
+	}
+	switch certPub := leaf.PublicKey.(type) {
+	case *rsa.PublicKey:
+		k, ok := key.(*rsa.PrivateKey)
+		if !ok {
+			return errors.New("revoke: cert is RSA but key is not")
+		}
+		if k.N.Cmp(certPub.N) != 0 || k.E != certPub.E {
+			return errors.New("revoke: RSA key does not match cert")
+		}
+	case *ecdsa.PublicKey:
+		k, ok := key.(*ecdsa.PrivateKey)
+		if !ok {
+			return errors.New("revoke: cert is ECDSA but key is not")
+		}
+		if k.X.Cmp(certPub.X) != 0 || k.Y.Cmp(certPub.Y) != 0 || k.Curve != certPub.Curve {
+			return errors.New("revoke: ECDSA key does not match cert")
+		}
+	default:
+		return fmt.Errorf("revoke: unsupported cert key type %T", certPub)
+	}
+	return nil
 }
