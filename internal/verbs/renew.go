@@ -346,6 +346,20 @@ func mergeFromRenewalConf(cfg *config.Config, conf *renewalconf.File) {
 			cfg.Domains = list
 		}
 	}
+	// Certbot doesn't write `domains` to renewal.conf at all (it derives
+	// SANs from the cert at renew time — renewal.py:151-152). When the
+	// merged Domains is still empty, read the cert and pull DNS names +
+	// IP SANs out so go-certbot can renew lineages issued by Certbot.
+	if !cfg.SetByUser("domain") && len(cfg.Domains) == 0 {
+		if certPath := conf.Top["cert"]; certPath != "" {
+			if dns, ips, err := sansFromCert(certPath); err == nil {
+				cfg.Domains = dns
+				if len(cfg.IPAddresses) == 0 {
+					cfg.IPAddresses = ips
+				}
+			}
+		}
+	}
 	// Webroot path + per-domain map (skipped when user passed
 	// --webroot-path / --webroot-map per VAR_MODIFIERS).
 	if !webrootMapSetByUser {
@@ -420,6 +434,42 @@ var deprecatedRenewalParams = []string{
 	"no_permissions_check",
 	"dns_route53_propagation_seconds",
 	"certbot_route53:auth_propagation_seconds",
+}
+
+// sansFromCert parses the PEM-encoded cert at path and returns its DNS
+// names and IP-address SANs separately. Used when a renewal.conf doesn't
+// list `domains` (Certbot omits this key and derives SANs from the cert).
+func sansFromCert(path string) ([]string, []string, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	block, _ := pem.Decode(b)
+	if block == nil {
+		return nil, nil, errors.New("renew: empty cert PEM")
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return nil, nil, err
+	}
+	dns := append([]string(nil), cert.DNSNames...)
+	if cert.Subject.CommonName != "" {
+		seen := false
+		for _, n := range dns {
+			if n == cert.Subject.CommonName {
+				seen = true
+				break
+			}
+		}
+		if !seen {
+			dns = append(dns, cert.Subject.CommonName)
+		}
+	}
+	var ips []string
+	for _, ip := range cert.IPAddresses {
+		ips = append(ips, ip.String())
+	}
+	return dns, ips, nil
 }
 
 // needsRenewal returns true if the cert is near expiry, with the cert's
