@@ -101,9 +101,18 @@ func readARIRetryAfter(conf *renewalconf.File) *time.Time {
 	if !ok || raw == "" {
 		return nil
 	}
-	t, err := time.Parse(time.RFC3339, raw)
+	// Certbot writes the timestamp via Python's datetime.isoformat(
+	// timespec="seconds") on a NAIVE datetime (no tzinfo) — see
+	// renewal.py:407. The resulting form is `2026-05-21T12:34:56`
+	// (no `Z`, no offset). Parsing as RFC3339 would fail because
+	// time.RFC3339 requires the suffix. Try the naive form first,
+	// then fall back to RFC3339 in case an older go-certbot wrote a
+	// tz-suffixed value.
+	t, err := time.Parse("2006-01-02T15:04:05", raw)
 	if err != nil {
-		return nil
+		if t, err = time.Parse(time.RFC3339, raw); err != nil {
+			return nil
+		}
 	}
 	return &t
 }
@@ -112,6 +121,12 @@ func writeARIRetryAfter(conf *renewalconf.File, confPath string, at time.Time) {
 	if conf == nil || confPath == "" {
 		return
 	}
-	conf.SetSection("acme_renewal_info", "ari_retry_after", at.UTC().Format(time.RFC3339))
+	// Match Certbot's naive (timezone-less) ISO format. Certbot's reader
+	// (renewal.py:381-383) does `datetime.fromisoformat(value)` and then
+	// compares to `datetime.now()` (also naive); a tz-aware value here
+	// causes Python to raise `can't compare offset-naive and offset-aware
+	// datetimes` and aborts the renewal. The value is implicitly UTC
+	// because both sides use naive UTC throughout the ARI flow.
+	conf.SetSection("acme_renewal_info", "ari_retry_after", at.UTC().Format("2006-01-02T15:04:05"))
 	_ = conf.Save(confPath)
 }

@@ -1,6 +1,7 @@
 package renewalconf
 
 import (
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -122,6 +123,53 @@ func TestFormatValueListSemantics(t *testing.T) {
 		if got := formatValue(tc.in); got != tc.want {
 			t.Errorf("formatValue(%q) = %q, want %q", tc.in, got, tc.want)
 		}
+	}
+}
+
+// TestLoadPreservesUnknownSections asserts that a renewal conf with an
+// [acme_renewal_info] section can be loaded, mutated, and saved without
+// losing the section. Mirrors the ARI Retry-After persistence contract:
+// Certbot writes [acme_renewal_info] and expects go-certbot to leave it
+// alone on subsequent renewals, and vice versa.
+func TestLoadPreservesUnknownSections(t *testing.T) {
+	src := `version = 1.4.0
+archive_dir = /etc/letsencrypt/archive/example.com
+cert = /etc/letsencrypt/live/example.com/cert.pem
+privkey = /etc/letsencrypt/live/example.com/privkey.pem
+
+[renewalparams]
+authenticator = standalone
+server = https://acme-v02.api.letsencrypt.org/directory
+
+[acme_renewal_info]
+ari_retry_after = 2026-05-21T12:34:56
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "example.com.conf")
+	if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Mutate a known [renewalparams] key.
+	f.SetParam("server", "https://acme-staging-v02.api.letsencrypt.org/directory")
+	if err := f.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	got, err := readFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, "[acme_renewal_info]") {
+		t.Errorf("[acme_renewal_info] section dropped on round-trip:\n%s", got)
+	}
+	if !strings.Contains(got, "ari_retry_after = 2026-05-21T12:34:56") {
+		t.Errorf("ari_retry_after value dropped on round-trip:\n%s", got)
+	}
+	if !strings.Contains(got, "server = https://acme-staging-v02.api.letsencrypt.org/directory") {
+		t.Errorf("server param not updated:\n%s", got)
 	}
 }
 

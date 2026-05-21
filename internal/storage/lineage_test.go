@@ -94,6 +94,28 @@ func TestWriteIncrementsVersion(t *testing.T) {
 	}
 }
 
+// TestNextVersionAllKinds mirrors the certbot.storage.next_free_version
+// behavior: the next version is one more than the max version across all
+// of cert/privkey/chain/fullchain, not just cert.
+func TestNextVersionAllKinds(t *testing.T) {
+	dir := t.TempDir()
+	full, chain, key := makePEMChain(t)
+	if _, err := Write(dir, "x", full, chain, key, WriteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate an interrupted state: delete cert1.pem but leave the others.
+	if err := os.Remove(filepath.Join(dir, "archive", "x", "cert1.pem")); err != nil {
+		t.Fatal(err)
+	}
+	n, err := NextVersion(dir, "x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Errorf("NextVersion = %d after orphan privkey1/chain1/fullchain1, want 2", n)
+	}
+}
+
 // TestWritePropagatesPrivkeyMode mirrors certbot integration test
 // test_renew_files_propagate_permissions: when a user chmods their
 // privkey to add a group/other read bit, the next renewal must keep

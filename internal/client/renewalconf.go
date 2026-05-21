@@ -1,6 +1,8 @@
 package client
 
 import (
+	"errors"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -13,8 +15,24 @@ import (
 // writeRenewalConf produces a renewal/<certname>.conf compatible with
 // certbot._internal.renewal so the resulting lineage can be renewed by either
 // tool. Format and key names match certbot._internal.storage:make_renewal_configobj.
+//
+// If a conf already exists at the target path, it is loaded first and the
+// existing top-level sections (notably [acme_renewal_info] which holds the
+// ARI Retry-After cache) are preserved. Stale keys in [renewalparams] that
+// we don't write here are also preserved on disk so a Certbot-set key like
+// `renew_before_expiry` survives a go-certbot renewal cycle. This mirrors
+// certbot.storage.atomic_rewrite (storage.py:126-172).
 func writeRenewalConf(cfg *config.Config, certName, accountID string, domains []string, lineage *storage.Lineage) error {
-	f := renewalconf.New()
+	path := filepath.Join(cfg.RenewalConfigsDir(), certName+".conf")
+	var f *renewalconf.File
+	if existing, err := renewalconf.Load(path); err == nil {
+		f = existing
+	} else if errors.Is(err, os.ErrNotExist) {
+		f = renewalconf.New()
+	} else {
+		// Some other parse error — start fresh rather than block renewal.
+		f = renewalconf.New()
+	}
 
 	// Top-level keys exactly as Certbot's make_renewal_configobj writes them
 	// (storage.py:209-225). archive_dir and version are required by Certbot's
@@ -121,7 +139,6 @@ func writeRenewalConf(cfg *config.Config, certName, accountID string, domains []
 		f.SetParam("webroot_path", strings.Join(cfg.WebrootPath, ",")+",")
 	}
 
-	path := filepath.Join(cfg.RenewalConfigsDir(), certName+".conf")
 	return f.Save(path)
 }
 

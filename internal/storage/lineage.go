@@ -41,9 +41,14 @@ func ArchiveDir(configDir, certName string) string {
 	return filepath.Join(configDir, "archive", certName)
 }
 
-// NextVersion scans archive/<certname>/ and returns the next available
-// version number (one more than the highest cert<N>.pem present), or 1 if the
-// directory is empty/missing.
+// NextVersion scans archive/<certname>/ for any of {cert,privkey,chain,
+// fullchain}<N>.pem and returns one more than the highest N. Returns 1 if
+// the directory is empty/missing.
+//
+// Inspecting all four kinds (not just cert) prevents lineage corruption in
+// the case where, e.g., cert3.pem was manually deleted but privkey3.pem
+// still exists — using N=3 would overwrite the orphan privkey. Mirrors
+// certbot.storage.next_free_version (storage.py:843-855).
 func NextVersion(configDir, certName string) (int, error) {
 	archive := ArchiveDir(configDir, certName)
 	entries, err := os.ReadDir(archive)
@@ -55,16 +60,41 @@ func NextVersion(configDir, certName string) (int, error) {
 	}
 	highest := 0
 	for _, e := range entries {
-		name := e.Name()
-		if !strings.HasPrefix(name, "cert") || !strings.HasSuffix(name, ".pem") {
-			continue
-		}
-		n, err := strconv.Atoi(strings.TrimSuffix(strings.TrimPrefix(name, "cert"), ".pem"))
-		if err == nil && n > highest {
+		if n := archiveVersionFromName(e.Name()); n > highest {
 			highest = n
 		}
 	}
 	return highest + 1, nil
+}
+
+// archiveVersionFromName returns the N from "{cert,privkey,chain,fullchain}<N>.pem",
+// or 0 if the filename doesn't match.
+func archiveVersionFromName(name string) int {
+	if !strings.HasSuffix(name, ".pem") {
+		return 0
+	}
+	stem := strings.TrimSuffix(name, ".pem")
+	var rest string
+	switch {
+	case strings.HasPrefix(stem, "fullchain"):
+		rest = strings.TrimPrefix(stem, "fullchain")
+	case strings.HasPrefix(stem, "privkey"):
+		rest = strings.TrimPrefix(stem, "privkey")
+	case strings.HasPrefix(stem, "chain"):
+		rest = strings.TrimPrefix(stem, "chain")
+	case strings.HasPrefix(stem, "cert"):
+		rest = strings.TrimPrefix(stem, "cert")
+	default:
+		return 0
+	}
+	if rest == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(rest)
+	if err != nil {
+		return 0
+	}
+	return n
 }
 
 // archiveSet returns the four archive/<certname>/<kind>N.pem paths.
@@ -214,12 +244,7 @@ func EnsureDeployed(configDir, certName string) (int, error) {
 	}
 	highest := 0
 	for _, e := range entries {
-		name := e.Name()
-		if !strings.HasPrefix(name, "cert") || !strings.HasSuffix(name, ".pem") {
-			continue
-		}
-		n, err := strconv.Atoi(strings.TrimSuffix(strings.TrimPrefix(name, "cert"), ".pem"))
-		if err == nil && n > highest {
+		if n := archiveVersionFromName(e.Name()); n > highest {
 			highest = n
 		}
 	}
