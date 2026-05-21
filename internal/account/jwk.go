@@ -17,6 +17,7 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"math/big"
@@ -185,6 +186,29 @@ func SubjectPublicKeyInfoPEM(pub crypto.PublicKey) ([]byte, error) {
 	out = append(out, body...)
 	out = append(out, footer...)
 	return out, nil
+}
+
+// ParsePrivateKeyPEM accepts a PEM-encoded RSA or EC private key and returns
+// it in a form usable as a crypto.Signer. Used by revoke --key-path to do
+// cert-key revocation (RFC 8555 §7.6).
+func ParsePrivateKeyPEM(data []byte) (crypto.PrivateKey, error) {
+	block, _ := pem.Decode(data)
+	if block == nil {
+		return nil, errors.New("account: not a PEM block")
+	}
+	switch block.Type {
+	case "RSA PRIVATE KEY":
+		return x509.ParsePKCS1PrivateKey(block.Bytes)
+	case "EC PRIVATE KEY":
+		return x509.ParseECPrivateKey(block.Bytes)
+	case "PRIVATE KEY":
+		k, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+		if err != nil {
+			return nil, err
+		}
+		return k, nil
+	}
+	return nil, fmt.Errorf("account: unsupported PEM block %q", block.Type)
 }
 
 func b64uInt(n *big.Int) string {

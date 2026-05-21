@@ -26,7 +26,7 @@ import (
 )
 
 // version is the go-certbot version string; used in the User-Agent.
-const version = "0.1.0-phase1"
+const version = "0.3.0-phase3"
 
 // Client bundles a lego Client with the loaded account.
 type Client struct {
@@ -150,6 +150,29 @@ func (c *Client) Obtain(ctx context.Context, auth plugins.Authenticator, domains
 		return nil, err
 	}
 	return lineage, nil
+}
+
+// RevokeWithReason revokes the given PEM-encoded certificate using lego's
+// Certifier.RevokeWithReason. reason is an RFC 5280 code (use 0 if unset).
+func (c *Client) RevokeWithReason(ctx context.Context, certPEM []byte, reason uint) error {
+	r := reason // lego wants *uint, distinguish unspecified from 0
+	return c.lego.Certificate.RevokeWithReason(ctx, certPEM, &r)
+}
+
+// UpdateAccount changes the account's contact email at the ACME server.
+// Pass "" to clear it (use carefully — Let's Encrypt currently rejects this).
+func (c *Client) UpdateAccount(ctx context.Context, email string) error {
+	c.user.email = email
+	_, err := c.lego.Registration.UpdateRegistration(ctx, registration.RegisterOptions{
+		TermsOfServiceAgreed: true,
+	})
+	return err
+}
+
+// DeactivateAccount marks the account "deactivated" at the ACME server.
+// After this the account key can no longer be used for new orders.
+func (c *Client) DeactivateAccount(ctx context.Context) error {
+	return c.lego.Registration.DeleteRegistration(ctx)
 }
 
 // LeafExpiry parses the issued cert's NotAfter for logging.

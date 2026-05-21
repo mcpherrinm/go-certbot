@@ -53,6 +53,10 @@ func registerFlags(fs *pflag.FlagSet, c *config.Config) {
 	fs.BoolVar(&c.NewKey, "new-key", c.NewKey, "Generate a fresh private key on renewal.")
 	fs.BoolVar(&c.AllowSubsetOfNames, "allow-subset-of-names", c.AllowSubsetOfNames, "Continue if a subset of names authorize.")
 	fs.StringVar(&c.CSR, "csr", c.CSR, "Path to a CSR (DER or PEM); --csr-driven issuance with certonly.")
+	fs.StringVar(&c.CertPath, "cert-path", c.CertPath, "Path to an existing fullchain PEM (revoke/install).")
+	fs.StringVar(&c.KeyPath, "key-path", c.KeyPath, "Path to an existing private key (install / revoke --key-path).")
+	fs.StringVar(&c.Reason, "reason", c.Reason, "Revocation reason: unspecified, keycompromise, affiliationchanged, superseded, cessationofoperation.")
+	fs.BoolVar(&c.DeleteAfterRevoke, "delete-after-revoke", c.DeleteAfterRevoke, "Also delete lineage files after a successful revoke.")
 
 	// Plugin selection
 	fs.StringVar(&c.Authenticator, "authenticator", c.Authenticator, "Authenticator plugin name.")
@@ -102,8 +106,9 @@ func registerFlags(fs *pflag.FlagSet, c *config.Config) {
 	fs.StringSliceVar(&c.PreferredChallenges, "preferred-challenges", c.PreferredChallenges, "Preferred challenge types, comma-separated.")
 	fs.BoolVar(&c.RunDeployHooks, "run-deploy-hooks", c.RunDeployHooks, "Always run deploy hooks on `reconfigure`.")
 
-	// Path overrides for certonly --csr.
-	fs.StringVar(&c.AuthCertPath, "cert-path", c.AuthCertPath, "Where to write the leaf cert when using --csr.")
+	// Path overrides for certonly --csr. Note: --cert-path itself is also
+	// registered above (bound to c.CertPath for revoke/install). For
+	// certonly --csr destinations Certbot uses these chain variants.
 	fs.StringVar(&c.AuthChainPath, "chain-path", c.AuthChainPath, "Where to write the issuer chain when using --csr.")
 	fs.StringVar(&c.FullchainPath, "fullchain-path", c.FullchainPath, "Where to write the full chain when using --csr.")
 
