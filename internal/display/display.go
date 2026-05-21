@@ -25,13 +25,33 @@ var Default = &Input{In: os.Stdin, Out: os.Stderr}
 // YesNo prompts with a y/N question. Returns false on EOF or any non-"y"
 // reply. Matches `display_util.yesno(prompt, default=False)` semantics.
 func (i *Input) YesNo(prompt string) bool {
-	fmt.Fprintf(i.Out, "%s [y/N]: ", prompt)
+	return i.YesNoDefault(prompt, false)
+}
+
+// YesNoDefault prompts with a y/n question whose default tracks `def`. The
+// uppercase letter in the prompt indicates the default. Matches Certbot's
+// `display_util.yesno(prompt, default=True|False)`.
+func (i *Input) YesNoDefault(prompt string, def bool) bool {
+	tag := "[y/N]"
+	if def {
+		tag = "[Y/n]"
+	}
+	fmt.Fprintf(i.Out, "%s %s: ", prompt, tag)
 	scanner := bufio.NewScanner(i.In)
 	if !scanner.Scan() {
-		return false
+		return def
 	}
 	ans := strings.ToLower(strings.TrimSpace(scanner.Text()))
+	if ans == "" {
+		return def
+	}
 	return ans == "y" || ans == "yes"
+}
+
+// Notify writes a notification message (no input). Matches Certbot's
+// display_util.notification — used for "Successfully …" status lines.
+func (i *Input) Notify(msg string) {
+	fmt.Fprintln(i.Out, msg)
 }
 
 // Email prompts for an email address until the user supplies a non-empty
@@ -54,5 +74,11 @@ func (i *Input) Email(prompt string) string {
 // YesNo is the package-level shortcut on Default.
 func YesNo(prompt string) bool { return Default.YesNo(prompt) }
 
+// YesNoDefault is the package-level shortcut.
+func YesNoDefault(prompt string, def bool) bool { return Default.YesNoDefault(prompt, def) }
+
 // Email is the package-level shortcut on Default.
 func Email(prompt string) string { return Default.Email(prompt) }
+
+// Notify is the package-level shortcut.
+func Notify(msg string) { Default.Notify(msg) }

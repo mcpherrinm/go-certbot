@@ -48,12 +48,17 @@ func Run(ctx context.Context, cfg *config.Config, reg *plugins.Registry) error {
 	if err := hooks.Run(ctx, cfg.PreHook, nil); err != nil {
 		return err
 	}
-	if err := hooks.RunDir(ctx, cfg.HookDir("pre"), nil, cfg.PreHook); err != nil {
+	if err := hooks.RunDirIf(ctx, cfg.DirectoryHooks, cfg.HookDir("pre"), nil, cfg.PreHook); err != nil {
 		return err
 	}
+	var renewedDomains []string
 	defer func() {
-		_ = hooks.Run(ctx, cfg.PostHook, nil)
-		_ = hooks.RunDir(ctx, cfg.HookDir("post"), nil, cfg.PostHook)
+		// post-hook gets RENEWED_DOMAINS / FAILED_DOMAINS env. For run /
+		// certonly the FAILED list is always empty per Certbot
+		// hooks.py:post_hook 145.
+		env := hooks.PostEnv(renewedDomains, nil)
+		_ = hooks.Run(ctx, cfg.PostHook, env)
+		_ = hooks.RunDirIf(ctx, cfg.DirectoryHooks, cfg.HookDir("post"), env, cfg.PostHook)
 	}()
 
 	accountsDir, err := cfg.AccountsDir()
@@ -86,6 +91,7 @@ func Run(ctx context.Context, cfg *config.Config, reg *plugins.Registry) error {
 	if err != nil {
 		return err
 	}
+	renewedDomains = append([]string(nil), cfg.Domains...)
 
 	// Install.
 	if instName != "" && instName != "null" {
@@ -103,7 +109,7 @@ func Run(ctx context.Context, cfg *config.Config, reg *plugins.Registry) error {
 	if err := hooks.Run(ctx, cfg.DeployHook, env); err != nil {
 		slog.Warn("deploy_hook failed", "err", err)
 	}
-	if err := hooks.RunDir(ctx, cfg.HookDir("deploy"), env, cfg.DeployHook); err != nil {
+	if err := hooks.RunDirIf(ctx, cfg.DirectoryHooks, cfg.HookDir("deploy"), env, cfg.DeployHook); err != nil {
 		slog.Warn("deploy-hook directory failed", "err", err)
 	}
 

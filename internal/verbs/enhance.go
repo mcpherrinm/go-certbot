@@ -30,6 +30,13 @@ func Enhance(ctx context.Context, cfg *config.Config, reg *plugins.Registry) err
 	if cfg.Apache {
 		installerName = "apache"
 	}
+	if cfg.CertName == "" && len(domains) == 0 {
+		name, err := chooseCertName(cfg, "enhance")
+		if err != nil {
+			return err
+		}
+		cfg.CertName = name
+	}
 	if cfg.CertName != "" {
 		conf, err := renewalconf.Load(filepath.Join(cfg.RenewalConfigsDir(), cfg.CertName+".conf"))
 		if err != nil {

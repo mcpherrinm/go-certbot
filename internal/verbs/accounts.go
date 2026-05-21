@@ -144,9 +144,16 @@ func UpdateAccount(ctx context.Context, cfg *config.Config, _ *plugins.Registry)
 	if err := c.UpdateAccount(ctx, cfg.Email); err != nil {
 		return err
 	}
-	// Update on-disk contact.
+	// Update on-disk contact. Certbot splits comma-separated emails into
+	// one mailto: each (main.py:960).
 	if cfg.Email != "" {
-		acc.Contact = []string{"mailto:" + cfg.Email}
+		acc.Contact = nil
+		for _, e := range strings.Split(cfg.Email, ",") {
+			e = strings.TrimSpace(e)
+			if e != "" {
+				acc.Contact = append(acc.Contact, "mailto:"+e)
+			}
+		}
 	} else {
 		acc.Contact = nil
 	}
@@ -174,7 +181,8 @@ func Unregister(ctx context.Context, cfg *config.Config, _ *plugins.Registry) er
 				"account key can no longer be used for new orders and the account is\n"+
 				"effectively destroyed.\n",
 			acc.ID, cfg.EffectiveServer())
-		if !display.YesNo("Continue?") {
+		// Certbot defaults Yes on this prompt (main.py:872-892).
+		if !display.YesNoDefault("Are you sure you would like to deactivate this account?", true) {
 			fmt.Println("unregister: aborted by user.")
 			return nil
 		}
@@ -190,7 +198,11 @@ func Unregister(ctx context.Context, cfg *config.Config, _ *plugins.Registry) er
 	if err := os.RemoveAll(store.AccountsDir + string(os.PathSeparator) + acc.ID); err != nil {
 		return fmt.Errorf("unregister: remove %s: %w", acc.ID, err)
 	}
-	fmt.Printf("Unregistered account %s\n", acc.ID)
+	// Best-effort: rmdir the empty server parent dir so a re-registered
+	// account against a different server doesn't see a stale empty tree.
+	// Matches account.py:_delete_links_and_find_target_dir 280-294.
+	_ = os.Remove(store.AccountsDir)
+	fmt.Printf("Account deactivated.\n")
 	return nil
 }
 

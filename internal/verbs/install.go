@@ -30,6 +30,17 @@ func Install(ctx context.Context, cfg *config.Config, reg *plugins.Registry) err
 	var fullchainPath, privkeyPath string
 	domains := cfg.Domains
 
+	// Prompt for cert-name if neither --cert-name nor --cert-path was set
+	// and we're interactive. Matches main.py:_install_cert's
+	// _get_certbot_config_filename interactive path.
+	if cfg.CertName == "" && cfg.CertPath == "" {
+		name, err := chooseCertName(cfg, "install")
+		if err != nil {
+			return err
+		}
+		cfg.CertName = name
+	}
+
 	switch {
 	case cfg.CertPath != "" && cfg.KeyPath != "":
 		fullchainPath = cfg.CertPath

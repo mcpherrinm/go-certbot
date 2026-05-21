@@ -117,6 +117,11 @@ func RunDir(ctx context.Context, dir string, extraEnv []string, dedupAgainst ...
 		if e.IsDir() {
 			continue
 		}
+		// Skip editor backup files. Matches Certbot's list_hooks
+		// (hooks.py:276) `not path.endswith('~')`.
+		if strings.HasSuffix(e.Name(), "~") {
+			continue
+		}
 		names = append(names, e.Name())
 	}
 	sort.Strings(names)
@@ -192,4 +197,47 @@ func DeployEnv(lineagePath string, domains []string) []string {
 		"RENEWED_LINEAGE=" + lineagePath,
 		"RENEWED_DOMAINS=" + strings.Join(domains, " "),
 	}
+}
+
+// PostEnv builds the env slice for a post-hook invocation:
+//
+//	RENEWED_DOMAINS=<space-separated SANs of newly renewed certs>
+//	FAILED_DOMAINS=<space-separated SANs of certs that failed>
+//
+// Matches certbot/_internal/hooks.py:run_saved_post_hooks. Per Certbot,
+// non-renew verbs (run/certonly) pass FAILED_DOMAINS="".
+func PostEnv(renewed, failed []string) []string {
+	return []string{
+		"RENEWED_DOMAINS=" + strings.Join(renewed, " "),
+		"FAILED_DOMAINS=" + strings.Join(failed, " "),
+	}
+}
+
+// PreRunner deduplicates pre-hook commands so identical pre-hooks (e.g. one
+// per lineage from a multi-cert renew) only fire once per process. Mirrors
+// certbot/_internal/hooks.py:executed_pre_hooks.
+type PreRunner struct {
+	ran map[string]bool
+}
+
+// NewPreRunner returns a fresh PreRunner.
+func NewPreRunner() *PreRunner { return &PreRunner{ran: map[string]bool{}} }
+
+// Run executes cmd once. Subsequent calls with the same command string are
+// no-ops.
+func (p *PreRunner) Run(ctx context.Context, cmd string) error {
+	if cmd == "" || p.ran[cmd] {
+		return nil
+	}
+	p.ran[cmd] = true
+	return Run(ctx, cmd, nil)
+}
+
+// RunDirIf is RunDir gated by enabled. The shorter syntax centralizes the
+// --directory-hooks/--no-directory-hooks toggle at call sites.
+func RunDirIf(ctx context.Context, enabled bool, dir string, env []string, dedup ...string) error {
+	if !enabled {
+		return nil
+	}
+	return RunDir(ctx, dir, env, dedup...)
 }

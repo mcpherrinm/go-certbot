@@ -128,13 +128,21 @@ func (p *Plugin) Install(ctx context.Context, cfg *config.Config, domains []stri
 		return fmt.Errorf("apache: no <VirtualHost> matched any of %v in %s (or its includes)", domains, configPath)
 	}
 
+	// Install the Mozilla-intermediate SSL snippet once. The Include
+	// directive is added to every SSL vhost so the recommended
+	// SSLProtocol/SSLCipherSuite/SSLHonorCipherOrder triple takes effect.
+	sslSnippet, err := installOptionsSSLApacheConf(cfg.ConfigDir)
+	if err != nil {
+		return err
+	}
+
 	// Track new -le-ssl.conf files so we write them too.
 	type extraFile struct{ path, body string }
 	var extras []extraFile
 
 	if len(hits443) > 0 {
 		for _, h := range hits443 {
-			applySSLDirectives(h.Sec, fullchainPath, privkeyPath)
+			applySSLDirectives(h.Sec, fullchainPath, privkeyPath, sslSnippet)
 		}
 	} else {
 		// Clone each :80 vhost as a :443 vhost in a separate <basename>-le-ssl.conf.
@@ -149,12 +157,12 @@ func (p *Plugin) Install(ctx context.Context, cfg *config.Config, domains []stri
 				// it back so the cert path stays current.
 				cfg2, err := parser.Parse(string(existing))
 				if err == nil {
-					updateExistingSSLVHost(cfg2, fullchainPath, privkeyPath)
+					updateExistingSSLVHost(cfg2, fullchainPath, privkeyPath, sslSnippet)
 					extras = append(extras, extraFile{path: leSSLPath, body: cfg2.String()})
 					continue
 				}
 			}
-			clone := cloneAsSSLVHost(h.Sec, fullchainPath, privkeyPath)
+			clone := cloneAsSSLVHost(h.Sec, fullchainPath, privkeyPath, sslSnippet)
 			body := managedByMarker + "\n" + wrapInIfModuleSSL(clone)
 			extras = append(extras, extraFile{path: leSSLPath, body: body})
 		}
@@ -185,9 +193,11 @@ func (p *Plugin) Install(ctx context.Context, cfg *config.Config, domains []stri
 			return fmt.Errorf("apache: write %s: %w", e.path, err)
 		}
 	}
-	// Make sure mod_ssl / mod_headers / mod_rewrite are loaded so the
-	// directives we wrote don't blow up configtest.
-	if err := ensureModules(ctx, cfg, []string{"ssl", "headers", "rewrite"}); err != nil {
+	// Make sure mod_ssl / mod_headers / mod_rewrite / mod_socache_shmcb
+	// are loaded. socache_shmcb is required by SSLStaplingCache (added
+	// during enhance --staple-ocsp); enabling it eagerly keeps configtest
+	// green even if the user enhances later.
+	if err := ensureModules(ctx, cfg, []string{"ssl", "headers", "rewrite", "socache_shmcb"}); err != nil {
 		return err
 	}
 	return testAndReload(ctx, cfg)
@@ -329,30 +339,39 @@ func vhostMatchesAny(sec *parser.Section, want map[string]bool) bool {
 }
 
 // applySSLDirectives writes (or updates) SSLEngine on, SSLCertificateFile,
-// SSLCertificateKeyFile inside an existing :443 vhost.
-func applySSLDirectives(sec *parser.Section, fullchain, privkey string) {
+// SSLCertificateKeyFile, and `Include options-ssl-apache.conf` inside an
+// existing :443 vhost. The Include pulls in the Mozilla-intermediate
+// SSLProtocol / SSLCipherSuite / SSLHonorCipherOrder triple from
+// installOptionsSSLApacheConf so the vhost doesn't fall back to Apache
+// defaults (= weak ciphers, no protocol pinning).
+func applySSLDirectives(sec *parser.Section, fullchain, privkey, sslSnippet string) {
 	indent := childIndent(sec)
 	setOrAppend(sec, indent, "SSLEngine", "on")
 	setOrAppend(sec, indent, "SSLCertificateFile", fullchain)
 	setOrAppend(sec, indent, "SSLCertificateKeyFile", privkey)
+	if sslSnippet != "" {
+		setOrAppend(sec, indent, "Include", sslSnippet)
+	}
 }
 
-// managedByMarker is the sentinel comment we leave in cloned -le-ssl.conf
-// files so a subsequent --apache run can detect its own work and update
-// (rather than duplicate) the vhost.
-const managedByMarker = "# Managed by go-certbot — do not edit by hand."
+// managedByMarker matches Certbot's exact marker text
+// (certbot-apache/_internal/constants.py:83 — "DO NOT REMOVE - Managed by
+// Certbot") so a mixed-tool deployment (Certbot then go-certbot, or
+// vice-versa) detects the existing cloned vhost and updates in place
+// instead of duplicating it.
+const managedByMarker = "# DO NOT REMOVE - Managed by Certbot"
 
 // updateExistingSSLVHost walks an already-cloned -le-ssl.conf parse tree and
 // refreshes its SSLCertificateFile / SSLCertificateKeyFile to the current
 // fullchain/privkey paths. Used on re-run to keep the path in sync without
 // duplicating the vhost.
-func updateExistingSSLVHost(cfg *parser.Config, fullchain, privkey string) {
+func updateExistingSSLVHost(cfg *parser.Config, fullchain, privkey, sslSnippet string) {
 	var visit func(nodes []parser.Node)
 	visit = func(nodes []parser.Node) {
 		for _, n := range nodes {
 			if sec, ok := n.(*parser.Section); ok {
 				if strings.EqualFold(sec.Name, "VirtualHost") {
-					applySSLDirectives(sec, fullchain, privkey)
+					applySSLDirectives(sec, fullchain, privkey, sslSnippet)
 				}
 				visit(sec.Body)
 			}
@@ -364,7 +383,7 @@ func updateExistingSSLVHost(cfg *parser.Config, fullchain, privkey string) {
 // cloneAsSSLVHost duplicates a :80 vhost as a new :443 vhost with SSL
 // directives appended. The clone keeps ServerName/ServerAlias/DocumentRoot/
 // other arbitrary directives so the new vhost behaves the same.
-func cloneAsSSLVHost(src *parser.Section, fullchain, privkey string) *parser.Section {
+func cloneAsSSLVHost(src *parser.Section, fullchain, privkey, sslSnippet string) *parser.Section {
 	dst := &parser.Section{
 		OpenIndent:   src.OpenIndent,
 		Name:         "VirtualHost",
@@ -389,6 +408,11 @@ func cloneAsSSLVHost(src *parser.Section, fullchain, privkey string) *parser.Sec
 	dst.Body = append(dst.Body, &parser.Directive{
 		Indent: indent, Name: "SSLCertificateKeyFile", Args: []string{privkey}, Newline: "\n",
 	})
+	if sslSnippet != "" {
+		dst.Body = append(dst.Body, &parser.Directive{
+			Indent: indent, Name: "Include", Args: []string{sslSnippet}, Newline: "\n",
+		})
+	}
 	return dst
 }
 

@@ -2,7 +2,6 @@ package verbs
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -20,8 +19,18 @@ import (
 // section, then saving. Validates the merged config (plugin selection +
 // hook commands) before committing.
 func Reconfigure(_ context.Context, cfg *config.Config, reg *plugins.Registry) error {
-	if cfg.CertName == "" {
-		return errors.New("reconfigure: --cert-name is required")
+	name, err := chooseCertName(cfg, "reconfigure")
+	if err != nil {
+		return err
+	}
+	cfg.CertName = name
+	// Certbot rejects reconfigure of these (main.py:1773-1778) because
+	// changing them effectively requires a fresh issuance and breaks the
+	// drop-in promise of "renew uses the recorded settings".
+	for _, banned := range []string{"server", "account", "domain"} {
+		if cfg.SetByUser(banned) {
+			return fmt.Errorf("reconfigure: changing --%s is not supported (use a fresh certonly run); see https://eff-certbot.readthedocs.io for migration", banned)
+		}
 	}
 	path := filepath.Join(cfg.RenewalConfigsDir(), cfg.CertName+".conf")
 	f, err := renewalconf.Load(path)
@@ -35,7 +44,6 @@ func Reconfigure(_ context.Context, cfg *config.Config, reg *plugins.Registry) e
 		encode    func(*config.Config) string
 	}
 	all := []setter{
-		{"server", "server", func(c *config.Config) string { return c.Server }},
 		{"key-type", "key_type", func(c *config.Config) string { return c.KeyType }},
 		{"rsa-key-size", "rsa_key_size", func(c *config.Config) string { return strconv.Itoa(c.RSAKeySize) }},
 		{"elliptic-curve", "elliptic_curve", func(c *config.Config) string { return c.EllipticCurve }},
@@ -48,7 +56,9 @@ func Reconfigure(_ context.Context, cfg *config.Config, reg *plugins.Registry) e
 		{"http-01-address", "http01_address", func(c *config.Config) string { return c.HTTP01Address }},
 		{"pre-hook", "pre_hook", func(c *config.Config) string { return c.PreHook }},
 		{"post-hook", "post_hook", func(c *config.Config) string { return c.PostHook }},
-		{"deploy-hook", "deploy_hook", func(c *config.Config) string { return c.DeployHook }},
+		// Persist deploy-hook under the historic `renew_hook` key so older
+		// Certbot can pick it up (storage.py:512-516).
+		{"deploy-hook", "renew_hook", func(c *config.Config) string { return c.DeployHook }},
 		{"webroot-path", "webroot_path", func(c *config.Config) string { return strings.Join(c.WebrootPath, ",") + "," }},
 	}
 	changed := 0
@@ -78,7 +88,9 @@ func Reconfigure(_ context.Context, cfg *config.Config, reg *plugins.Registry) e
 	if err := f.Save(path); err != nil {
 		return err
 	}
-	fmt.Printf("reconfigure: updated %d field(s) in %s\n", changed, path)
+	// Certbot's success message (main.py:1688).
+	fmt.Println("Successfully updated configuration.")
+	fmt.Println("Changes will apply when the certificate renews.")
 	return nil
 }
 

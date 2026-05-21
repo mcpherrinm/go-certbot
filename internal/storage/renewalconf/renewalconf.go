@@ -244,10 +244,20 @@ func quoteIfNeeded(v string) string {
 	if v == "" {
 		return v
 	}
+	// configobj treats a trailing comma as the list-mode marker
+	// (`domains = a,b,c,`). For those we leave the commas alone —
+	// quoting would defeat the list form. For *other* commas in
+	// scalar values (hook commands, user-agent strings) we have to
+	// quote, or configobj parses the value back as a list.
+	endsInListComma := strings.HasSuffix(v, ",")
 	needs := false
 	for i := 0; i < len(v); i++ {
 		c := v[i]
-		if c == '"' || c == '#' || c == '=' {
+		if c == '"' || c == '#' || c == '=' || c == '\n' {
+			needs = true
+			break
+		}
+		if c == ',' && !endsInListComma {
 			needs = true
 			break
 		}

@@ -2,13 +2,11 @@ package verbs
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 
 	"github.com/letsencrypt/go-certbot/internal/config"
-	"github.com/letsencrypt/go-certbot/internal/display"
 	"github.com/letsencrypt/go-certbot/internal/plugins"
 )
 
@@ -22,17 +20,13 @@ import (
 // renewal conf to .deleted first so a crash leaves the lineage marked as
 // gone, then remove the directories.
 func Delete(_ context.Context, cfg *config.Config, _ *plugins.Registry) error {
-	if cfg.CertName == "" {
-		return errors.New("delete: --cert-name is required")
+	name, err := chooseCertName(cfg, "delete")
+	if err != nil {
+		return err
 	}
+	cfg.CertName = name
 	if !cfg.NonInteractive {
-		fmt.Fprintf(os.Stderr,
-			"You are about to delete certificate %q. This will remove\n"+
-				"  live/%s/        (web servers using these symlinks will break)\n"+
-				"  archive/%s/     (all historical versions of the cert)\n"+
-				"  renewal/%s.conf (configuration; auto-renewal stops)\n",
-			cfg.CertName, cfg.CertName, cfg.CertName, cfg.CertName)
-		if !display.YesNo("Continue?") {
+		if !confirmDelete(cfg, cfg.CertName) {
 			fmt.Println("delete: aborted by user.")
 			return nil
 		}

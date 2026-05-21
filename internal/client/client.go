@@ -23,12 +23,13 @@ import (
 
 	"github.com/letsencrypt/go-certbot/internal/account"
 	"github.com/letsencrypt/go-certbot/internal/config"
+	"github.com/letsencrypt/go-certbot/internal/display"
 	"github.com/letsencrypt/go-certbot/internal/plugins"
 	"github.com/letsencrypt/go-certbot/internal/storage"
 )
 
 // version is the go-certbot version string; used in the User-Agent.
-const version = "1.1.0"
+const version = "1.2.0"
 
 // Client bundles a lego Client with the loaded account.
 type Client struct {
@@ -63,15 +64,34 @@ func New(cfg *config.Config, acc *account.Account) (*Client, error) {
 
 // EnsureRegistered registers the account with the CA if it has no Location
 // URL. On success, c.account.Registration is updated and written to disk.
+//
+// Mirrors certbot._internal.main._determine_account: if --agree-tos isn't
+// set and we're interactive, prompt before failing. Non-interactive without
+// --agree-tos errors out (same wording as Certbot's _tos_cb).
 func (c *Client) EnsureRegistered(ctx context.Context, accountStorage *account.FileStorage) error {
 	if c.account.Registration.URI != "" {
 		return nil
 	}
 	if !c.cfg.TOS {
-		return errors.New("client: --agree-tos is required to register a new ACME account")
+		if c.cfg.NonInteractive {
+			return errors.New("client: --agree-tos is required to register a new ACME account (and you passed --non-interactive, so I can't prompt)")
+		}
+		prompt := fmt.Sprintf(
+			"Please read the Terms of Service at %s. You must agree in order to register with the ACME server. Do you agree?",
+			"https://letsencrypt.org/repository/")
+		if !display.YesNoDefault(prompt, true) {
+			return errors.New("client: TOS not accepted; aborting registration")
+		}
+		c.cfg.TOS = true
 	}
 	if c.cfg.Email == "" && !c.cfg.RegisterUnsafelyWithoutEmail {
-		return errors.New("client: --email is required (or pass --register-unsafely-without-email)")
+		if c.cfg.NonInteractive {
+			return errors.New("client: --email is required (or pass --register-unsafely-without-email)")
+		}
+		c.cfg.Email = display.Email("Enter email address (used for urgent renewal and security notices):")
+		if c.cfg.Email == "" {
+			return errors.New("client: --email is required (or pass --register-unsafely-without-email)")
+		}
 	}
 
 	var (
