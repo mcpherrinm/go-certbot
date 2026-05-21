@@ -465,6 +465,18 @@ func registerFlags(fs *pflag.FlagSet, c *config.Config) {
 		if c.AllowSubsetOfNames && c.CSR.Path != "" {
 			fail("--allow-subset-of-names cannot be used with --csr")
 		}
+		// --allow-subset-of-names + wildcard domain  (certbot helpful.py).
+		// Wildcard authzs cannot be subset'd by SAN — the validating CA
+		// returns one challenge per identifier, and our partial-success
+		// retry path would still need ALL wildcards. Reject early so
+		// users don't get a cryptic dns-01 failure mid-issue.
+		if c.AllowSubsetOfNames {
+			for _, d := range c.Domains {
+				if strings.HasPrefix(d, "*.") {
+					fail("Using --allow-subset-of-names is not allowed with wildcard domains.")
+				}
+			}
+		}
 		// --csr is only allowed with `certonly` (helpful.py:323-328).
 		// Pre-fix we silently ignored --csr with run/renew/etc.
 		if c.CSR.Path != "" && c.Verb != "" && c.Verb != "certonly" {
@@ -603,6 +615,30 @@ func trackSources(fs *pflag.FlagSet, c *config.Config) {
 	if c.SetByUser("quiet") {
 		c.NonInteractive = true
 		c.MarkSet("non-interactive", config.SourceRuntime)
+	}
+	// --renew-hook is a legacy alias for --deploy-hook; both bind to the
+	// same Var via pflag, so the value is captured either way — but
+	// SetByUser("deploy-hook") returns false when only --renew-hook was
+	// passed (pflag tracks Changed per-flag). Mirror certbot cli.py:
+	// helpful.py:354-374 where --renew-hook ultimately writes to
+	// deploy_hook and BOTH names are treated as set_by_user. Without
+	// this, a `--renew-hook foo` on the CLI is overwritten by the conf's
+	// stored renew_hook on the next merge.
+	if c.SetByUser("renew-hook") {
+		c.MarkSet("deploy-hook", config.SourceCommandLine)
+	}
+	// And the reverse direction so SetByUser("renew-hook") covers either spelling.
+	if c.SetByUser("deploy-hook") {
+		c.MarkSet("renew-hook", config.SourceCommandLine)
+	}
+	// --webroot-path is processed both as a flat list AND as a domain → path
+	// map via -w/-d interleaving (applyWebrootMap, called pre-parse). Mirror
+	// certbot _WebrootPathProcessor which has both `--webroot-path` and the
+	// derived `webroot_map` participate in set_by_user. Without this, on the
+	// next renew mergeFromRenewalConf would clobber the user-supplied
+	// webroot map with whatever the conf says.
+	if c.SetByUser("webroot-path") || len(c.WebrootMap) > 0 {
+		c.MarkSet("webroot-map", config.SourceRuntime)
 	}
 }
 
