@@ -1,6 +1,6 @@
 # go-certbot
 
-This is an experiment in makign a clone of Certbot in Go based on Lego.
+This is an experiment in making a clone of Certbot in Go based on Lego.
 
 The code is all AI-generated, and is not intended to be used.
 
