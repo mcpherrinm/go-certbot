@@ -108,6 +108,11 @@ func (p *Plugin) Cleanup(ctx context.Context) error {
 		_ = os.RemoveAll(p.challengeDir)
 		p.challengeDir = ""
 	}
+	// Cleanup completed — mark the apache-http01 checkpoint clean so
+	// a subsequent signal-driven rollback doesn't re-undo our (now
+	// already-undone) injection. If injection never happened, MarkClean
+	// is a no-op.
+	checkpoint.MarkClean()
 	if err := testAndReload(ctx, p.cfg); err != nil {
 		fmt.Fprintf(os.Stderr, "apache: cleanup reload: %v\n", err)
 	}
@@ -1047,6 +1052,19 @@ func (p *Plugin) injectChallengeAliases(configPath, webroot string) error {
 			},
 		)
 		touched[h.File.Path] = h.File
+	}
+	// Checkpoint every file we're about to mutate so a crash between
+	// Present and Cleanup (panic, SIGKILL, OOM) can be rolled back by
+	// the next go-certbot/certbot run via reverter recovery. Pre-fix
+	// the Alias snippet stayed in the user's config forever on
+	// abnormal termination. Mirrors certbot http_01.py:61-70 which
+	// register file modifications with the reverter.
+	checkpointPaths := make([]string, 0, len(touched))
+	for path := range touched {
+		checkpointPaths = append(checkpointPaths, path)
+	}
+	if _, err := checkpoint.Save(p.cfg.WorkDir, "apache-http01", checkpointPaths); err != nil {
+		return fmt.Errorf("apache: checkpoint: %w", err)
 	}
 	// Write back every mutated file. Track which files we wrote so
 	// Cleanup can roll them back.
