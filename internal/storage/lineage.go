@@ -8,6 +8,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -223,6 +224,16 @@ func Write(configDir, certName string, fullchainPEM, chainPEM, privkeyPEM []byte
 		}
 	}
 
+	// Trim archive history. Certbot keeps the current version plus the prior
+	// 5 (RenewableCert.truncate, storage.py:1229; called from renewal.renew_cert
+	// :573). Without this the archive/ dir grows by ~16 KiB per renewal across
+	// {cert,chain,fullchain,privkey} and bots that renew daily for years leave
+	// an unbounded pile of stale PEMs. Errors here are logged but non-fatal —
+	// trimming is a cleanup, not a correctness step.
+	if err := truncateArchive(configDir, certName, version, 5); err != nil {
+		slog.Warn("storage: truncate archive failed", "lineage", certName, "err", err)
+	}
+
 	return &Lineage{
 		CertName:  certName,
 		ConfigDir: configDir,
@@ -230,6 +241,45 @@ func Write(configDir, certName string, fullchainPEM, chainPEM, privkeyPEM []byte
 		Archive:   arc,
 		Live:      liveFiles,
 	}, nil
+}
+
+// truncateArchive removes archive/<certName>/{cert,chain,fullchain,privkey}<v>.pem
+// for each version v that is older than (currentVersion - keepN). Mirrors
+// certbot RenewableCert.truncate (storage.py:1229).
+func truncateArchive(configDir, certName string, currentVersion, keepN int) error {
+	archive := ArchiveDir(configDir, certName)
+	entries, err := os.ReadDir(archive)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	// Gather distinct version numbers present in the archive across all four
+	// kinds. We can't trust just cert*.pem because an interrupted run might
+	// have left, e.g., privkey<N+1>.pem without a cert<N+1>.pem.
+	seen := map[int]bool{}
+	for _, e := range entries {
+		if n := archiveVersionFromName(e.Name()); n > 0 {
+			seen[n] = true
+		}
+	}
+	// Keep [currentVersion - keepN, currentVersion]. Versions higher than
+	// currentVersion shouldn't exist (we just wrote the highest), but treat
+	// them as "newer" and keep them — better safe than data loss.
+	low := currentVersion - keepN
+	for v := range seen {
+		if v >= low || v > currentVersion {
+			continue
+		}
+		for _, kind := range []string{"cert", "privkey", "chain", "fullchain"} {
+			path := filepath.Join(archive, fmt.Sprintf("%s%d.pem", kind, v))
+			if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+				slog.Debug("storage: truncate remove failed", "path", path, "err", err)
+			}
+		}
+	}
+	return nil
 }
 
 // EnsureDeployed re-links live/<certname>/{cert,chain,fullchain,privkey}.pem

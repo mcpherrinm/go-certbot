@@ -148,3 +148,30 @@ func TestWritePropagatesPrivkeyMode(t *testing.T) {
 		t.Errorf("renewed privkey perm: got %o want 0644 (propagated from prior)", got)
 	}
 }
+
+func TestWriteTruncatesOldVersions(t *testing.T) {
+	dir := t.TempDir()
+	full, chain, key := makePEMChain(t)
+	// Write 7 versions. Certbot keeps the current + 5 prior, so after the
+	// 7th write versions 1 should be gone (current=7, keep [2..7]).
+	for range 7 {
+		if _, err := Write(dir, "x", full, chain, key, WriteOptions{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	archive := filepath.Join(dir, "archive", "x")
+	for _, kind := range []string{"cert", "privkey", "chain", "fullchain"} {
+		oldPath := filepath.Join(archive, kind+"1.pem")
+		if _, err := os.Stat(oldPath); !os.IsNotExist(err) {
+			t.Errorf("expected %s removed by truncate, stat err=%v", oldPath, err)
+		}
+		kept := filepath.Join(archive, kind+"7.pem")
+		if _, err := os.Stat(kept); err != nil {
+			t.Errorf("current %s missing: %v", kept, err)
+		}
+		boundary := filepath.Join(archive, kind+"2.pem")
+		if _, err := os.Stat(boundary); err != nil {
+			t.Errorf("kept-window %s missing: %v", boundary, err)
+		}
+	}
+}
