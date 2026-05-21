@@ -9,6 +9,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/rsa"
 	"crypto/x509"
 	"encoding/pem"
 	"errors"
@@ -195,6 +196,28 @@ func (c *Client) Obtain(ctx context.Context, auth plugins.Authenticator, domains
 	if c.cfg.ReuseKey && !c.cfg.NewKey {
 		if reuseKey, err := loadPriorPrivkey(c.cfg.ConfigDir, certName); err == nil && reuseKey != nil {
 			req.PrivateKey = reuseKey
+			// Sync key params back from the reused key so the renewal
+			// conf write reflects the ACTUAL key on disk, not whatever
+			// stale defaults were on the CLI. Without this, a user who
+			// originally issued with --rsa-key-size 4096 then renews
+			// with just --reuse-key (no --rsa-key-size) would have
+			// `rsa_key_size = 2048` written back. Mirrors certbot
+			// _update_renewal_params_from_key (renewal.py:751).
+			switch k := reuseKey.(type) {
+			case *rsa.PrivateKey:
+				c.cfg.KeyType = "rsa"
+				c.cfg.RSAKeySize = k.N.BitLen()
+			case *ecdsa.PrivateKey:
+				c.cfg.KeyType = "ecdsa"
+				switch k.Curve {
+				case elliptic.P256():
+					c.cfg.EllipticCurve = "secp256r1"
+				case elliptic.P384():
+					c.cfg.EllipticCurve = "secp384r1"
+				case elliptic.P521():
+					c.cfg.EllipticCurve = "secp521r1"
+				}
+			}
 		}
 	}
 	// P-521 / secp521r1: lego's certcrypto only defines EC256/EC384, so

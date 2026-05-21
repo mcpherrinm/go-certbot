@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 
 	"github.com/letsencrypt/go-certbot/internal/config"
@@ -72,6 +73,17 @@ func Install(ctx context.Context, cfg *config.Config, reg *plugins.Registry) err
 	}
 	if len(domains) == 0 {
 		return errors.New("install: --domain is required when not using --cert-name")
+	}
+	// Pre-flight check: certbot main._check_certificate_and_key (main.py:1166)
+	// resolves both paths and fails early if either file is missing — gives
+	// users a clear error before nginx/apache attempts to parse a non-existent
+	// PEM. Mirror the wording verbatim so scripts grepping for the certbot
+	// error keep working.
+	if _, err := os.Stat(fullchainPath); err != nil {
+		return fmt.Errorf("Error while reading certificate from path %s", fullchainPath)
+	}
+	if _, err := os.Stat(privkeyPath); err != nil {
+		return fmt.Errorf("Error while reading private key from path %s", privkeyPath)
 	}
 	inst, err := reg.Installer(installerName)
 	if err != nil {
