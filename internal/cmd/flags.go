@@ -279,7 +279,12 @@ func registerFlags(fs *pflag.FlagSet, c *config.Config) {
 		if !c.SetByUser("key-type") {
 			return
 		}
-		switch strings.ToLower(c.KeyType) {
+		// Normalize to lowercase canonical form. Certbot's argparse
+		// `choices=['rsa','ecdsa']` rejects mixed-case outright; we
+		// accept it but canonicalize so downstream string-compare
+		// checks (cfg.KeyType=="ecdsa") work.
+		c.KeyType = strings.ToLower(c.KeyType)
+		switch c.KeyType {
 		case "rsa", "ecdsa":
 		default:
 			fmt.Fprintf(os.Stderr, "go-certbot: invalid --key-type %q (expected rsa or ecdsa)\n", c.KeyType)
@@ -382,6 +387,28 @@ func registerFlags(fs *pflag.FlagSet, c *config.Config) {
 		}
 	})
 
+	// Mutual-exclusion checks. Each mirrors a Certbot helpful.py guard.
+	// Run as a single PostParseHook so the error message comes after all
+	// flags are parsed and `SetByUser` is reliable.
+	c.PostParseHooks = append(c.PostParseHooks, func() {
+		fail := func(msg string) {
+			fmt.Fprintln(os.Stderr, "go-certbot:", msg)
+			os.Exit(2)
+		}
+		// --force-interactive + -n/--non-interactive  (helpful.py:277-280)
+		if c.ForceInteractive && c.NonInteractive {
+			fail("Flag for non-interactive mode and --force-interactive conflict")
+		}
+		// --hsts + --auto-hsts  (helpful.py:306-308)
+		if c.HSTS && c.AutoHSTS {
+			fail("Parameters --hsts and --auto-hsts cannot be used simultaneously.")
+		}
+		// --allow-subset-of-names + --csr  (helpful.py:329-330)
+		if c.AllowSubsetOfNames && c.CSR.Path != "" {
+			fail("--allow-subset-of-names cannot be used with --csr")
+		}
+	})
+
 	// Hide flags Certbot marks help=argparse.SUPPRESS (cli/__init__.py:84-99,
 	// 188-190, 354, 363, 371, 432-437). They remain settable for compat but
 	// shouldn't clutter `--help`.
@@ -443,17 +470,39 @@ func applyDryRunSideEffects(c *config.Config) {
 	// server doesn't error out on the "are you sure?" check.
 	c.BreakMyCerts = true
 	c.MarkSet("break-my-certs", config.SourceRuntime)
-	// --dry-run + no agreement + no email => Certbot auto-agrees TOS and
-	// uses the unsafely-without-email mode (cli_utils.py:280-289). We
-	// mirror only the auto-TOS half; the email-skip remains explicit.
-	if !c.TOS {
-		c.TOS = true
-		c.MarkSet("agree-tos", config.SourceRuntime)
+	// --dry-run + no agreement + no email + no existing account =>
+	// Certbot auto-agrees TOS and uses the unsafely-without-email mode
+	// only when there's no prod account on disk. Mirrors
+	// cli_utils.py:286-290 which checks
+	// `glob.glob(... ACCOUNTS_DIR/*)` before flipping the flags. If
+	// the user already has an account, registration is a no-op and
+	// these flags are irrelevant — flipping them unconditionally
+	// would surprise users who deliberately omit --agree-tos.
+	if !hasAnyAccount(c) {
+		if !c.TOS {
+			c.TOS = true
+			c.MarkSet("agree-tos", config.SourceRuntime)
+		}
+		if c.Email == "" {
+			c.RegisterUnsafelyWithoutEmail = true
+			c.MarkSet("register-unsafely-without-email", config.SourceRuntime)
+		}
 	}
-	if c.Email == "" {
-		c.RegisterUnsafelyWithoutEmail = true
-		c.MarkSet("register-unsafely-without-email", config.SourceRuntime)
+}
+
+// hasAnyAccount returns true if the configured AccountsDir contains at
+// least one entry. Mirrors certbot's existence check in
+// cli_utils.set_test_server_options: glob.glob(... accounts dir/*).
+func hasAnyAccount(c *config.Config) bool {
+	d, err := c.AccountsDir()
+	if err != nil {
+		return false
 	}
+	entries, err := os.ReadDir(d)
+	if err != nil {
+		return false
+	}
+	return len(entries) > 0
 }
 
 // trackSources walks the FlagSet after parsing and records, for each flag

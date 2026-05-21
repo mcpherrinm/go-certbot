@@ -309,11 +309,14 @@ func addRewriteRedirect(sec *parser.Section) {
 	})
 }
 
-// vhostNames returns the ServerName + ServerAlias values for a vhost
-// section (single ServerName, plus aliases). Used by the RewriteCond
-// per-domain guard.
+// vhostNames returns the active ServerName + every ServerAlias for a
+// vhost. Mirrors certbot configurator.py:_get_servernames: when multiple
+// ServerName directives are present, the LAST one wins (Apache override
+// semantics — configurator.py:958-961). Values are stripped of optional
+// scheme:// prefix and :port suffix (obj.py:127).
 func vhostNames(sec *parser.Section) []string {
-	var out []string
+	var aliases []string
+	var lastServerName string
 	for _, n := range sec.Body {
 		d, ok := n.(*parser.Directive)
 		if !ok {
@@ -322,13 +325,18 @@ func vhostNames(sec *parser.Section) []string {
 		switch strings.ToLower(d.Name) {
 		case "servername":
 			if len(d.Args) > 0 {
-				out = append(out, d.Args[0])
+				lastServerName = stripServerNameDecoration(d.Args[0])
 			}
 		case "serveralias":
-			out = append(out, d.Args...)
+			for _, a := range d.Args {
+				aliases = append(aliases, stripServerNameDecoration(a))
+			}
 		}
 	}
-	return out
+	if lastServerName != "" {
+		return append([]string{lastServerName}, aliases...)
+	}
+	return aliases
 }
 
 // apacheConfigPath returns where to read/write, honoring --apache-server-root
@@ -540,6 +548,67 @@ func findMatchingVHosts(cfg *parser.Config, domains []string, wantPort string) [
 	return out
 }
 
+// unnamedVHostsOnPort returns vhosts on wantPort that have NO ServerName
+// directive at all. Mirrors certbot http_01.py's `_unnamed_vhosts` —
+// these catch requests that don't match any named vhost (default-vhost
+// behavior) and must also be given the challenge Alias so the CA's
+// validation request lands on the right handler.
+func unnamedVHostsOnPort(cfg *parser.Config, wantPort string) []*parser.Section {
+	var out []*parser.Section
+	var visit func(nodes []parser.Node, inMacro bool)
+	visit = func(nodes []parser.Node, inMacro bool) {
+		for _, n := range nodes {
+			sec, ok := n.(*parser.Section)
+			if !ok {
+				continue
+			}
+			macroHere := inMacro || strings.EqualFold(sec.Name, "Macro")
+			if !macroHere &&
+				strings.EqualFold(sec.Name, "VirtualHost") &&
+				vhostOnPort(sec, wantPort) &&
+				len(vhostNames(sec)) == 0 {
+				out = append(out, sec)
+			}
+			visit(sec.Body, macroHere)
+		}
+	}
+	visit(cfg.Nodes, false)
+	return out
+}
+
+// allVHostsOnPort returns every vhost (named or not) on wantPort.
+func allVHostsOnPort(cfg *parser.Config, wantPort string) []*parser.Section {
+	var out []*parser.Section
+	var visit func(nodes []parser.Node, inMacro bool)
+	visit = func(nodes []parser.Node, inMacro bool) {
+		for _, n := range nodes {
+			sec, ok := n.(*parser.Section)
+			if !ok {
+				continue
+			}
+			macroHere := inMacro || strings.EqualFold(sec.Name, "Macro")
+			if !macroHere &&
+				strings.EqualFold(sec.Name, "VirtualHost") &&
+				vhostOnPort(sec, wantPort) {
+				out = append(out, sec)
+			}
+			visit(sec.Body, macroHere)
+		}
+	}
+	visit(cfg.Nodes, false)
+	return out
+}
+
+// vhostInHits reports whether sec is already present in hits.
+func vhostInHits(hits []vhostHit, sec *parser.Section) bool {
+	for _, h := range hits {
+		if h.Sec == sec {
+			return true
+		}
+	}
+	return false
+}
+
 // vhostOnPort returns true if the vhost's first arg ends in :wantPort, or if
 // wantPort is "". `*:443`, `_default_:443`, `1.2.3.4:443` all match "443".
 func vhostOnPort(sec *parser.Section, wantPort string) bool {
@@ -558,31 +627,74 @@ func vhostOnPort(sec *parser.Section, wantPort string) bool {
 }
 
 // vhostMatchesAny: does ServerName or ServerAlias cover any requested domain?
+// DNS matching is case-insensitive (RFC 4343) and Apache itself is
+// case-insensitive for ServerName / ServerAlias. We also strip the optional
+// scheme:// prefix and :port suffix that Apache accepts on ServerName per
+// VirtualHost.strip_name (certbot _internal/plugins/apache_/obj.py:127).
+// Mirrors certbot's `domain_in_names` (configurator.py:773-794).
 func vhostMatchesAny(sec *parser.Section, want map[string]bool) bool {
+	// Build a lowercase set of wanted names for O(1) lookup.
+	lcWant := make(map[string]bool, len(want))
+	for w := range want {
+		lcWant[strings.ToLower(w)] = true
+	}
+	// Per Apache: when multiple ServerName directives are present, the
+	// LAST one wins (subsequent overrides earlier). Walk Body in order
+	// and remember the most recent ServerName; ServerAlias accumulates.
+	var lastServerName string
+	var aliases []string
 	for _, n := range sec.Body {
 		d, ok := n.(*parser.Directive)
 		if !ok {
 			continue
 		}
 		switch strings.ToLower(d.Name) {
-		case "servername", "serveralias":
-			for _, raw := range d.Args {
-				name := strings.Trim(raw, `"`)
-				if want[name] {
+		case "servername":
+			if len(d.Args) > 0 {
+				lastServerName = stripServerNameDecoration(d.Args[0])
+			}
+		case "serveralias":
+			for _, a := range d.Args {
+				aliases = append(aliases, stripServerNameDecoration(a))
+			}
+		}
+	}
+	names := aliases
+	if lastServerName != "" {
+		names = append(names, lastServerName)
+	}
+	for _, raw := range names {
+		name := strings.ToLower(raw)
+		if name == "" {
+			continue
+		}
+		if lcWant[name] {
+			return true
+		}
+		if strings.HasPrefix(name, "*.") {
+			suffix := name[1:]
+			for w := range lcWant {
+				if strings.HasSuffix(w, suffix) {
 					return true
-				}
-				if strings.HasPrefix(name, "*.") {
-					suffix := name[1:]
-					for w := range want {
-						if strings.HasSuffix(w, suffix) {
-							return true
-						}
-					}
 				}
 			}
 		}
 	}
 	return false
+}
+
+// stripServerNameDecoration removes surrounding quotes and the optional
+// `scheme://` prefix / `:port` suffix Apache accepts on ServerName /
+// ServerAlias values. e.g. `https://example.com:8080` → `example.com`.
+func stripServerNameDecoration(raw string) string {
+	s := strings.Trim(raw, `"'`)
+	if i := strings.Index(s, "://"); i >= 0 {
+		s = s[i+3:]
+	}
+	if i := strings.IndexByte(s, ':'); i >= 0 {
+		s = s[:i]
+	}
+	return s
 }
 
 // applySSLDirectives writes (or updates) SSLEngine on, SSLCertificateFile,
@@ -598,8 +710,16 @@ func vhostMatchesAny(sec *parser.Section, want map[string]bool) bool {
 func applySSLDirectives(sec *parser.Section, fullchain, privkey, chainPath, sslSnippet string) {
 	indent := childIndent(sec)
 	setOrAppend(sec, indent, "SSLEngine", "on")
-	setOrAppend(sec, indent, "SSLCertificateFile", fullchain)
-	setOrAppend(sec, indent, "SSLCertificateKeyFile", privkey)
+	// Drop ALL existing SSLCertificateFile/KeyFile lines before appending
+	// the canonical pair. Apache uses the LAST instance of each, so a
+	// stale or hand-edited duplicate would cause the wrong cert to be
+	// served. Mirrors certbot _clean_vhost (configurator.py:1654-1675).
+	removeDirective(sec, "SSLCertificateFile")
+	removeDirective(sec, "SSLCertificateKeyFile")
+	sec.Body = append(sec.Body,
+		&parser.Directive{Indent: indent, Name: "SSLCertificateFile", Args: []string{fullchain}, Newline: "\n"},
+		&parser.Directive{Indent: indent, Name: "SSLCertificateKeyFile", Args: []string{privkey}, Newline: "\n"},
+	)
 	if chainPath != "" {
 		setOrAppend(sec, indent, "SSLCertificateChainFile", chainPath)
 	} else {
@@ -827,6 +947,34 @@ func (p *Plugin) injectChallengeAliases(configPath, webroot string) error {
 		return err
 	}
 	hits := findMatchingVHostsAcrossFiles(files, p.domains, "80")
+	// Certbot http_01.py also picks up unnamed (ServerName-less)
+	// vhosts when at least one named match exists — the unnamed vhost
+	// will catch any request whose Host header doesn't match a
+	// ServerName, including requests for IP-address SANs or domains
+	// behind a proxy that rewrites Host. Add those as additional
+	// targets when we already have a name match. Mirrors
+	// http_01.py:91-104 (`_unnamed_vhosts`).
+	if len(hits) > 0 {
+		for _, f := range files {
+			for _, sec := range unnamedVHostsOnPort(f.AST, "80") {
+				if !vhostInHits(hits, sec) {
+					hits = append(hits, vhostHit{File: f, Sec: sec})
+				}
+			}
+		}
+	} else {
+		// No name match anywhere — fall back to every :80 vhost
+		// (Apache's "default vhost is the first defined" rule will
+		// then handle the routing). Mirrors http_01.py's behavior
+		// when name-matching yields nothing on a fresh-install where
+		// the user hasn't set ServerName yet.
+		for _, f := range files {
+			for _, sec := range allVHostsOnPort(f.AST, "80") {
+				hits = append(hits, vhostHit{File: f, Sec: sec})
+			}
+		}
+	}
+	// As a last resort, accept any :port vhost.
 	if len(hits) == 0 {
 		hits = findMatchingVHostsAcrossFiles(files, p.domains, "")
 	}

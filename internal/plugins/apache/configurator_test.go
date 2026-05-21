@@ -34,6 +34,53 @@ func TestFindMatchingVHostsByServerName(t *testing.T) {
 	}
 }
 
+// TestFindMatchingVHostsCaseInsensitive mirrors certbot domain_in_names
+// (configurator.py:773-794): both ServerName and the request are lowercased.
+func TestFindMatchingVHostsCaseInsensitive(t *testing.T) {
+	src := `<VirtualHost *:80>
+    ServerName Example.COM
+    ServerAlias WWW.Example.COM
+</VirtualHost>
+`
+	cfg := parseOrFatal(t, src)
+	for _, dom := range []string{"example.com", "www.example.com", "EXAMPLE.COM"} {
+		if got := findMatchingVHosts(cfg, []string{dom}, "80"); len(got) != 1 {
+			t.Errorf("expected match for %q, got %d", dom, len(got))
+		}
+	}
+}
+
+// TestServerNameSchemeStripped: Apache accepts `scheme://name:port` on
+// ServerName per obj.py:127 — strip both before matching.
+func TestServerNameSchemeStripped(t *testing.T) {
+	src := `<VirtualHost *:80>
+    ServerName https://example.com:8080
+</VirtualHost>
+`
+	cfg := parseOrFatal(t, src)
+	if got := findMatchingVHosts(cfg, []string{"example.com"}, "80"); len(got) != 1 {
+		t.Errorf("scheme://host:port ServerName should match bare host")
+	}
+}
+
+// TestRepeatedServerNameUsesLast: when a vhost has multiple ServerName
+// directives, Apache uses the last one (the second overrides the first).
+// We should match the LAST, not the first.
+func TestRepeatedServerNameUsesLast(t *testing.T) {
+	src := `<VirtualHost *:80>
+    ServerName first.example
+    ServerName second.example
+</VirtualHost>
+`
+	cfg := parseOrFatal(t, src)
+	if got := findMatchingVHosts(cfg, []string{"second.example"}, "80"); len(got) != 1 {
+		t.Errorf("second.example should match (last ServerName wins)")
+	}
+	if got := findMatchingVHosts(cfg, []string{"first.example"}, "80"); len(got) != 0 {
+		t.Errorf("first.example should NOT match (overridden by later ServerName)")
+	}
+}
+
 func TestFindMatchingVHostsWildcard(t *testing.T) {
 	src := `<VirtualHost *:80>
     ServerName *.example.com
@@ -61,6 +108,33 @@ func TestApplySSLDirectivesIdempotent(t *testing.T) {
 	}
 	if !strings.Contains(out, "SSLEngine on") {
 		t.Errorf("missing SSLEngine on:\n%s", out)
+	}
+}
+
+// TestApplySSLDedupesStaleCertDirectives mirrors certbot _clean_vhost
+// (configurator.py:1654-1675): when a vhost already has a stale
+// SSLCertificateFile pointing at an old path, apply must drop the
+// stale line so Apache's last-wins semantics serve the new cert.
+func TestApplySSLDedupesStaleCertDirectives(t *testing.T) {
+	src := `<VirtualHost *:443>
+    ServerName example.com
+    SSLCertificateFile /old/path/cert.pem
+    SSLCertificateKeyFile /old/path/key.pem
+</VirtualHost>
+`
+	cfg := parseOrFatal(t, src)
+	sec := cfg.Nodes[0].(*parser.Section)
+	applySSLDirectives(sec, "/new/fullchain.pem", "/new/privkey.pem", "", "")
+	out := cfg.String()
+	if strings.Contains(out, "/old/path/cert.pem") {
+		t.Errorf("stale SSLCertificateFile not removed:\n%s", out)
+	}
+	if strings.Count(out, "SSLCertificateFile") != 1 {
+		t.Errorf("expected exactly one SSLCertificateFile, got %d:\n%s",
+			strings.Count(out, "SSLCertificateFile"), out)
+	}
+	if !strings.Contains(out, "/new/fullchain.pem") {
+		t.Errorf("new fullchain missing:\n%s", out)
 	}
 }
 
