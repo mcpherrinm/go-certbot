@@ -597,7 +597,6 @@ func registerDeprecated(fs *pflag.FlagSet, c *config.Config, names []string) {
 	}
 }
 
-
 // normalizeDomains lower-cases each entry, strips trailing dots, and dedupes
 // preserving first-seen order. Mirrors certbot.cli.cli_utils.DomainsAction
 // (cli_utils.py:_DomainsAction.__call__).
