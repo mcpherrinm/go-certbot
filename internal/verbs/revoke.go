@@ -50,6 +50,25 @@ func Revoke(ctx context.Context, cfg *config.Config, reg *plugins.Registry) erro
 		if v := conf.RenewalParams["account"]; v != "" && !cfg.SetByUser("account") {
 			cfg.Account = v
 		}
+	} else if cfg.CertName == "" {
+		// --cert-path was given without --cert-name. Walk renewal confs
+		// to find a lineage that owns this cert path so the post-revoke
+		// delete prompt (when not suppressed) targets the right
+		// lineage. Mirrors certbot cert_manager.cert_path_to_lineage
+		// (main.py:799-801). Silently skip on lookup failure — the
+		// revoke itself still proceeds against the cert bytes.
+		if name := certPathToLineage(cfg, certPath); name != "" {
+			cfg.CertName = name
+			// Also pin server + account from the resolved lineage.
+			if conf, err := renewalconf.Load(filepath.Join(cfg.RenewalConfigsDir(), name+".conf")); err == nil {
+				if v := conf.RenewalParams["server"]; v != "" && !cfg.SetByUser("server") {
+					cfg.Server = v
+				}
+				if v := conf.RenewalParams["account"]; v != "" && !cfg.SetByUser("account") {
+					cfg.Account = v
+				}
+			}
+		}
 	}
 	certBytes, err := os.ReadFile(certPath)
 	if err != nil {
@@ -123,6 +142,42 @@ func Revoke(ctx context.Context, cfg *config.Config, reg *plugins.Registry) erro
 		}
 	}
 	return nil
+}
+
+// certPathToLineage returns the lineage name (renewal-conf basename without
+// the `.conf` suffix) whose `cert` or `fullchain` top-level key matches
+// targetPath. Empty when nothing matches. Mirrors certbot
+// cert_manager.cert_path_to_lineage which scans renewal confs by file path.
+func certPathToLineage(cfg *config.Config, targetPath string) string {
+	abs, err := filepath.Abs(targetPath)
+	if err != nil {
+		abs = targetPath
+	}
+	entries, err := os.ReadDir(cfg.RenewalConfigsDir())
+	if err != nil {
+		return ""
+	}
+	for _, e := range entries {
+		if !e.Type().IsRegular() || !strings.HasSuffix(e.Name(), ".conf") {
+			continue
+		}
+		name := strings.TrimSuffix(e.Name(), ".conf")
+		conf, err := renewalconf.Load(filepath.Join(cfg.RenewalConfigsDir(), e.Name()))
+		if err != nil {
+			continue
+		}
+		for _, key := range []string{"cert", "fullchain"} {
+			if p := conf.Top[key]; p != "" {
+				if pa, err := filepath.Abs(p); err == nil && pa == abs {
+					return name
+				}
+				if p == targetPath {
+					return name
+				}
+			}
+		}
+	}
+	return ""
 }
 
 // hasOverlappingArchiveDir returns true iff any renewal conf OTHER than
