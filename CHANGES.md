@@ -5,7 +5,34 @@ This file tracks every behavior in **go-certbot** that differs from upstream
 drop-in compatibility, so this file should stay short. Anything not listed
 here should behave identically to Certbot.
 
-## Phase 6 (current)
+## Phase 7 (current)
+
+### Implemented
+
+- **`enhance` verb** with `--hsts` / `--uir` / `--staple-ocsp` flags.
+  Applies the requested security enhancements to existing managed
+  vhosts. Implemented as a new `plugins.Enhancer` interface that
+  both nginx and apache satisfy:
+  - HSTS: `Strict-Transport-Security: max-age=31536000` (always)
+  - UIR:  `Content-Security-Policy: upgrade-insecure-requests`
+  - Staple: nginx → `ssl_stapling on; ssl_stapling_verify on;`;
+    apache → `SSLUseStapling on` + `SSLStaplingCache ...`.
+  Idempotent on repeated runs.
+- **`install` verb**: installs an existing cert into a web server
+  without re-issuing. Accepts either `--cert-name` (uses the
+  lineage's `live/` paths) or `--cert-path` + `--key-path`. Plugin
+  picked via `--nginx` / `--apache` / `--installer`, or restored
+  from the renewal conf when `--cert-name` is given.
+- **`--ip-address` SANs**: lego v5's `ObtainRequest` accepts IP
+  literals in `Domains` and auto-detects them via `net.ParseIP`.
+  We validate the literal before sending; non-IP strings error out.
+- **ACME Renewal Info (RFC 9773)** integration in `renew`. Before
+  issuing, query the server's `renewalInfo` endpoint via lego's
+  `Certifier.GetRenewalInfo`. If the server suggests a future
+  window, defer the renewal; otherwise (or if ARI isn't supported)
+  fall back to the existing `renew_before_expiry` decision.
+
+## Phase 6
 
 ### Implemented
 
@@ -212,7 +239,7 @@ small behavioral difference.
 
 | Verb | Planned phase |
 | --- | --- |
-| `install`, `enhance`, `rollback` | Phase 7 |
+| `rollback` | Phase 8 |
 
 Plugins not yet implemented (using them returns a clear error):
 

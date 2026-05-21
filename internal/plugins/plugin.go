@@ -46,9 +46,22 @@ type Authenticator interface {
 }
 
 // Installer takes a freshly issued cert and installs it into a web server.
-// Phase 1–3 ship no installers; nginx and apache come in Phase 5/6.
 type Installer interface {
 	Name() string
 	Description() string
 	Install(ctx context.Context, cfg *config.Config, domains []string, fullchainPath, privkeyPath string) error
+}
+
+// Enhancement names supported by Enhance.
+const (
+	EnhanceHSTS   = "hsts"   // Strict-Transport-Security
+	EnhanceUIR    = "uir"    // Content-Security-Policy: upgrade-insecure-requests
+	EnhanceStaple = "staple" // OCSP stapling
+)
+
+// Enhancer is implemented by installers that can apply security enhancements
+// (HSTS, OCSP stapling, upgrade-insecure-requests) to existing managed
+// vhosts. nginx and apache implement this; null does not.
+type Enhancer interface {
+	Enhance(ctx context.Context, cfg *config.Config, domains []string, enhancements []string) error
 }

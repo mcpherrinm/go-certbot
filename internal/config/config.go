@@ -85,6 +85,11 @@ type Config struct {
 	ApacheConfig     string // explicit apache2.conf path; overrides ApacheServerRoot
 	ApacheServerRoot string // /etc/apache2 default
 	ApacheCtl        string // apachectl binary (default "apachectl")
+
+	// Enhancements (enhance verb)
+	HSTS   bool
+	UIR    bool
+	Staple bool
 	Standalone    bool
 	Webroot       bool
 	WebrootPath   []string

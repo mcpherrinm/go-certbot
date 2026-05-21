@@ -66,6 +66,11 @@ func registerFlags(fs *pflag.FlagSet, c *config.Config) {
 	fs.StringVar(&c.ApacheConfig, "apache-config", c.ApacheConfig, "Path to apache2.conf / httpd.conf (default /etc/apache2/apache2.conf).")
 	fs.StringVar(&c.ApacheServerRoot, "apache-server-root", c.ApacheServerRoot, "Apache server root (default /etc/apache2).")
 	fs.StringVar(&c.ApacheCtl, "apache-ctl", c.ApacheCtl, "Apache control binary (default apachectl).")
+
+	// Enhancements
+	fs.BoolVar(&c.HSTS, "hsts", c.HSTS, "Add a Strict-Transport-Security header (enhance verb).")
+	fs.BoolVar(&c.UIR, "uir", c.UIR, "Add a Content-Security-Policy: upgrade-insecure-requests header (enhance verb).")
+	fs.BoolVar(&c.Staple, "staple-ocsp", c.Staple, "Enable OCSP stapling (enhance verb).")
 	fs.BoolVar(&c.Nginx, "nginx", c.Nginx, "Use the nginx plugin.")
 	fs.StringVar(&c.NginxConfig, "nginx-config", c.NginxConfig, "Path to nginx.conf (default /etc/nginx/nginx.conf).")
 	fs.StringVar(&c.NginxServerRoot, "nginx-server-root", c.NginxServerRoot, "Nginx server root (default /etc/nginx).")

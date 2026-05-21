@@ -125,6 +125,15 @@ func renewOne(ctx context.Context, cli *config.Config, reg *plugins.Registry, co
 			"expires_at", expiresAt.Format(time.RFC3339))
 		return nil
 	}
+	// If the ACME server supports ARI and the suggested window is in the
+	// future, respect it. This mirrors RFC 9773 §4.1: clients should use the
+	// server's hint when available.
+	if !cli.ForceRenewal {
+		if dueAt, err := ariDecision(ctx, &merged, leafPath); err == nil && dueAt != nil && dueAt.After(time.Now()) {
+			slog.Info("ARI says wait", "cert_name", certName, "due_at", dueAt.Format(time.RFC3339))
+			return nil
+		}
+	}
 	slog.Info("renewing certificate",
 		"cert_name", certName,
 		"domains", merged.Domains,
