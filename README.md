@@ -15,16 +15,16 @@ rewritten in Go on top of [lego v5](https://github.com/go-acme/lego).
 
 ## Status
 
-**Phase 4.** Builds on Phase 3 with all 13 DNS-01 authenticator plugins
-Certbot bundles — `dns-cloudflare`, `dns-digitalocean`, `dns-dnsimple`,
-`dns-dnsmadeeasy`, `dns-gehirn`, `dns-google`, `dns-linode`,
-`dns-luadns`, `dns-nsone`, `dns-ovh`, `dns-rfc2136`, `dns-route53`,
-`dns-sakuracloud`. Each wraps the matching [lego v5](
-https://github.com/go-acme/lego) provider and reads Certbot's
-`dns_<name>_*` INI files. What remains: the nginx installer (Phase 5),
-the apache installer (Phase 6), and the default `run` verb that ties
-authenticator + installer together. See [`CHANGES.md`](CHANGES.md) for
-the rollout plan.
+**Phase 5.** Builds on Phase 4 with an **nginx plugin** (acting as both
+authenticator and installer), a hand-rolled nginx config parser
+(`internal/plugins/nginx/parser/`), and the default **`run` verb** that
+ties obtain + install together. The plugin locates server blocks by
+`server_name`, writes `ssl_certificate` / `ssl_certificate_key` /
+`listen <port> ssl`, runs `nginx -t`, then `nginx -s reload`. What
+remains: the apache installer (Phase 6) and the security-enhancements
+pass — HSTS, OCSP stapling, must-staple — plus the `enhance` verb
+(Phase 7). See [`CHANGES.md`](CHANGES.md) for the documented scope
+limits and the rollout plan.
 
 The upstream Certbot source tree is vendored as a git submodule under
 `reference/certbot/` for cross-reference. (We avoid the Go-reserved

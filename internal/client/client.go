@@ -26,7 +26,7 @@ import (
 )
 
 // version is the go-certbot version string; used in the User-Agent.
-const version = "0.4.0-phase4"
+const version = "0.5.0-phase5"
 
 // Client bundles a lego Client with the loaded account.
 type Client struct {
