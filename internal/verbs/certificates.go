@@ -106,13 +106,18 @@ func (c certInfo) String() string {
 	// Certbot formats the expiry as Python's `str(datetime)` does:
 	// `2026-01-01 12:34:56+00:00`. Use the equivalent Go layout so monitoring
 	// scripts grep-ing for the timestamp still work.
+	//
+	// No trailing newline — certbot's human_readable_cert_info ends with
+	// "Private Key Path: …" and entries are joined with "\n" by the caller.
+	// Without dropping the trailing \n we emit a blank line between cert
+	// blocks that certbot doesn't.
 	return fmt.Sprintf("  Certificate Name: %s\n"+
 		"    Serial Number: %s\n"+
 		"    Key Type: %s\n"+
 		"    Identifiers: %s\n"+
 		"    Expiry Date: %s (%s)\n"+
 		"    Certificate Path: %s\n"+
-		"    Private Key Path: %s\n",
+		"    Private Key Path: %s",
 		c.Name, c.Serial, c.KeyType,
 		strings.Join(c.SANs, " "),
 		c.NotAfter.Format("2006-01-02 15:04:05-07:00"), c.Status,
@@ -177,7 +182,9 @@ func describeCert(confPath, certName string) (*certInfo, error) {
 	if isTestCert(cert) {
 		reasons = append(reasons, "TEST_CERT")
 	}
-	expired := cert.NotAfter.Before(now)
+	// Inclusive boundary: a cert with target_expiry == now is EXPIRED.
+	// certbot uses `cert.target_expiry <= now` (cert_manager.py:266).
+	expired := !cert.NotAfter.After(now)
 	if expired {
 		reasons = append(reasons, "EXPIRED")
 	}

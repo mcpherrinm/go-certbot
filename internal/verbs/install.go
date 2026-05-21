@@ -42,6 +42,17 @@ func Install(ctx context.Context, cfg *config.Config, reg *plugins.Registry) err
 		cfg.CertName = name
 	}
 
+	// install with --cert-path/--key-path can't enable enhancements because
+	// enhance.Enhance needs a lineage (it reads the renewal conf for SANs).
+	// Mirror certbot main.install (main.py:1121-1124) which errors out
+	// rather than silently dropping the requested enhancement.
+	if cfg.CertName == "" && cfg.CertPath != "" {
+		redirReq := cfg.Redirect != nil
+		if cfg.HSTS || cfg.UIR || cfg.Staple || redirReq {
+			return errors.New("install: One or more of the requested enhancements require --cert-name to be provided")
+		}
+	}
+
 	switch {
 	case cfg.CertPath != "" && cfg.KeyPath != "":
 		fullchainPath = cfg.CertPath

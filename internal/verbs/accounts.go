@@ -104,10 +104,13 @@ func ShowAccount(_ context.Context, cfg *config.Config, _ *plugins.Registry) err
 	if len(stripped) > 1 {
 		label = "Email contacts"
 	}
+	// Match certbot main.show_account (main.py:1022-1024): the empty-contact
+	// label is the bare word "none" — no parens — so users grepping for
+	// certbot's exact text keep matching.
 	if len(stripped) > 0 {
 		fmt.Printf("  %s: %s\n", label, strings.Join(stripped, ", "))
 	} else {
-		fmt.Printf("  %s: (none)\n", label)
+		fmt.Printf("  %s: none\n", label)
 	}
 	return nil
 }

@@ -19,8 +19,15 @@ import (
 // + installer plugin pair from flags (e.g. --nginx sets both to nginx), runs
 // the issuance, then installs.
 func Run(ctx context.Context, cfg *config.Config, reg *plugins.Registry) error {
-	if len(cfg.Domains) == 0 {
+	if len(cfg.Domains) == 0 && len(cfg.IPAddresses) == 0 {
 		return errors.New("run: at least one -d/--domain is required")
+	}
+	// IP-address-only certs can't be installed by nginx/apache — neither
+	// plugin's installer flow knows how to match an IP SAN to a vhost. Match
+	// certbot main.run (main.py:1438-1440) and reject upfront with the same
+	// wording so users get a clear error instead of a confusing later one.
+	if len(cfg.Domains) == 0 && len(cfg.IPAddresses) > 0 {
+		return errors.New("run: installation of IP address certificates is not currently supported. Use the `certonly` command instead.")
 	}
 
 	authName, instName, err := resolveRunPlugins(cfg)
