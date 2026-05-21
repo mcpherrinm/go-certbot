@@ -405,6 +405,19 @@ func apacheCtl(cfg *config.Config) string {
 	return detectOSOptions().Ctl
 }
 
+// apacheQueryBin returns the binary used for `-v`/`-M`/`-D DUMP_*` queries.
+// Falls back to apacheCtl when the per-OS QueryBin is empty (most distros
+// use apachectl for both). RHEL 9+ / Fedora point QueryBin at `httpd`.
+func apacheQueryBin(cfg *config.Config) string {
+	if cfg.ApacheBin != "" {
+		return cfg.ApacheBin
+	}
+	if q := detectOSOptions().QueryBin; q != "" {
+		return q
+	}
+	return apacheCtl(cfg)
+}
+
 // apacheVersion runs `<ctl> -v` and parses the "Server version: Apache/2.4.X"
 // line. Returns (2, 4, 0) when parsing fails so we conservatively assume the
 // older codepath (split chain) and won't write directives unsupported on
@@ -423,17 +436,12 @@ func apacheVersion(ctx context.Context, cfg *config.Config) apacheVer {
 	if apacheVerCacheOK {
 		return apacheVerCache
 	}
-	ctl := apacheCtl(cfg)
-	out, err := exec.CommandContext(ctx, ctl, "-v").CombinedOutput()
+	query := apacheQueryBin(cfg)
+	out, err := exec.CommandContext(ctx, query, "-v").CombinedOutput()
 	if err != nil {
-		// Try the non-wrapper binary as a fallback (e.g. Fedora's
-		// apachectl can't take -v in some configs; httpd directly works).
-		out, err = exec.CommandContext(ctx, "httpd", "-v").CombinedOutput()
-		if err != nil {
-			apacheVerCacheOK = true
-			apacheVerCache = apacheVer{2, 4, 0}
-			return apacheVerCache
-		}
+		apacheVerCacheOK = true
+		apacheVerCache = apacheVer{2, 4, 0}
+		return apacheVerCache
 	}
 	v := parseApacheVersion(string(out))
 	apacheVerCacheOK = true
@@ -483,28 +491,35 @@ func (v apacheVer) ge(M, m, p int) bool {
 // ServerName or ServerAlias matches any of `domains` AND whose listen port
 // (the bit after ':' in the section's first arg) is `wantPort`. If wantPort
 // is empty, match regardless of port.
+//
+// Skips any vhost whose enclosing scope is a <Macro> section, mirroring
+// Certbot's configurator.py:1152-1155 / 873-915 which refuses to rewrite
+// vhosts inside mod_macro definitions (the rewrite would inadvertently
+// apply to every macro invocation site).
 func findMatchingVHosts(cfg *parser.Config, domains []string, wantPort string) []*parser.Section {
 	want := map[string]bool{}
 	for _, d := range domains {
 		want[d] = true
 	}
 	var out []*parser.Section
-	var visit func(nodes []parser.Node)
-	visit = func(nodes []parser.Node) {
+	var visit func(nodes []parser.Node, inMacro bool)
+	visit = func(nodes []parser.Node, inMacro bool) {
 		for _, n := range nodes {
 			sec, ok := n.(*parser.Section)
 			if !ok {
 				continue
 			}
-			if strings.EqualFold(sec.Name, "VirtualHost") &&
+			macroHere := inMacro || strings.EqualFold(sec.Name, "Macro")
+			if !macroHere &&
+				strings.EqualFold(sec.Name, "VirtualHost") &&
 				vhostOnPort(sec, wantPort) &&
 				vhostMatchesAny(sec, want) {
 				out = append(out, sec)
 			}
-			visit(sec.Body)
+			visit(sec.Body, macroHere)
 		}
 	}
-	visit(cfg.Nodes)
+	visit(cfg.Nodes, false)
 	return out
 }
 
@@ -881,10 +896,26 @@ func testAndReload(ctx context.Context, cfg *config.Config) error {
 	} else {
 		reload = exec.CommandContext(ctx, ctl, "graceful")
 	}
-	if out, err := reload.CombinedOutput(); err != nil {
+	if out, err := reload.CombinedOutput(); err == nil {
+		return nil
+	} else {
+		// Try the per-OS restart_cmd_alt before declaring failure
+		// (override_centos/gentoo/fedora pass restart_cmd_alt=['<ctl>',
+		// 'restart']; configurator.py:2364-2387).
+		alt := detectOSOptions().RestartCmdAlt
+		if cfg.ApacheCtl != "" {
+			// User-provided ctl override; fall back to it directly.
+			alt = []string{cfg.ApacheCtl, "restart"}
+		}
+		if len(alt) > 0 {
+			altOut, altErr := exec.CommandContext(ctx, alt[0], alt[1:]...).CombinedOutput()
+			if altErr == nil {
+				return nil
+			}
+			return fmt.Errorf("apache: graceful failed (%v) and restart_cmd_alt (%v) also failed: %w\n%s", err, alt, altErr, string(altOut))
+		}
 		return fmt.Errorf("apache: `%s graceful` failed: %w\n%s", ctl, err, string(out))
 	}
-	return nil
 }
 
 // _ keeps `errors` referenced for future use.
