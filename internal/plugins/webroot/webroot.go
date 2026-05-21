@@ -20,6 +20,7 @@ import (
 	"github.com/go-acme/lego/v5/challenge/http01"
 
 	"github.com/letsencrypt/go-certbot/internal/config"
+	"github.com/letsencrypt/go-certbot/internal/plugins"
 )
 
 // Authenticator implements the webroot HTTP-01 provider.
@@ -38,13 +39,16 @@ func (a *Authenticator) Description() string {
 	return "Place files in a server's webroot folder for authentication."
 }
 
-// PrepareHTTP01 resolves the domain→webroot map.
-func (a *Authenticator) PrepareHTTP01(_ context.Context, cfg *config.Config, domains []string) (challenge.Provider, error) {
+// Prepare resolves the domain→webroot map. Uses cfg.WebrootMap when set (the
+// CLI builds it from -w/-d interleaving) and falls back to a single
+// --webroot-path applied to every domain. Multi-path without a map is
+// rejected (interleave with -d instead).
+func (a *Authenticator) Prepare(_ context.Context, cfg *config.Config, domains []string) (plugins.ChallengeKind, challenge.Provider, error) {
 	if len(cfg.WebrootMap) > 0 {
 		a.domainPaths = map[string]string{}
 		for d, p := range cfg.WebrootMap {
 			if _, err := os.Stat(p); err != nil {
-				return nil, fmt.Errorf("webroot: %s: %w", p, err)
+				return 0, nil, fmt.Errorf("webroot: %s: %w", p, err)
 			}
 			a.domainPaths[d] = p
 		}
@@ -61,23 +65,23 @@ func (a *Authenticator) PrepareHTTP01(_ context.Context, cfg *config.Config, dom
 				a.domainPaths[d] = fallback
 			}
 		}
-		return a, nil
+		return plugins.HTTP01, a, nil
 	}
 	if len(cfg.WebrootPath) == 0 {
-		return nil, errors.New("webroot: at least one --webroot-path is required")
+		return 0, nil, errors.New("webroot: at least one --webroot-path is required")
 	}
 	if len(cfg.WebrootPath) != 1 {
-		return nil, errors.New("webroot: multiple --webroot-path values require interleaving with -d to form a per-domain map")
+		return 0, nil, errors.New("webroot: multiple --webroot-path values require interleaving with -d to form a per-domain map")
 	}
 	path := cfg.WebrootPath[0]
 	if _, err := os.Stat(path); err != nil {
-		return nil, fmt.Errorf("webroot: %s: %w", path, err)
+		return 0, nil, fmt.Errorf("webroot: %s: %w", path, err)
 	}
 	a.domainPaths = map[string]string{}
 	for _, d := range domains {
 		a.domainPaths[d] = path
 	}
-	return a, nil
+	return plugins.HTTP01, a, nil
 }
 
 func (a *Authenticator) Cleanup(_ context.Context) error {

@@ -12,27 +12,41 @@ import (
 	"github.com/letsencrypt/go-certbot/internal/config"
 )
 
+// ChallengeKind identifies which ACME challenge a plugin solves.
+type ChallengeKind int
+
+const (
+	HTTP01 ChallengeKind = iota
+	DNS01
+)
+
+func (c ChallengeKind) String() string {
+	switch c {
+	case HTTP01:
+		return "http-01"
+	case DNS01:
+		return "dns-01"
+	}
+	return "unknown"
+}
+
 // Authenticator solves an ACME challenge for the given domains.
 //
-// PrepareHTTP01 returns a lego challenge.Provider that should be installed via
-// client.Challenge.SetHTTP01Provider before calling Obtain. Authenticators
-// that don't support http-01 return ErrUnsupportedChallenge.
+// Prepare returns the kind of challenge the plugin solves along with a lego
+// challenge.Provider. The client uses the kind to call SetHTTP01Provider or
+// SetDNS01Provider on the lego client.
 //
 // Cleanup is called after Obtain returns (success or failure). It must not
 // fail loudly — best-effort.
 type Authenticator interface {
 	Name() string
 	Description() string
-	// PrepareHTTP01 returns a lego http-01 provider. Domains are passed for
-	// plugins (like webroot) that need them up front.
-	PrepareHTTP01(ctx context.Context, cfg *config.Config, domains []string) (challenge.Provider, error)
-	// Cleanup releases any resources held by the authenticator (e.g. stop
-	// listeners). Idempotent.
+	Prepare(ctx context.Context, cfg *config.Config, domains []string) (ChallengeKind, challenge.Provider, error)
 	Cleanup(ctx context.Context) error
 }
 
 // Installer takes a freshly issued cert and installs it into a web server.
-// Phase 1 ships a null installer; nginx and apache come later.
+// Phase 1–3 ship no installers; nginx and apache come in Phase 5/6.
 type Installer interface {
 	Name() string
 	Description() string

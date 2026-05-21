@@ -15,11 +15,14 @@ rewritten in Go on top of [lego v5](https://github.com/go-acme/lego).
 
 ## Status
 
-**Phase 3.** Builds on Phase 2 with the certificate-management verbs
-(`certificates`, `delete`, `revoke`) and the account-management verbs
-(`register`, `show_account`, `update_account`, `unregister`). What
-remains: DNS plugins (Phase 4), the nginx installer (Phase 5), the
-apache installer (Phase 6), and the default `run` verb that ties
+**Phase 4.** Builds on Phase 3 with all 13 DNS-01 authenticator plugins
+Certbot bundles — `dns-cloudflare`, `dns-digitalocean`, `dns-dnsimple`,
+`dns-dnsmadeeasy`, `dns-gehirn`, `dns-google`, `dns-linode`,
+`dns-luadns`, `dns-nsone`, `dns-ovh`, `dns-rfc2136`, `dns-route53`,
+`dns-sakuracloud`. Each wraps the matching [lego v5](
+https://github.com/go-acme/lego) provider and reads Certbot's
+`dns_<name>_*` INI files. What remains: the nginx installer (Phase 5),
+the apache installer (Phase 6), and the default `run` verb that ties
 authenticator + installer together. See [`CHANGES.md`](CHANGES.md) for
 the rollout plan.
 

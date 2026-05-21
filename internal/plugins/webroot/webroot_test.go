@@ -16,7 +16,7 @@ func TestPresentWritesChallenge(t *testing.T) {
 	auth := New()
 	cfg := config.NewDefault()
 	cfg.WebrootPath = []string{dir}
-	if _, err := auth.PrepareHTTP01(context.Background(), cfg, []string{"example.test"}); err != nil {
+	if _, _, err := auth.Prepare(context.Background(), cfg, []string{"example.test"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := auth.Present(context.Background(), "example.test", "tok", "keyAuth"); err != nil {
@@ -46,7 +46,7 @@ func TestPerDomainMap(t *testing.T) {
 	// Use the new WebrootMap path (the CLI builds this from -w/-d
 	// interleaving; tests construct it directly).
 	cfg.WebrootMap = map[string]string{"a.test": dirA, "b.test": dirB}
-	if _, err := auth.PrepareHTTP01(context.Background(), cfg, []string{"a.test", "b.test"}); err != nil {
+	if _, _, err := auth.Prepare(context.Background(), cfg, []string{"a.test", "b.test"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := auth.Present(context.Background(), "a.test", "ta", "ka"); err != nil {
@@ -66,7 +66,7 @@ func TestPerDomainMap(t *testing.T) {
 func TestMissingWebrootPath(t *testing.T) {
 	auth := New()
 	cfg := config.NewDefault()
-	if _, err := auth.PrepareHTTP01(context.Background(), cfg, []string{"x.test"}); err == nil {
+	if _, _, err := auth.Prepare(context.Background(), cfg, []string{"x.test"}); err == nil {
 		t.Errorf("expected error when no webroot path is given")
 	}
 }

@@ -30,6 +30,7 @@ import (
 
 	"github.com/letsencrypt/go-certbot/internal/config"
 	"github.com/letsencrypt/go-certbot/internal/hooks"
+	"github.com/letsencrypt/go-certbot/internal/plugins"
 )
 
 // Authenticator backs --manual.
@@ -50,18 +51,27 @@ func (a *Authenticator) Description() string {
 	return "Manual configuration or running of shell scripts to fulfill ACME challenges."
 }
 
-// PrepareHTTP01 returns the plugin acting as a lego http-01 challenge.Provider.
-// The domains slice is stored so Present/CleanUp can emit
+// Prepare returns the plugin acting as a lego challenge.Provider for whichever
+// challenge type the user picked. Defaults to http-01 unless
+// --preferred-challenges=dns-01 is set, matching Certbot's behavior for
+// --manual. The domain list is captured so Present/CleanUp can emit
 // CERTBOT_ALL_DOMAINS / CERTBOT_REMAINING_CHALLENGES.
-func (a *Authenticator) PrepareHTTP01(_ context.Context, cfg *config.Config, domains []string) (challenge.Provider, error) {
+func (a *Authenticator) Prepare(_ context.Context, cfg *config.Config, domains []string) (plugins.ChallengeKind, challenge.Provider, error) {
 	if cfg.ManualAuthHook == "" {
-		return nil, errors.New("manual: --manual-auth-hook is required (interactive mode is not yet implemented)")
+		return 0, nil, errors.New("manual: --manual-auth-hook is required (interactive mode is not yet implemented)")
 	}
 	a.authHook = cfg.ManualAuthHook
 	a.cleanupHook = cfg.ManualCleanupHook
 	a.allDomains = append([]string(nil), domains...)
 	a.remaining.Store(int64(len(domains)))
-	return a, nil
+	kind := plugins.HTTP01
+	for _, c := range cfg.PreferredChallenges {
+		if c == "dns-01" || c == "dns" {
+			kind = plugins.DNS01
+			break
+		}
+	}
+	return kind, a, nil
 }
 
 func (a *Authenticator) Cleanup(_ context.Context) error { return nil }

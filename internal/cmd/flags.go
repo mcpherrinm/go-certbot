@@ -125,6 +125,13 @@ func registerFlags(fs *pflag.FlagSet, c *config.Config) {
 	registerBoolDefaultTrue(fs, c, &c.Autorenew, "autorenew", "Track this cert for auto-renewal.")
 	registerBoolDefaultTrue(fs, c, &c.RandomSleepOnRenew, "random-sleep-on-renew", "Insert a random sleep at the start of renew.")
 
+	// DNS plugins. Each gets --dns-X (boolean selector),
+	// --dns-X-credentials (path to INI), and --dns-X-propagation-seconds.
+	// Propagation defaults match Certbot's per-plugin defaults; 0 means "use lego's default".
+	for _, name := range dnsPluginNames {
+		registerDNSPluginFlags(fs, c, name)
+	}
+
 	// User agent
 	fs.StringVar(&c.UserAgent, "user-agent", c.UserAgent, "Override the User-Agent header.")
 	fs.StringVar(&c.UserAgentComment, "user-agent-comment", c.UserAgentComment, "Append a comment to the default User-Agent string.")
