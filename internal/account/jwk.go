@@ -42,41 +42,124 @@ type rawJWK struct {
 }
 
 // MarshalJWK serializes an RSA or ECDSA private key into a josepy-compatible
-// JWK JSON blob.
+// JWK JSON blob. Field order matches josepy's
+// `to_partial_json` exactly so byte-for-byte interop with Certbot is
+// preserved:
+//
+//	RSA: n, e, d, p, q, dp, dq, qi, kty
+//	EC:  d, x, y, crv, kty
+//
+// `kty` is always appended *last* (json_util.py:539-550). Separators are
+// Python's defaults `", "` and `": "` (with spaces), matching
+// json.dumps's default Encoder.
 func MarshalJWK(key crypto.PrivateKey) ([]byte, error) {
 	switch k := key.(type) {
 	case *rsa.PrivateKey:
-		jwk := rawJWK{
-			Kty: "RSA",
-			N:   b64uInt(k.N),
-			E:   b64uInt(big.NewInt(int64(k.E))),
-			D:   b64uInt(k.D),
-			P:   b64uInt(k.Primes[0]),
-			Q:   b64uInt(k.Primes[1]),
-			Dp:  b64uInt(k.Precomputed.Dp),
-			Dq:  b64uInt(k.Precomputed.Dq),
-			Qi:  b64uInt(k.Precomputed.Qinv),
-		}
-		return json.Marshal(jwk)
+		return marshalPythonJSON([]jsonField{
+			{"n", b64uInt(k.N)},
+			{"e", b64uInt(big.NewInt(int64(k.E)))},
+			{"d", b64uInt(k.D)},
+			{"p", b64uInt(k.Primes[0])},
+			{"q", b64uInt(k.Primes[1])},
+			{"dp", b64uInt(k.Precomputed.Dp)},
+			{"dq", b64uInt(k.Precomputed.Dq)},
+			{"qi", b64uInt(k.Precomputed.Qinv)},
+			{"kty", "RSA"},
+		}), nil
 	case *ecdsa.PrivateKey:
 		crv, err := curveName(k.Curve)
 		if err != nil {
 			return nil, err
 		}
-		// josepy pads EC scalars to the curve's byte length (32/48/66 for
-		// P-256/P-384/P-521); a leading zero byte must not be stripped or
-		// josepy's strict length check rejects the JWK.
 		size := ecCoordinateSize(k.Curve)
-		return json.Marshal(rawJWK{
-			Kty: "EC",
-			Crv: crv,
-			X:   b64uIntPadded(k.X, size),
-			Y:   b64uIntPadded(k.Y, size),
-			D:   b64uIntPadded(k.D, size),
-		})
+		return marshalPythonJSON([]jsonField{
+			{"d", b64uIntPadded(k.D, size)},
+			{"x", b64uIntPadded(k.X, size)},
+			{"y", b64uIntPadded(k.Y, size)},
+			{"crv", crv},
+			{"kty", "EC"},
+		}), nil
 	default:
 		return nil, fmt.Errorf("account: unsupported private key type %T", key)
 	}
+}
+
+// jsonField is a (key, value) pair for marshalPythonJSON. Value may be a
+// string, json.RawMessage, or any of the JSON primitives encoding/json
+// understands; encoding/json handles the value side.
+type jsonField struct {
+	key   string
+	value any
+}
+
+// marshalPythonJSON emits {"k1": v1, "k2": v2, ...} with Python-style
+// separators `", "` and `": "`. Used for every JSON we write that needs to
+// be byte-equivalent with Certbot output.
+func marshalPythonJSON(fields []jsonField) []byte {
+	var buf []byte
+	buf = append(buf, '{')
+	for i, f := range fields {
+		if i > 0 {
+			buf = append(buf, ',', ' ')
+		}
+		kb, _ := json.Marshal(f.key)
+		buf = append(buf, kb...)
+		buf = append(buf, ':', ' ')
+		vb, _ := json.Marshal(f.value)
+		buf = append(buf, vb...)
+	}
+	buf = append(buf, '}')
+	return buf
+}
+
+// JWKThumbprintCanonical returns the RFC 7638 canonical JSON of the JWK's
+// REQUIRED public fields (sorted lex, no whitespace), suitable for hashing
+// with SHA-256 to produce the JWK thumbprint. Matches josepy's
+// JWK.thumbprint (interfaces.py:180-187):
+//
+//	RSA: {"e":"...","kty":"RSA","n":"..."}
+//	EC:  {"crv":"P-256","kty":"EC","x":"...","y":"..."}
+func JWKThumbprintCanonical(key crypto.PrivateKey) ([]byte, error) {
+	switch k := key.(type) {
+	case *rsa.PrivateKey:
+		return canonicalJSON([]jsonField{
+			{"e", b64uInt(big.NewInt(int64(k.E)))},
+			{"kty", "RSA"},
+			{"n", b64uInt(k.N)},
+		}), nil
+	case *ecdsa.PrivateKey:
+		crv, err := curveName(k.Curve)
+		if err != nil {
+			return nil, err
+		}
+		size := ecCoordinateSize(k.Curve)
+		return canonicalJSON([]jsonField{
+			{"crv", crv},
+			{"kty", "EC"},
+			{"x", b64uIntPadded(k.X, size)},
+			{"y", b64uIntPadded(k.Y, size)},
+		}), nil
+	}
+	return nil, fmt.Errorf("account: unsupported key type %T", key)
+}
+
+// canonicalJSON emits {"k1":v1,"k2":v2,...} with no whitespace. Used by
+// JWKThumbprintCanonical and other places needing RFC 8785-style output.
+func canonicalJSON(fields []jsonField) []byte {
+	var buf []byte
+	buf = append(buf, '{')
+	for i, f := range fields {
+		if i > 0 {
+			buf = append(buf, ',')
+		}
+		kb, _ := json.Marshal(f.key)
+		buf = append(buf, kb...)
+		buf = append(buf, ':')
+		vb, _ := json.Marshal(f.value)
+		buf = append(buf, vb...)
+	}
+	buf = append(buf, '}')
+	return buf
 }
 
 // UnmarshalJWK parses a josepy JWK blob into an *rsa.PrivateKey or

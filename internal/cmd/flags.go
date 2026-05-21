@@ -31,6 +31,19 @@ func registerFlags(fs *pflag.FlagSet, c *config.Config) {
 	fs.StringVar(&c.Account, "account", "", "Account id to use; default = first found.")
 	fs.BoolVar(&c.NoEFFEmail, "no-eff-email", false, "Don't subscribe to the EFF mailing list.")
 	fs.BoolVar(&c.EFFEmailExplicit, "eff-email", false, "Subscribe to the EFF mailing list after successful issuance.")
+	// Resolve EFFEmail tri-state from the two paired flags. Order matches
+	// Certbot (cli/__init__.py:195-200): --eff-email=true, --no-eff-email=false,
+	// neither = nil (ask interactively when issuing).
+	c.PostParseHooks = append(c.PostParseHooks, func() {
+		switch {
+		case c.SetByUser("eff-email"):
+			t := true
+			c.EFFEmail = &t
+		case c.SetByUser("no-eff-email"):
+			f := false
+			c.EFFEmail = &f
+		}
+	})
 
 	// Domains
 	fs.StringSliceVarP(&c.Domains, "domain", "d", c.Domains, "Domain name to include (repeatable).")
@@ -77,6 +90,15 @@ func registerFlags(fs *pflag.FlagSet, c *config.Config) {
 	fs.StringVar(&c.ApacheConfig, "apache-config", c.ApacheConfig, "Path to apache2.conf / httpd.conf (default /etc/apache2/apache2.conf).")
 	fs.StringVar(&c.ApacheServerRoot, "apache-server-root", c.ApacheServerRoot, "Apache server root (default /etc/apache2).")
 	fs.StringVar(&c.ApacheCtl, "apache-ctl", c.ApacheCtl, "Apache control binary (default apachectl).")
+	fs.StringVar(&c.ApacheBin, "apache-bin", c.ApacheBin, "Apache httpd binary (used for `-v`/`-M`; falls back to apache-ctl).")
+	fs.StringVar(&c.ApacheEnMod, "apache-enmod", c.ApacheEnMod, "Command to enable an Apache module (e.g. a2enmod).")
+	fs.StringVar(&c.ApacheDismod, "apache-dismod", c.ApacheDismod, "Command to disable an Apache module.")
+	fs.StringVar(&c.ApacheLeVhostExt, "apache-le-vhost-ext", "-le-ssl.conf", "Extension appended to source vhost filenames for SSL clones.")
+	fs.StringVar(&c.ApacheVHostRoot, "apache-vhost-root", c.ApacheVHostRoot, "Directory where SSL vhost clones land (overrides per-OS default).")
+	fs.StringVar(&c.ApacheLogsRoot, "apache-logs-root", c.ApacheLogsRoot, "Apache log directory (e.g. /var/log/apache2).")
+	fs.StringVar(&c.ApacheChallengeLocation, "apache-challenge-location", c.ApacheChallengeLocation, "Directory used for HTTP-01 challenge files.")
+	fs.BoolVar(&c.ApacheHandleModules, "apache-handle-modules", c.ApacheHandleModules, "Manage a2enmod/a2dismod (Debian-style).")
+	fs.BoolVar(&c.ApacheHandleSites, "apache-handle-sites", c.ApacheHandleSites, "Manage a2ensite/a2dissite (Debian-style).")
 
 	// Enhancements — tri-state via paired --X / --no-X flags. Certbot lets
 	// users opt out of an enhancement that was previously applied; we
@@ -112,6 +134,7 @@ func registerFlags(fs *pflag.FlagSet, c *config.Config) {
 	fs.StringVar(&c.NginxConfig, "nginx-config", c.NginxConfig, "Path to nginx.conf (default /etc/nginx/nginx.conf).")
 	fs.StringVar(&c.NginxServerRoot, "nginx-server-root", c.NginxServerRoot, "Nginx server root (default /etc/nginx).")
 	fs.StringVar(&c.NginxCtl, "nginx-ctl", c.NginxCtl, "Nginx control binary (default nginx).")
+	fs.IntVar(&c.NginxSleepSeconds, "nginx-sleep-seconds", 1, "Number of seconds to sleep after nginx reload (default 1).")
 	registerRedirectFlags(fs, c)
 	fs.BoolVar(&c.Standalone, "standalone", c.Standalone, "Use the standalone plugin.")
 	fs.BoolVar(&c.Webroot, "webroot", c.Webroot, "Use the webroot plugin.")
@@ -188,6 +211,45 @@ func registerFlags(fs *pflag.FlagSet, c *config.Config) {
 			os.Exit(2)
 		}
 	})
+	// Validate --key-type (cli/__init__.py:320).
+	c.PostParseHooks = append(c.PostParseHooks, func() {
+		if !c.SetByUser("key-type") {
+			return
+		}
+		switch strings.ToLower(c.KeyType) {
+		case "rsa", "ecdsa":
+		default:
+			fmt.Fprintf(os.Stderr, "go-certbot: invalid --key-type %q (expected rsa or ecdsa)\n", c.KeyType)
+			os.Exit(2)
+		}
+	})
+	// Validate --elliptic-curve.
+	c.PostParseHooks = append(c.PostParseHooks, func() {
+		if !c.SetByUser("elliptic-curve") {
+			return
+		}
+		switch c.EllipticCurve {
+		case "secp256r1", "secp384r1", "secp521r1":
+		default:
+			fmt.Fprintf(os.Stderr, "go-certbot: invalid --elliptic-curve %q (expected secp256r1, secp384r1, or secp521r1)\n", c.EllipticCurve)
+			os.Exit(2)
+		}
+	})
+	// --max-log-backups must be non-negative (cli_utils.py:224).
+	c.PostParseHooks = append(c.PostParseHooks, func() {
+		if c.MaxLogBackups < 0 {
+			fmt.Fprintf(os.Stderr, "go-certbot: --max-log-backups must be non-negative, got %d\n", c.MaxLogBackups)
+			os.Exit(2)
+		}
+	})
+	// --user-agent-comment can't contain ( or ) per Certbot
+	// cli_utils.py:166-169 (would unbalance the User-Agent header).
+	c.PostParseHooks = append(c.PostParseHooks, func() {
+		if strings.ContainsAny(c.UserAgentComment, "()") {
+			fmt.Fprintln(os.Stderr, "go-certbot: --user-agent-comment may not contain ( or )")
+			os.Exit(2)
+		}
+	})
 	fs.BoolVar(&c.RunDeployHooks, "run-deploy-hooks", c.RunDeployHooks, "Always run deploy hooks on `reconfigure`.")
 
 	// Path overrides for certonly --csr. Note: --cert-path itself is also
@@ -216,6 +278,8 @@ func registerFlags(fs *pflag.FlagSet, c *config.Config) {
 	// Default-True bool pairs (`--no-X` flips off).
 	registerBoolDefaultTrue(fs, c, &c.Autorenew, "autorenew", "Track this cert for auto-renewal.")
 	registerBoolDefaultTrue(fs, c, &c.RandomSleepOnRenew, "random-sleep-on-renew", "Insert a random sleep at the start of renew.")
+	registerBoolDefaultTrue(fs, c, &c.DirectoryHooks, "directory-hooks", "Run scripts in renewal-hooks/{pre,post,deploy}/ alongside the flag hooks.")
+	registerBoolDefaultTrue(fs, c, &c.ValidateHooks, "validate-hooks", "Validate hook commands are executable before running.")
 
 	// DNS plugins. Each gets --dns-X (boolean selector),
 	// --dns-X-credentials (path to INI), and --dns-X-propagation-seconds.
@@ -255,6 +319,33 @@ func registerFlags(fs *pflag.FlagSet, c *config.Config) {
 		// for the per-plugin propagation timeout, so we don't register
 		// it as deprecated to avoid a pflag duplicate-flag panic.
 	})
+}
+
+// applyDryRunSideEffects applies the side effects Certbot's
+// set_test_server_options (cli_utils.py:247-290) sets when --dry-run is
+// passed. We invoke this from main.go after CLI parsing finishes.
+func applyDryRunSideEffects(c *config.Config) {
+	if !c.DryRun {
+		return
+	}
+	// --dry-run implies --staging.
+	c.Staging = true
+	c.MarkSet("staging", config.SourceRuntime)
+	// --dry-run implies --break-my-certs so issuance against a non-default
+	// server doesn't error out on the "are you sure?" check.
+	c.BreakMyCerts = true
+	c.MarkSet("break-my-certs", config.SourceRuntime)
+	// --dry-run + no agreement + no email => Certbot auto-agrees TOS and
+	// uses the unsafely-without-email mode (cli_utils.py:280-289). We
+	// mirror only the auto-TOS half; the email-skip remains explicit.
+	if !c.TOS {
+		c.TOS = true
+		c.MarkSet("agree-tos", config.SourceRuntime)
+	}
+	if c.Email == "" {
+		c.RegisterUnsafelyWithoutEmail = true
+		c.MarkSet("register-unsafely-without-email", config.SourceRuntime)
+	}
 }
 
 // trackSources walks the FlagSet after parsing and records, for each flag

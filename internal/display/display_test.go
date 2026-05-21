@@ -27,13 +27,20 @@ func TestYesNo(t *testing.T) {
 
 func TestEmail(t *testing.T) {
 	out := &bytes.Buffer{}
-	// Empty line followed by a real address.
-	d := &Input{In: strings.NewReader("\nuser@example.com\n"), Out: out}
+	// A real address on the first line returns it.
+	d := &Input{In: strings.NewReader("user@example.com\n"), Out: out}
 	got := d.Email("Email:")
 	if got != "user@example.com" {
 		t.Errorf("Email got %q", got)
 	}
-	if !strings.Contains(out.String(), "email address is required") {
-		t.Errorf("expected retry prompt, got %q", out.String())
+}
+
+func TestEmailBlankSkips(t *testing.T) {
+	out := &bytes.Buffer{}
+	// A blank line returns "" — caller switches to unsafely-without-email
+	// mode (matches Certbot display_ops.get_email).
+	d := &Input{In: strings.NewReader("\n"), Out: out}
+	if got := d.Email("Email:"); got != "" {
+		t.Errorf("blank line should return empty; got %q", got)
 	}
 }

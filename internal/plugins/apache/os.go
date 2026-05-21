@@ -2,6 +2,7 @@ package apache
 
 import (
 	"os"
+	"runtime"
 	"strings"
 )
 
@@ -46,7 +47,10 @@ var (
 	osAlpine = osOptions{
 		ConfigPath: "/etc/apache2/httpd.conf",
 		ServerRoot: "/etc/apache2",
-		Ctl:        "httpd",
+		// Alpine ships apachectl as a wrapper around httpd; `configtest`
+		// and `graceful` are apachectl-only verbs (override_alpine.py).
+		Ctl:       "apachectl",
+		VHostRoot: "/etc/apache2/conf.d",
 	}
 	osGentoo = osOptions{
 		ConfigPath: "/etc/apache2/httpd.conf",
@@ -58,7 +62,19 @@ var (
 		ConfigPath: "/etc/httpd/conf/httpd.conf",
 		ServerRoot: "/etc/httpd",
 		Ctl:        "apachectl",
-		VHostRoot:  "/etc/httpd/conf/extra",
+		VHostRoot:  "/etc/httpd/conf", // override_arch.py:11 (siblings of httpd.conf)
+	}
+	osDarwin = osOptions{
+		ConfigPath: "/etc/apache2/httpd.conf",
+		ServerRoot: "/etc/apache2",
+		Ctl:        "apachectl",
+		VHostRoot:  "/etc/apache2/other", // override_darwin.py
+	}
+	osVoid = osOptions{
+		ConfigPath: "/etc/apache/httpd.conf",
+		ServerRoot: "/etc/apache",
+		Ctl:        "apachectl",
+		VHostRoot:  "/etc/apache/extra", // override_void.py
 	}
 	osSUSE = osOptions{
 		ConfigPath: "/etc/apache2/httpd.conf",
@@ -69,10 +85,14 @@ var (
 )
 
 // detectOSOptions reads /etc/os-release and returns the matching osOptions.
-// Defaults to Debian when nothing matches (and on macOS/dev systems).
+// On macOS we fall back to the Darwin record (no /etc/os-release there).
+// Other dev systems default to Debian.
 func detectOSOptions() osOptions {
 	data, err := os.ReadFile("/etc/os-release")
 	if err != nil {
+		if runtime.GOOS == "darwin" {
+			return osDarwin
+		}
 		return osDebian
 	}
 	id := ""
@@ -105,7 +125,14 @@ func detectOSOptions() osOptions {
 		return osArch
 	case "opensuse", "opensuse-leap", "opensuse-tumbleweed", "sles", "suse":
 		return osSUSE
+	case "darwin", "macos":
+		return osDarwin
+	case "void":
+		return osVoid
 	}
+	// macOS doesn't ship /etc/os-release; detect via runtime.GOOS
+	// elsewhere if needed. The hard-coded build-tag detection lives in
+	// detectByGOOS (called after this map fails).
 	for _, like := range strings.Fields(idLike) {
 		switch like {
 		case "debian":

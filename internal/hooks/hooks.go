@@ -205,12 +205,29 @@ func DeployEnv(lineagePath string, domains []string) []string {
 //	FAILED_DOMAINS=<space-separated SANs of certs that failed>
 //
 // Matches certbot/_internal/hooks.py:run_saved_post_hooks. Per Certbot,
-// non-renew verbs (run/certonly) pass FAILED_DOMAINS="".
+// non-renew verbs (run/certonly) pass FAILED_DOMAINS="". The combined
+// limit is 32 KiB on Windows-friendly envs (Certbot caps each at 16k for
+// the renew path, 32k for non-renew). Beyond that we truncate and log,
+// matching hooks.py:173-179.
 func PostEnv(renewed, failed []string) []string {
+	const max = 16 * 1024
+	rJoined := truncatedJoin(renewed, max, "RENEWED_DOMAINS")
+	fJoined := truncatedJoin(failed, max, "FAILED_DOMAINS")
 	return []string{
-		"RENEWED_DOMAINS=" + strings.Join(renewed, " "),
-		"FAILED_DOMAINS=" + strings.Join(failed, " "),
+		"RENEWED_DOMAINS=" + rJoined,
+		"FAILED_DOMAINS=" + fJoined,
 	}
+}
+
+// truncatedJoin space-joins items and truncates to maxBytes, emitting a
+// warning to stderr matching Certbot's wording.
+func truncatedJoin(items []string, maxBytes int, name string) string {
+	s := strings.Join(items, " ")
+	if len(s) > maxBytes {
+		fmt.Fprintf(os.Stderr, "Limiting %s environment variable to %dk characters\n", name, maxBytes/1024)
+		s = s[:maxBytes]
+	}
+	return s
 }
 
 // PreRunner deduplicates pre-hook commands so identical pre-hooks (e.g. one

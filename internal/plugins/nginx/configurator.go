@@ -421,6 +421,18 @@ func nginxConfigPath(cfg *config.Config) string {
 	return "/etc/nginx/nginx.conf"
 }
 
+// sleepAfterReload pauses for cfg.NginxSleepSeconds (default 1) so a
+// subsequent challenge-verification doesn't race the nginx worker swap.
+// Matches certbot-nginx's configurable post-reload sleep (constants.py:19,
+// configurator.py:1318-1323).
+func sleepAfterReload(cfg *config.Config) {
+	d := time.Duration(cfg.NginxSleepSeconds) * time.Second
+	if d <= 0 {
+		d = time.Second
+	}
+	time.Sleep(d)
+}
+
 // regexpCompile is a tiny wrapper over regexp.Compile so the inner loop in
 // serverMatchesAny stays readable; lego/regex compile errors are uncommon
 // for valid nginx configs.
@@ -717,9 +729,10 @@ func hasIfHostRedirect(srv *parser.Block, name string) bool {
 	return false
 }
 
-// appendIfHostRedirect appends the `if ($host = name) { return 301 ... }`
-// block, marked with `# managed by Certbot` (the comment marker Certbot uses
-// — keeps drop-in detection by mixed-tool installs).
+// appendIfHostRedirect prepends an `if ($host = name) { return 301 ... }`
+// block to the top of the server block. Certbot uses `insert_at_top=True`
+// (configurator.py:856-862) so the redirect fires before any other
+// rewrites the user has below it.
 func appendIfHostRedirect(srv *parser.Block, name string) {
 	indent := childIndent(srv)
 	inner := &parser.Block{
@@ -736,7 +749,7 @@ func appendIfHostRedirect(srv *parser.Block, name string) {
 		},
 		BeforeClose: "\n" + indent,
 	}
-	srv.Body = append(srv.Body, inner)
+	srv.Body = append([]parser.Node{inner}, srv.Body...)
 }
 
 // testAndReload runs `nginx -t` then `nginx -s reload`. If reload fails
@@ -756,7 +769,7 @@ func testAndReload(ctx context.Context, cfg *config.Config) error {
 		// doesn't race the worker swap. Matches Certbot's
 		// nginx_restart sleep (configurator.py:1318-1323, addresses
 		// certbot#7422).
-		time.Sleep(time.Second)
+		sleepAfterReload(cfg)
 		return nil
 	}
 	// Reload failed — likely nginx isn't running. Try to start it.
@@ -809,8 +822,10 @@ func (p *Plugin) injectChallengeLocations(configPath, webroot string) error {
 	}
 	// Inject the include + server_names_hash_bucket_size at the top of
 	// http {} in the root file. Track whether we added them so cleanup
-	// can remove them.
-	challengeConfPath := filepath.Join(webroot, "le_http_01_cert_challenge.conf")
+	// can remove them. The challenge conf lives under config_dir to
+	// match Certbot's http_01.py:46-47 (so `find /etc/letsencrypt -name
+	// le_http_01*` finds it the same way under both tools).
+	challengeConfPath := filepath.Join(p.cfg.ConfigDir, "le_http_01_cert_challenge.conf")
 	p.addedInclude = ensureHTTPInclude(files[0].AST, challengeConfPath)
 	p.addedBucketSize = ensureBucketSize(files[0].AST)
 	p.challengeConfPath = challengeConfPath

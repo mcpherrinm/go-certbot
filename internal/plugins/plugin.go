@@ -54,9 +54,10 @@ type Installer interface {
 
 // Enhancement names supported by Enhance.
 const (
-	EnhanceHSTS   = "hsts"   // Strict-Transport-Security
-	EnhanceUIR    = "uir"    // Content-Security-Policy: upgrade-insecure-requests
-	EnhanceStaple = "staple" // OCSP stapling
+	EnhanceHSTS     = "hsts"     // Strict-Transport-Security
+	EnhanceUIR      = "uir"      // Content-Security-Policy: upgrade-insecure-requests
+	EnhanceStaple   = "staple"   // OCSP stapling
+	EnhanceRedirect = "redirect" // HTTP→HTTPS redirect
 )
 
 // Enhancer is implemented by installers that can apply security enhancements

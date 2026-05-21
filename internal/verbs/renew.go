@@ -161,8 +161,14 @@ func renewOne(ctx context.Context, cli *config.Config, reg *plugins.Registry, co
 	if err != nil {
 		return renewOutcome{kind: outcomeParseError}, err
 	}
+	// Lineages flagged `autorenew = False` are skipped per
+	// renewal.py:140. cli.ForceRenewal overrides.
+	if !merged.Autorenew && !cli.ForceRenewal {
+		fmt.Println("Certificate is configured with autorenew=False; skipping.")
+		return renewOutcome{kind: outcomeSkipped, sans: append([]string(nil), merged.Domains...)}, nil
+	}
 	if !needs && !cli.ForceRenewal {
-		fmt.Printf("Certificate not yet due for renewal; renew_before_expiry not reached. Cert expires on %s.\n", expiresAt.Format("2006-01-02"))
+		fmt.Println("Certificate not yet due for renewal")
 		return renewOutcome{kind: outcomeSkipped, sans: append([]string(nil), merged.Domains...)}, nil
 	}
 	// If the ACME server supports ARI and the suggested window is in the
@@ -283,6 +289,14 @@ func mergeFromRenewalConf(cfg *config.Config, conf *renewalconf.File) {
 	if v, ok := conf.Bool("must_staple"); ok && !cfg.SetByUser("must-staple") {
 		cfg.MustStaple = v
 	}
+	// Honor `autorenew = False` from the conf so lineages flagged for
+	// no-autorenew are skipped by `renew`. Certbot reads this via
+	// BOOL_CONFIG_ITEMS (renewal.py:55) and the renew loop bypasses the
+	// lineage entirely. We mirror by setting Autorenew=false on the merged
+	// config; renewOne consults it.
+	if v, ok := conf.Bool("autorenew"); ok && !cfg.SetByUser("autorenew") {
+		cfg.Autorenew = v
+	}
 	if v, ok := conf.Bool("reuse_key"); ok && !cfg.SetByUser("reuse-key") {
 		cfg.ReuseKey = v
 	}
@@ -330,6 +344,20 @@ func mergeFromRenewalConf(cfg *config.Config, conf *renewalconf.File) {
 	if !cfg.SetByUser("domain") {
 		if list, ok := conf.List("domains"); ok {
 			cfg.Domains = list
+		}
+	}
+	// Certbot doesn't write `domains` to renewal.conf at all (it derives
+	// SANs from the cert at renew time — renewal.py:151-152). When the
+	// merged Domains is still empty, read the cert and pull DNS names +
+	// IP SANs out so go-certbot can renew lineages issued by Certbot.
+	if !cfg.SetByUser("domain") && len(cfg.Domains) == 0 {
+		if certPath := conf.Top["cert"]; certPath != "" {
+			if dns, ips, err := sansFromCert(certPath); err == nil {
+				cfg.Domains = dns
+				if len(cfg.IPAddresses) == 0 {
+					cfg.IPAddresses = ips
+				}
+			}
 		}
 	}
 	// Webroot path + per-domain map (skipped when user passed
@@ -408,6 +436,42 @@ var deprecatedRenewalParams = []string{
 	"certbot_route53:auth_propagation_seconds",
 }
 
+// sansFromCert parses the PEM-encoded cert at path and returns its DNS
+// names and IP-address SANs separately. Used when a renewal.conf doesn't
+// list `domains` (Certbot omits this key and derives SANs from the cert).
+func sansFromCert(path string) ([]string, []string, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	block, _ := pem.Decode(b)
+	if block == nil {
+		return nil, nil, errors.New("renew: empty cert PEM")
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return nil, nil, err
+	}
+	dns := append([]string(nil), cert.DNSNames...)
+	if cert.Subject.CommonName != "" {
+		seen := false
+		for _, n := range dns {
+			if n == cert.Subject.CommonName {
+				seen = true
+				break
+			}
+		}
+		if !seen {
+			dns = append(dns, cert.Subject.CommonName)
+		}
+	}
+	var ips []string
+	for _, ip := range cert.IPAddresses {
+		ips = append(ips, ip.String())
+	}
+	return dns, ips, nil
+}
+
 // needsRenewal returns true if the cert is near expiry, with the cert's
 // NotAfter for logging. Uses renew_before_expiry from the conf if present;
 // otherwise falls back to Certbot's 1/3-of-lifetime rule (renewal.py:413-431)
@@ -451,7 +515,8 @@ func needsRenewal(certPath string, conf *renewalconf.File) (bool, time.Time, err
 
 // parseRenewBefore parses Certbot's English-language interval, including
 // concatenated sequences like "6 months 1 week" (storage.add_time_interval).
-// Bare integers mean days.
+// Bare integers mean days. Zero-valued intervals like "0 days" are accepted
+// and mean "always renew" (Certbot via parsedatetime).
 func parseRenewBefore(s string) (time.Duration, error) {
 	s = strings.TrimSpace(strings.ToLower(s))
 	if s == "" {
@@ -462,7 +527,11 @@ func parseRenewBefore(s string) (time.Duration, error) {
 		return time.Duration(n) * 24 * time.Hour, nil
 	}
 	tokens := strings.Fields(s)
+	if len(tokens) < 2 {
+		return 0, fmt.Errorf("could not parse interval %q", s)
+	}
 	var total time.Duration
+	saw := false
 	for i := 0; i < len(tokens)-1; i += 2 {
 		n, err := strconv.Atoi(tokens[i])
 		if err != nil {
@@ -489,8 +558,9 @@ func parseRenewBefore(s string) (time.Duration, error) {
 			return 0, fmt.Errorf("unknown unit %q", unit)
 		}
 		total += time.Duration(n) * step
+		saw = true
 	}
-	if total == 0 {
+	if !saw {
 		return 0, fmt.Errorf("could not parse interval %q", s)
 	}
 	return total, nil

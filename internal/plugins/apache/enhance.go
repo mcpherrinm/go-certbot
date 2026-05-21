@@ -26,6 +26,8 @@ func (p *Plugin) Enhance(ctx context.Context, cfg *config.Config, domains []stri
 	if len(hits) == 0 {
 		return fmt.Errorf("apache: no <VirtualHost *:443> matched %v; install a cert first", domains)
 	}
+	// Redirect enhancement amends matching :80 vhosts, not the :443 ones.
+	hits80 := findMatchingVHostsAcrossFiles(files, domains, "80")
 
 	needStaple := false
 	for _, h := range hits {
@@ -38,6 +40,11 @@ func (p *Plugin) Enhance(ctx context.Context, cfg *config.Config, domains []stri
 			case plugins.EnhanceStaple:
 				addPerVHostStaple(h.Sec)
 				needStaple = true
+			case plugins.EnhanceRedirect:
+				// Apply to every matched :80 vhost. Idempotent.
+				for _, h80 := range hits80 {
+					addRewriteRedirect(h80.Sec)
+				}
 			default:
 				return fmt.Errorf("apache: unknown enhancement %q", e)
 			}

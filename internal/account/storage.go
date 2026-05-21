@@ -259,15 +259,13 @@ func (s *FileStorage) Save(a *Account) error {
 		return err
 	}
 	// Minimal regr.json: Certbot writes `{"body": {}, "uri": "..."}` and
-	// nothing else (account.py _update_regr).
-	regrBytes, err := json.Marshal(Registration{Body: json.RawMessage(`{}`), URI: a.Registration.URI})
-	if err != nil {
-		return fmt.Errorf("account: marshal regr: %w", err)
-	}
+	// nothing else (account.py _update_regr). Python `json.dumps` uses
+	// ", " and ": " separators by default — we mirror that.
+	regrBytes := marshalRegrPython(a.Registration.URI)
 	if err := writeFile(filepath.Join(dir, "regr.json"), regrBytes, 0o644); err != nil {
 		return err
 	}
-	metaBytes, err := json.Marshal(a.Meta)
+	metaBytes, err := marshalMetaPython(a.Meta)
 	if err != nil {
 		return fmt.Errorf("account: marshal meta: %w", err)
 	}
@@ -277,10 +275,46 @@ func (s *FileStorage) Save(a *Account) error {
 	return nil
 }
 
+// marshalRegrPython emits Certbot's minimal regr.json:
+//
+//	{"body": {}, "uri": "<URI>"}
+//
+// matching Python json.dumps defaults.
+func marshalRegrPython(uri string) []byte {
+	uriJSON, _ := json.Marshal(uri)
+	out := append([]byte{}, `{"body": {}, "uri": `...)
+	out = append(out, uriJSON...)
+	out = append(out, '}')
+	return out
+}
+
+// marshalMetaPython serializes Meta with Python json.dumps separators
+// (", " and ": "). Field order follows Certbot's writes (creation_dt,
+// creation_host, register_to_eff).
+func marshalMetaPython(m Meta) ([]byte, error) {
+	var fields []jsonField
+	if !m.CreationDT.Time.IsZero() {
+		// Re-use Meta's MarshalJSON via JSON round-trip to get the
+		// RFC3339 string (with second truncation + Z suffix).
+		b, err := json.Marshal(m.CreationDT)
+		if err != nil {
+			return nil, err
+		}
+		fields = append(fields, jsonField{"creation_dt", json.RawMessage(b)})
+	}
+	if m.CreationHost != "" {
+		fields = append(fields, jsonField{"creation_host", m.CreationHost})
+	}
+	if m.RegisterToEFF != "" {
+		fields = append(fields, jsonField{"register_to_eff", m.RegisterToEFF})
+	}
+	return marshalPythonJSON(fields), nil
+}
+
 // UpdateMeta rewrites meta.json without touching the key or regr files.
 func (s *FileStorage) UpdateMeta(a *Account) error {
 	dir := s.accountDir(a.ID)
-	metaBytes, err := json.Marshal(a.Meta)
+	metaBytes, err := marshalMetaPython(a.Meta)
 	if err != nil {
 		return fmt.Errorf("account: marshal meta: %w", err)
 	}
@@ -290,10 +324,7 @@ func (s *FileStorage) UpdateMeta(a *Account) error {
 // UpdateRegistration rewrites regr.json (used after registration URI changes).
 func (s *FileStorage) UpdateRegistration(a *Account) error {
 	dir := s.accountDir(a.ID)
-	regrBytes, err := json.Marshal(Registration{Body: json.RawMessage(`{}`), URI: a.Registration.URI})
-	if err != nil {
-		return err
-	}
+	regrBytes := marshalRegrPython(a.Registration.URI)
 	return writeFile(filepath.Join(dir, "regr.json"), regrBytes, 0o644)
 }
 

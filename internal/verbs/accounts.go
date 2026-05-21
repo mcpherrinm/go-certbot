@@ -27,9 +27,12 @@ func Register(ctx context.Context, cfg *config.Config, _ *plugins.Registry) erro
 		if cfg.NonInteractive {
 			return errors.New("register: --email is required (or --register-unsafely-without-email)")
 		}
-		cfg.Email = display.Email("Enter email address (used for urgent renewal and security notices):")
+		// Certbot's display_ops.get_email (display/ops.py:35) accepts an
+		// empty line as "skip"; we mirror by switching into
+		// register-unsafely-without-email mode if the user hits enter.
+		cfg.Email = display.Email("Enter email address or hit Enter to skip:")
 		if cfg.Email == "" {
-			return errors.New("register: --email is required")
+			cfg.RegisterUnsafelyWithoutEmail = true
 		}
 	}
 
@@ -109,15 +112,17 @@ func ShowAccount(_ context.Context, cfg *config.Config, _ *plugins.Registry) err
 	return nil
 }
 
-// accountThumbprint returns the lego/josepy-format thumbprint of the
-// account key (JWK SHA-256 fingerprint, base64url-encoded). Matches
-// the "Account Thumbprint" line in Certbot's show_account output.
+// accountThumbprint returns the RFC 7638 JWK thumbprint of the account
+// key — SHA-256 of the JSON containing only the REQUIRED public fields,
+// sorted lexically, with no whitespace between separators. Matches
+// josepy's JWK.thumbprint (interfaces.py:180-187) used by Certbot's
+// show_account (main.py:1013).
 func accountThumbprint(acc *account.Account) (string, error) {
-	jwk, err := account.MarshalJWK(acc.Key)
+	canon, err := account.JWKThumbprintCanonical(acc.Key)
 	if err != nil {
 		return "", err
 	}
-	sum := sha256.Sum256(jwk)
+	sum := sha256.Sum256(canon)
 	return base64.RawURLEncoding.EncodeToString(sum[:]), nil
 }
 

@@ -299,6 +299,22 @@ func (f *File) SetParam(key, value string) {
 	f.RenewalParams[key] = value
 }
 
+// DeleteParam removes a key from [renewalparams]. Used by reconfigure to
+// clear a hook when the user passed e.g. `--deploy-hook ""`.
+func (f *File) DeleteParam(key string) {
+	if _, ok := f.RenewalParams[key]; !ok {
+		return
+	}
+	delete(f.RenewalParams, key)
+	out := f.paramsOrder[:0]
+	for _, k := range f.paramsOrder {
+		if k != key {
+			out = append(out, k)
+		}
+	}
+	f.paramsOrder = out
+}
+
 // SetNested sets a key inside a [[nested]] section of [renewalparams].
 // Creates the section if it doesn't exist. Used for `webroot_map`.
 func (f *File) SetNested(name, key, value string) {

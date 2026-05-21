@@ -45,10 +45,12 @@ func LoadCredentials(path, prefix string) (*Credentials, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%s: stat credentials: %w", prefix, err)
 	}
-	if info.Mode().Perm()&0o077 != 0 {
-		// Match Certbot's permission check (dns_common warns + recommends).
+	// Certbot's dns_common.validate_file_permissions only warns on
+	// world-readable bits (mask 0o007). Group-readable INI files are
+	// common in shared-admin setups, so we don't warn on those.
+	if info.Mode().Perm()&0o007 != 0 {
 		fmt.Fprintf(os.Stderr,
-			"warning: %s permissions are %o; recommend chmod 600 to protect credentials\n",
+			"warning: %s is world-accessible (%o); recommend chmod 600 or 640 to protect credentials\n",
 			abs, info.Mode().Perm())
 	}
 

@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -46,7 +47,7 @@ func Main(args []string) int {
 	// `--version` always prints and exits.
 	for _, a := range args {
 		if a == "--version" {
-			fmt.Println("go-certbot 1.3.0")
+			fmt.Println("go-certbot 1.4.0")
 			return 0
 		}
 	}
@@ -91,6 +92,10 @@ func Main(args []string) int {
 		return 2
 	}
 	trackSources(fs, cfg)
+	// Snapshot the post-argv flag set so we can restore values after ini
+	// load without re-parsing argv (which would *append* to slice flags
+	// because pflag's StringSliceValue.Set appends once Changed=true).
+	argvSnapshot := snapshotFlags(fs)
 
 	// Load cli.ini after parsing flags so command-line wins. Apply found
 	// files in order: default search paths, then --config override.
@@ -106,15 +111,22 @@ func Main(args []string) int {
 			return 2
 		}
 	}
-	// Re-parse argv so flags override anything loaded from ini.
-	if err := fs.Parse(rest); err != nil {
-		fmt.Fprintln(os.Stderr, "go-certbot:", err)
-		return 2
-	}
+	// Restore argv values: for each flag that was set on argv, overwrite
+	// what ini loading set. Avoids the slice-append bug a second Parse
+	// would cause.
+	restoreFlags(fs, argvSnapshot)
 	trackSources(fs, cfg)
 	materializeDNSMaps(cfg)
 	for _, h := range cfg.PostParseHooks {
 		h()
+	}
+	applyDryRunSideEffects(cfg)
+	// --staging + custom --server is an error per Certbot
+	// cli_utils.py:272-273. Disallow.
+	if cfg.SetByUser("staging") && cfg.SetByUser("server") &&
+		cfg.Server != config.StagingDirectory && cfg.Server != config.DefaultLetsEncryptDirectory {
+		fmt.Fprintln(os.Stderr, "go-certbot: --staging is incompatible with a custom --server")
+		return 2
 	}
 
 	configureLogging(cfg)
@@ -160,18 +172,28 @@ func Main(args []string) int {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	// Background goroutine: when ctx is cancelled (SIGINT/SIGTERM),
-	// restore any in-flight checkpoint and print Certbot's exit message.
-	// Mirrors certbot._internal.log.exit_with_advice (log.py:362-364).
-	sigDone := make(chan struct{})
+	// Background goroutine: when ctx is cancelled by SIGINT/SIGTERM (NOT
+	// by the deferred cancel() on normal exit), restore any in-flight
+	// checkpoint and print Certbot's exit message. The handlerDone signal
+	// lets us tell the two apart: if the handler has already finished
+	// when ctx.Done() fires, the cancel was the deferred one and we
+	// shouldn't act.
+	handlerDone := make(chan struct{})
+	sigFired := make(chan struct{})
 	go func() {
 		<-ctx.Done()
+		select {
+		case <-handlerDone:
+			// Normal exit via deferred cancel(); nothing to do.
+			return
+		default:
+		}
 		if err := checkpoint.RestoreInFlight(); err == nil {
 			fmt.Fprintln(os.Stderr, "Exiting due to user request.")
 		} else {
 			fmt.Fprintln(os.Stderr, "Exiting due to user request (warning: in-flight checkpoint rollback failed:", err, ")")
 		}
-		close(sigDone)
+		close(sigFired)
 		// Give the active handler a moment to wrap up, then force-exit
 		// so we don't hang on a misbehaving plugin.
 		go func() {
@@ -184,13 +206,17 @@ func Main(args []string) int {
 	if handler == nil {
 		fmt.Fprintf(os.Stderr, "go-certbot: unknown subcommand %q\n", verb)
 		printCommands(os.Stderr)
+		close(handlerDone)
 		return 2
 	}
-	if err := handler(ctx, cfg, reg); err != nil {
-		// If we exited because of a signal, the message has already
-		// been printed by the goroutine above.
+	handlerErr := handler(ctx, cfg, reg)
+	close(handlerDone)
+	err = handlerErr
+	if err != nil {
+		// If a signal already fired, the goroutine printed the exit
+		// message; suppress the handler error.
 		select {
-		case <-sigDone:
+		case <-sigFired:
 			return 130
 		default:
 		}
@@ -278,6 +304,53 @@ func logLevel(cfg *config.Config) slog.Level {
 		level = slog.LevelError
 	}
 	return level
+}
+
+// snapshotFlags captures the user-set values of every flag the user
+// changed on argv. Used to re-apply over ini-loaded values without
+// re-parsing argv (which would double slice-flag values).
+func snapshotFlags(fs *pflag.FlagSet) map[string]string {
+	out := map[string]string{}
+	fs.Visit(func(f *pflag.Flag) {
+		out[f.Name] = f.Value.String()
+	})
+	return out
+}
+
+// restoreFlags re-applies argv-set values. For slice flags we must clear
+// the existing value first (since Set appends when Changed=true), which
+// we do by clearing the underlying slice via Type-specific handling.
+func restoreFlags(fs *pflag.FlagSet, snap map[string]string) {
+	for name, val := range snap {
+		f := fs.Lookup(name)
+		if f == nil {
+			continue
+		}
+		// Reset slice flags to avoid the append-on-Set behavior.
+		if sv, ok := f.Value.(interface{ Replace([]string) error }); ok {
+			// pflag's StringSlice / IPSlice etc. expose Replace which
+			// honors Changed semantics properly.
+			vals := splitCSVList(val)
+			_ = sv.Replace(vals)
+			continue
+		}
+		// For scalars Set is fine (replaces).
+		_ = f.Value.Set(val)
+	}
+}
+
+// splitCSVList parses the `[a,b,c]` form pflag's StringSlice.String() emits.
+func splitCSVList(s string) []string {
+	s = strings.TrimPrefix(s, "[")
+	s = strings.TrimSuffix(s, "]")
+	if s == "" {
+		return nil
+	}
+	parts := strings.Split(s, ",")
+	for i := range parts {
+		parts[i] = strings.TrimSpace(parts[i])
+	}
+	return parts
 }
 
 // configureLogging seeds slog with a stderr-only handler at the right level.

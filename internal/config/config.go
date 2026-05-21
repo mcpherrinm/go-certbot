@@ -77,14 +77,24 @@ type Config struct {
 	Apache        bool
 	Nginx         bool
 	// Nginx-specific
-	NginxConfig     string // explicit nginx.conf path; overrides NginxServerRoot
-	NginxServerRoot string // /etc/nginx default
-	NginxCtl        string // nginx binary (default "nginx")
+	NginxConfig         string // explicit nginx.conf path; overrides NginxServerRoot
+	NginxServerRoot     string // /etc/nginx default
+	NginxCtl            string // nginx binary (default "nginx")
+	NginxSleepSeconds   int    // sleep after reload; default 1
 	Redirect        *bool  // tri-state: nil = ask/auto, true = add 301, false = skip
 	// Apache-specific
-	ApacheConfig     string // explicit apache2.conf path; overrides ApacheServerRoot
-	ApacheServerRoot string // /etc/apache2 default
-	ApacheCtl        string // apachectl binary (default "apachectl")
+	ApacheConfig            string // explicit apache2.conf path; overrides ApacheServerRoot
+	ApacheServerRoot        string // /etc/apache2 default
+	ApacheCtl               string // apachectl binary (default "apachectl")
+	ApacheBin               string // override for `httpd` binary; falls back to ApacheCtl
+	ApacheEnMod             string // command to enable a mod (e.g. "a2enmod"); empty on RHEL
+	ApacheDismod            string // command to disable a mod
+	ApacheLeVhostExt        string // suffix for SSL clones; default "-le-ssl.conf"
+	ApacheVHostRoot         string // override per-OS vhost_root
+	ApacheLogsRoot          string // /var/log/apache2 or /var/log/httpd
+	ApacheChallengeLocation string // dir for HTTP-01 challenges; default work_dir/http_challenges
+	ApacheHandleModules     bool   // a2enmod/a2dismod on Debian
+	ApacheHandleSites       bool   // a2ensite/a2dissite on Debian
 
 	// Enhancements (enhance verb)
 	HSTS   bool
