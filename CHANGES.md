@@ -628,3 +628,163 @@ These are areas where the rewrite produces output equivalent to Certbot's:
   `/var/log/letsencrypt` on Linux/macOS; `C:\Certbot`, `C:\Certbot\lib`,
   `C:\Certbot\log` on Windows. Permission modes (0755 for directories,
   0600 for private keys) match.
+
+
+## Phase 13 — review-4 parity sweep
+
+Driven by a fourth round of code review against Certbot 5.6.0 source.
+Headline goal: a Certbot user can switch to go-certbot (or back) without
+surprises. Highlights:
+
+- **DNS plugins.** Wired each plugin's Certbot-shipped
+  `default_propagation_seconds` (cloudflare=10, route53=10, do=10,
+  dnsimple=30, dnsmadeeasy=60, gehirn=30, google=60, linode=120,
+  luadns=30, nsone=30, ovh=120, rfc2136=60, sakuracloud=90). Before this,
+  every plugin used 0 and fell back to heterogeneous lego defaults. RFC
+  2136 now validates the server is a literal IP and rejects unknown
+  algorithm names.
+
+- **renewal.conf format.** Multi-element lists round-trip as bare
+  `domains = a, b, c` (matching configobj's `list_values=True` default);
+  previously a comma in any scalar got double-quoted, which corrupted
+  Certbot-written `domains = a, b` on the next round-trip. Dropped
+  spurious quoting for bare `=` and the fabricated
+  `# Options used in the renewal process` header. Nested-section keys
+  now emit flush-left, matching configobj/Certbot output.
+
+- **processlock.** Switched from BSD `flock(2)` to POSIX `fcntl/lockf`
+  (`F_SETLK`). flock and lockf live in independent kernel namespaces, so
+  concurrent go-certbot + certbot runs were not blocking each other.
+  Also unlink the lock file on Release with the inode-recheck dance from
+  certbot LockFile.acquire so an unlink/recreate race doesn't leave us
+  holding a lock on an orphan inode.
+
+- **Checkpoint.** Build snapshots into `<work_dir>/in-progress/` and
+  atomic-rename to `<work_dir>/backups/<timestamp>/` only on MarkClean,
+  matching Certbot's finalize_checkpoint flow. A crash before MarkClean
+  leaves the dir for `RecoverInterrupted` (called at main.go startup) to
+  roll back. `shutil.copy2` equivalent now restores mtime alongside
+  mode. New `temp_checkpoint` dir reserves the layout Certbot uses for
+  this-run-only snapshots.
+
+- **CLI surface.**
+  - `--webroot-map` (JSON object → `WebrootMap`) per Certbot's
+    `_WebrootMapAction`.
+  - `--csr` reads the file at flag-set time and stores `(path, contents)`
+    like Certbot's argparse `type=read_file`.
+  - `--redirect` is genuinely tri-state pre-parse.
+  - `--reason` translated to the REVOCATION_REASONS int code at parse
+    time.
+  - Default `RollbackCheckpoints=1`.
+  - Dropped the invented `--apache-config` / `--nginx-config` flags;
+    conf paths are derived from `--apache-server-root` /
+    `--nginx-server-root` like Certbot.
+  - `plugins --authenticators` / `--installers` are zero-arg
+    (`action=append_const`).
+  - `extractVerb` scans all of argv for the verb token, not just args[0].
+  - Deprecated flags emit `"Use of --foo is deprecated."` on first use.
+  - Certbot-SUPPRESS'd flags hidden in `--help`.
+
+- **Renew.** Random sleep on renew (1-8min uniform when stdin is non-TTY
+  and `--no-random-sleep-on-renew` wasn't passed); `--dry-run` rewrites
+  Server to STAGING and clears Account; renew exit code non-zero on
+  parse_failures too; `--cert-name <missing>` now errors; default
+  renewal window uses Certbot's `lifetime*2/3` formula (no 30-day
+  clamp); `ensure_deployed` re-links live/<cert>/* to the highest
+  archive version before reading NotAfter; ARI retry-after persisted in
+  `[acme_renewal_info]` and fetched from the lineage's server (not the
+  CLI server).
+
+- **Certonly.** New `_find_cert` dispatch: before issuing, look up any
+  existing `renewal/<cert-name>.conf` and inspect its leaf SANs.
+  Reissue/renew/skip/expand/duplicate matches Certbot's
+  `_find_lineage_for_sans_and_certname` + `find_duplicative_certs`.
+  Previously go-certbot always reissued, causing rate-limit churn.
+
+- **Reconfigure.** Persists the full key surface Certbot uses:
+  authenticator, installer, allow_subset_of_names, renew_before_expiry,
+  pref_challs, DNS-prefixed flat keys, and the `[[webroot_map]]` nested
+  section. Previously only a handful of keys were writable.
+
+- **Revoke.** Pins server + account to the lineage's renewal conf
+  (otherwise revoking a cert from a non-default CA failed with
+  "unrecognized account"). Non-interactive mode now errors when
+  `--delete-after-revoke` / `--no-delete-after-revoke` weren't passed.
+
+- **Certificates / delete.** `--domain` filter is now subset-match
+  (`config_sans.issubset(cert.sans())`). REVOKED runs independently of
+  TEST_CERT. Delete drops the `.deleted` intermediate (Certbot uses
+  `os.remove` directly) and supports a multi-select checklist for
+  multiple-lineage delete in one call.
+
+- **Nginx.** Embedded the 24-entry historical SHA-256 list for
+  `options-ssl-nginx.conf`. Dropped `ssl-dhparams.pem` write +
+  `ssl_dhparam` directive (Certbot 5.x dropped them).
+  `serverNames()` now collects every `server_name` directive (nginx
+  allows multiple). `findMatchingVHosts` falls back to any
+  `default_server`-flagged vhost when no name matches.
+
+- **Apache.** Fedora `Ctl=httpd` and a new per-OS `QueryBin` field so
+  RHEL 9+ / Fedora use `httpd` (not apachectl) for `-v`/`-M`/`-D`
+  queries; `testAndReload` falls back to per-OS `restart_cmd_alt` when
+  `graceful` fails; `findMatchingVHosts` skips vhosts inside `<Macro>`
+  sections; `options-ssl-apache.conf` install now checks the on-disk
+  file's SHA-256 against the 21 historical hashes (user-modified files
+  are left alone with a `.dist` sidecar).
+
+  Remaining apache gaps (require deep apache-runtime evaluation; not
+  fixed in this phase): `${VAR}` interpolation via DUMP_RUN_CFG,
+  `<IfModule>` / `<IfDefine>` / `<IfVersion>` conditional activity
+  evaluation, `ensure_listen(443)`, `OLD_REWRITE_HTTPS_ARGS` removal in
+  the redirect block, and SSL clone dedupe of stale `SSLCertificate*`.
+
+- **Display / EFF.** `Email()` returns "" on first blank Enter and
+  validates with a regex (re-prompting with "There is a problem with
+  your email address. " prefix). `Default.Out` is now stdout (matches
+  `display_util.notify(outfile=sys.stdout)`). EFF prompt drops the
+  spurious "\nEmail: %s" suffix; all error paths route through
+  display.Notify with Certbot's "act.eff.org" wording. Removed the
+  custom User-Agent (Certbot uses the default requests UA).
+
+- **Hooks.** stdout+stderr captured and emitted with Certbot's
+  `Hook 'X' ran with output:\n  <indented>` wrapper. SNAP*, LD_PRELOAD,
+  LD_LIBRARY_PATH, PYTHONPATH stripped from the hook env so snap-installed
+  go-certbot doesn't leak snap-rooted paths into user hook scripts.
+
+- **Standalone.** Em-dash error wording replaced with Certbot's
+  ASCII-only "could not bind TCP port N because..." text. On EADDRINUSE
+  in interactive mode, the user is prompted to retry per
+  `standalone.py:196-204`.
+
+- **Manual.** Interactive mode (no `--manual-auth-hook` in interactive
+  contexts) prints Certbot's DNS/HTTP-01 instructions and blocks on
+  stdin per `manual.py:206-238`.
+
+- **Webroot.** Prefix creation wrapped in `umask(0o022)` so a restrictive
+  process umask doesn't produce 0o700 challenge dirs the web server's
+  uid can't traverse. On Windows, drop a `web.config` alongside the
+  challenge file telling IIS to serve extension-less files as
+  text/plain.
+
+- **ACME client.** UA token is "certbot" (not "go-certbot") so CA log
+  parsers classify requests as Certbot-shaped. Runtime tag is `Py/<go>`.
+  RenewalInfo 404 detection uses lego's typed `acme.ProblemDetails`
+  error instead of a substring match. Version banner prints "certbot
+  1.4.0".
+
+- **Error handler + logging.** New `internal/errorhandler` package: a
+  LIFO cleanup stack walked on SIGINT/SIGTERM and on uncaught panic.
+  Top-level `defer recover()` writes the runtime stack via
+  `WriteCrashTrace` and prints Certbot's
+  `exit_with_advice` line: "Ask for help or search for solutions at
+  https://community.letsencrypt.org. See the logfile <path> or re-run
+  Certbot with -v for more details." Signal-exit code is 1 (matching
+  Certbot, not bash's 130). logfile format is Certbot's
+  `%(asctime)s:%(levelname)s:%(name)s:%(message)s`, rotate on every
+  Setup, ANSI red on WARNING+ when TTY (unless `NO_COLOR` is set), file
+  mode 0600.
+
+- **Account storage.** When `--strict-permissions` is set, refuse to
+  operate on an accounts dir owned by a different uid. Empty accounts
+  dir + populated predecessor (per `LE_REUSE_SERVERS`) now migrates as a
+  whole-directory symlink, matching `account.py:200-213`.
