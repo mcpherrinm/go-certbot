@@ -1,36 +1,6 @@
 package verbs
 
-import "testing"
-
-func TestLookupReason(t *testing.T) {
-	tests := []struct {
-		in   string
-		want uint
-		err  bool
-	}{
-		{"", 0, false},
-		{"unspecified", 0, false},
-		{"keycompromise", 1, false},
-		{"KeyCompromise", 1, false},
-		{"superseded", 4, false},
-		{"cessationofoperation", 5, false},
-		{"affiliationchanged", 3, false},
-		{"bogus", 0, true},
-	}
-	for _, tc := range tests {
-		got, err := lookupReason(tc.in)
-		if tc.err {
-			if err == nil {
-				t.Errorf("lookupReason(%q): expected error", tc.in)
-			}
-			continue
-		}
-		if err != nil {
-			t.Errorf("lookupReason(%q): %v", tc.in, err)
-			continue
-		}
-		if got != tc.want {
-			t.Errorf("lookupReason(%q): got %d want %d", tc.in, got, tc.want)
-		}
-	}
-}
+// Revoke uses cfg.Reason (already int after flags.go translation), so
+// there's no longer a verb-level lookup function to unit-test here. The
+// keyword → code translation is exercised by the flag PostParseHook in
+// internal/cmd/flags.go and indirectly covered by the e2e flow.

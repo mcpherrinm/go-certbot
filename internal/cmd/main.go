@@ -268,18 +268,42 @@ func dispatch(verb string) func(context.Context, *config.Config, *plugins.Regist
 	return nil
 }
 
-// extractVerb pulls the leading positional subcommand (if any) from args.
-// Returns ("", args) if the first arg is a flag or args is empty (which
-// matches Certbot's "run" default).
+// verbSet enumerates every subcommand we know how to dispatch. Used by
+// extractVerb to scan ALL of argv (not just position 0) for a verb token,
+// matching Certbot's HelpfulArgumentParser.add_verbs flow (helpful.py:369-378)
+// which pops the first verb-shaped token from anywhere on the command line.
+var verbSet = map[string]struct{}{
+	"run": {}, "everything": {},
+	"certonly": {}, "auth": {},
+	"renew": {}, "certificates": {},
+	"delete": {}, "revoke": {},
+	"register": {}, "unregister": {},
+	"update_account": {}, "show_account": {},
+	"install": {}, "enhance": {},
+	"rollback": {}, "plugins": {},
+	"reconfigure": {},
+}
+
+// extractVerb scans args for the first token that names a subcommand and
+// returns that verb plus args with the token removed. Returns ("", args)
+// if no verb token appears (which matches Certbot's "run" default).
 func extractVerb(args []string) (string, []string) {
-	if len(args) == 0 {
-		return "", nil
+	for i, a := range args {
+		if a == "" || a[0] == '-' {
+			continue
+		}
+		if _, ok := verbSet[a]; !ok {
+			continue
+		}
+		// Normalize the legacy aliases (auth → certonly, everything → run)
+		// at the call site? No — dispatch() handles them. We just need to
+		// remove the token from the slice the FlagSet will see.
+		rest := make([]string, 0, len(args)-1)
+		rest = append(rest, args[:i]...)
+		rest = append(rest, args[i+1:]...)
+		return a, rest
 	}
-	first := args[0]
-	if len(first) > 0 && first[0] == '-' {
-		return "", args
-	}
-	return first, args[1:]
+	return "", args
 }
 
 func printHelp(out io.Writer, topic string) {

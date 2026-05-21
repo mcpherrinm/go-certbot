@@ -19,10 +19,10 @@ import (
 
 // Certonly obtains a new certificate (no installation).
 func Certonly(ctx context.Context, cfg *config.Config, reg *plugins.Registry) error {
-	if len(cfg.Domains) == 0 && cfg.CSR == "" {
+	if len(cfg.Domains) == 0 && cfg.CSR.Path == "" {
 		return errors.New("certonly: at least one -d/--domain is required")
 	}
-	if cfg.CSR != "" {
+	if cfg.CSR.Path != "" {
 		return errors.New("certonly: --csr issuance is not yet implemented")
 	}
 	if cfg.Apache || cfg.Nginx {

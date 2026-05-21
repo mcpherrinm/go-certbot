@@ -316,13 +316,10 @@ func vhostNames(sec *parser.Section) []string {
 	return out
 }
 
-// apacheConfigPath returns where to read/write, honoring explicit overrides
+// apacheConfigPath returns where to read/write, honoring --apache-server-root
 // then falling back to the per-OS default (Debian vs RHEL vs Alpine vs Gentoo
 // — see detectOSOptions).
 func apacheConfigPath(cfg *config.Config) string {
-	if cfg.ApacheConfig != "" {
-		return cfg.ApacheConfig
-	}
 	opts := detectOSOptions()
 	if cfg.ApacheServerRoot != "" {
 		return filepath.Join(cfg.ApacheServerRoot, filepath.Base(opts.ConfigPath))

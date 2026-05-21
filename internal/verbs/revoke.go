@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"github.com/letsencrypt/go-certbot/internal/account"
 	"github.com/letsencrypt/go-certbot/internal/client"
@@ -15,16 +14,6 @@ import (
 	"github.com/letsencrypt/go-certbot/internal/plugins"
 	"github.com/letsencrypt/go-certbot/internal/storage/renewalconf"
 )
-
-// revocationReasons maps the human-readable values Certbot accepts to RFC 5280
-// codes. Matches certbot._internal.constants.REVOCATION_REASONS.
-var revocationReasons = map[string]uint{
-	"unspecified":          0,
-	"keycompromise":        1,
-	"affiliationchanged":   3,
-	"superseded":           4,
-	"cessationofoperation": 5,
-}
 
 // Revoke revokes a certificate via ACME and (optionally) deletes its lineage.
 //
@@ -55,10 +44,7 @@ func Revoke(ctx context.Context, cfg *config.Config, reg *plugins.Registry) erro
 	if err != nil {
 		return fmt.Errorf("revoke: read %s: %w", certPath, err)
 	}
-	reason, err := lookupReason(cfg.Reason)
-	if err != nil {
-		return err
-	}
+	reason := uint(cfg.Reason)
 
 	// Two revocation paths (RFC 8555 §7.6):
 	//   1. account-key revocation — load the local ACME account and POST.
@@ -135,20 +121,4 @@ func revokeWithCertKey(ctx context.Context, cfg *config.Config, certPEM []byte, 
 		return err
 	}
 	return c.RevokeWithReason(ctx, certPEM, reason)
-}
-
-func lookupReason(name string) (uint, error) {
-	if name == "" {
-		return 0, nil
-	}
-	v, ok := revocationReasons[strings.ToLower(strings.TrimSpace(name))]
-	if !ok {
-		valid := make([]string, 0, len(revocationReasons))
-		for k := range revocationReasons {
-			valid = append(valid, k)
-		}
-		return 0, fmt.Errorf("revoke: unknown --reason %q (valid: %s)",
-			name, strings.Join(valid, ", "))
-	}
-	return v, nil
 }

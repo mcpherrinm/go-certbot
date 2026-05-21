@@ -406,9 +406,6 @@ func newRedirectServer(names []string) *parser.Block {
 // per-OS default. Matches certbot-nginx/constants.py:5-14: BSD/macOS use
 // /usr/local/etc/nginx, NetBSD uses /usr/pkg/etc/nginx.
 func nginxConfigPath(cfg *config.Config) string {
-	if cfg.NginxConfig != "" {
-		return cfg.NginxConfig
-	}
 	if cfg.NginxServerRoot != "" {
 		return filepath.Join(cfg.NginxServerRoot, "nginx.conf")
 	}
@@ -772,11 +769,10 @@ func testAndReload(ctx context.Context, cfg *config.Config) error {
 		sleepAfterReload(cfg)
 		return nil
 	}
-	// Reload failed — likely nginx isn't running. Try to start it.
-	cmd := exec.CommandContext(ctx, ctl)
-	if cfg.NginxConfig != "" {
-		cmd = exec.CommandContext(ctx, ctl, "-c", cfg.NginxConfig)
-	}
+	// Reload failed — likely nginx isn't running. Try to start it,
+	// pointing at the discovered nginx.conf so the right config tree gets
+	// loaded.
+	cmd := exec.CommandContext(ctx, ctl, "-c", nginxConfigPath(cfg))
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("nginx: reload failed and `%s` (start) also failed: %w\n%s", ctl, err, string(out))
 	}
