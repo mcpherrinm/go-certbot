@@ -788,3 +788,65 @@ surprises. Highlights:
   operate on an accounts dir owned by a different uid. Empty accounts
   dir + populated predecessor (per `LE_REUSE_SERVERS`) now migrates as a
   whole-directory symlink, matching `account.py:200-213`.
+
+## Phase 14 — Certbot 4.0–5.6 bug sweep
+
+Audit of bug-fix commits Certbot landed between releases 4.0.0 and 5.6.0
+(2025-04 through 2026-05). Each item below is a bug that existed in
+go-certbot and has now been fixed; items already present in go-certbot
+or not applicable to this codebase aren't listed.
+
+- **Private keys saved in PKCS#8** (was lego's PKCS#1 for RSA, SEC1 for
+  EC). `internal/client/client.go` now rewraps `resource.PrivateKey`
+  with `x509.MarshalPKCS8PrivateKey` before passing to storage.Write.
+  Matches certbot 3.2.0 — Certbot itself regressed to PKCS#1 in 3.1
+  before fixing this; go-certbot inherited the buggy state from lego.
+
+- **Scrub snap env from every external program**, not just user hooks.
+  New `internal/extenv` package strips SNAP*, OPENSSL_MODULES,
+  OPENSSL_FORCE_FIPS_MODE, LD_PRELOAD, PYTHONPATH and trims /snap/
+  entries from PATH / LD_LIBRARY_PATH. Applied to nginx -t / -s reload
+  / -c (start), apache `-v` / configtest / graceful / restart_cmd_alt,
+  a2enmod, and httpd -M. Hooks already had a subset of this scrub; the
+  new package is the single source of truth.
+
+- **nginx addListenSSL preserves IP host.** When converting `listen
+  127.0.0.1:80;` to SSL, the emitted listen now reads `listen
+  127.0.0.1:443 ssl;` (was bare `listen 443 ssl;`, losing the bind
+  address). Mirrors certbot _make_server_ssl
+  (configurator.py:709-784). New `TestInsertSSLPreservesIPHost`.
+
+- **nginx http {} discovery across included files.** http_01.py /
+  nginx-installer-style edits now scan every parsed file for the
+  `http {}` block, not just `nginx.conf`. Distros that place http {} in
+  `/etc/nginx/conf.d/server.conf` (and use the root nginx.conf only
+  for `events {}` + `include`) previously silently did nothing and
+  http-01 challenges failed.
+
+- **nginx parser tolerates inline comments inside directive args.**
+  `server_name *.example.com\n  # internal\n  www.example.com;` now
+  parses with both names retained and the comment preserved through
+  round-trip. Mirrors certbot 6fd6a541d (#10147). New AST fields
+  `Directive.InternalComments` and `Directive.ArgLeadingWS` keep edits
+  on these directives lossless.
+
+- **nginx lexer handles multibyte whitespace.** consumeWhitespace /
+  consumeWord now use `utf8.DecodeRuneInString` instead of byte-cast
+  rune, so NBSP (U+00A0, UTF-8 `C2 A0`) and other multibyte spaces
+  inserted by word processors lex as whitespace. Pre-fix the leading
+  0xC2 byte silently glued into the next word.
+
+- **manual plugin HTTP-01 instructions bracket IPv6.** Interactive
+  manual mode now prints `http://[::1]/.well-known/acme-challenge/...`
+  rather than `http://::1/...`. Mirrors certbot bd7b64f1e (#10548).
+
+- **Skip ARI for expired certs and during --dry-run.** RFC 9773 §4.3
+  forbids ARI for expired serials; certbot 95a70e98c added the gate.
+  Separately, `--dry-run` against staging while the cert was issued by
+  prod produced a noisy mismatch warning (certbot b68268744); the
+  dry-run path doesn't need ARI anyway.
+
+- **Auto-register without email when prompt blank.** Empty interactive
+  email response (or `--non-interactive` with no email) now flips
+  `RegisterUnsafelyWithoutEmail = true` rather than returning an
+  error. Matches the accounts verb's behavior and certbot 3.3.0.
