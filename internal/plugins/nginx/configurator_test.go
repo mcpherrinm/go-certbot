@@ -63,8 +63,8 @@ func TestInsertSSLDirectivesIdempotent(t *testing.T) {
 `
 	cfg := parseOrFatal(t, src)
 	srv := cfg.Nodes[0].(*parser.Block)
-	insertSSLDirectives(srv, "/fc.pem", "/key.pem", 443)
-	insertSSLDirectives(srv, "/fc.pem", "/key.pem", 443) // second call shouldn't double
+	insertSSLDirectives(srv, "/fc.pem", "/key.pem", 80, 443)
+	insertSSLDirectives(srv, "/fc.pem", "/key.pem", 80, 443) // second call shouldn't double
 	out := cfg.String()
 	if strings.Count(out, "ssl_certificate ") != 1 {
 		t.Errorf("ssl_certificate inserted %d times:\n%s", strings.Count(out, "ssl_certificate "), out)
@@ -82,13 +82,35 @@ func TestInsertSSLOnExistingListen443(t *testing.T) {
 `
 	cfg := parseOrFatal(t, src)
 	srv := cfg.Nodes[0].(*parser.Block)
-	insertSSLDirectives(srv, "/fc.pem", "/key.pem", 443)
+	insertSSLDirectives(srv, "/fc.pem", "/key.pem", 80, 443)
 	out := cfg.String()
 	if !strings.Contains(out, "listen 443 ssl;") {
 		t.Errorf("should upgrade existing listen 443:\n%s", out)
 	}
 	if strings.Count(out, "listen") != 1 {
 		t.Errorf("should not add a second listen line:\n%s", out)
+	}
+}
+
+// TestInsertSSLPreservesIPHost mirrors certbot#9978 fix: when the existing
+// http listen has an IP host (e.g. `listen 127.0.0.1:80;`), the new SSL
+// listen must keep the same host on the HTTPS port.
+func TestInsertSSLPreservesIPHost(t *testing.T) {
+	src := `server {
+    listen 127.0.0.1:80;
+    server_name example.com;
+}
+`
+	cfg := parseOrFatal(t, src)
+	srv := cfg.Nodes[0].(*parser.Block)
+	insertSSLDirectives(srv, "/fc.pem", "/key.pem", 80, 443)
+	out := cfg.String()
+	if !strings.Contains(out, "listen 127.0.0.1:443 ssl;") {
+		t.Errorf("expected 127.0.0.1:443 ssl listen:\n%s", out)
+	}
+	// The original http listen must NOT be modified.
+	if !strings.Contains(out, "listen 127.0.0.1:80;") {
+		t.Errorf("expected original http listen preserved:\n%s", out)
 	}
 }
 

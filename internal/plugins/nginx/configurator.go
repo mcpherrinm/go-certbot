@@ -39,6 +39,7 @@ import (
 
 	"github.com/letsencrypt/go-certbot/internal/checkpoint"
 	"github.com/letsencrypt/go-certbot/internal/config"
+	"github.com/letsencrypt/go-certbot/internal/extenv"
 	"github.com/letsencrypt/go-certbot/internal/plugins"
 	"github.com/letsencrypt/go-certbot/internal/plugins/nginx/parser"
 )
@@ -53,8 +54,9 @@ type Plugin struct {
 	challengeDir      string
 	challengeConfPath string // <work_dir>/le_http_01_cert_challenge.conf
 	addedLocations    []*serverLocation
-	addedInclude      bool // we added the include line to nginx.conf
-	addedBucketSize   bool // we added server_names_hash_bucket_size to nginx.conf
+	addedInclude      bool   // we added the include line to nginx.conf
+	addedBucketSize   bool   // we added server_names_hash_bucket_size to nginx.conf
+	httpBlockFile     string // absolute path of the conf file containing the http {} block we edited
 	pendingChallenges []challengeEntry
 }
 
@@ -238,7 +240,7 @@ func (p *Plugin) Install(ctx context.Context, cfg *config.Config, domains []stri
 	// install we accept it implicitly: the fullchain IS the chain we want
 	// nginx to use for ssl_trusted_certificate.
 	for _, h := range hits {
-		insertSSLDirectives(h.Server, fullchainPath, privkeyPath, cfg.HTTPSPort)
+		insertSSLDirectives(h.Server, fullchainPath, privkeyPath, cfg.HTTP01Port, cfg.HTTPSPort)
 		if cfg.Redirect != nil && *cfg.Redirect {
 			addRedirectIfHTTPOnly(h.Server, domains)
 		}
@@ -584,14 +586,17 @@ func serverMatchesAny(srv *parser.Block, want map[string]bool) bool {
 // `listen <port> ssl` to a server block (replacing existing values if
 // present). Indentation is borrowed from the first inner directive so the
 // edit blends in with the surrounding file.
-func insertSSLDirectives(srv *parser.Block, fullchain, privkey string, httpsPort int) {
+func insertSSLDirectives(srv *parser.Block, fullchain, privkey string, httpPort, httpsPort int) {
 	indent := childIndent(srv)
 	if httpsPort <= 0 {
 		httpsPort = 443
 	}
+	if httpPort <= 0 {
+		httpPort = 80
+	}
 	setOrAppend(srv, indent, "ssl_certificate", fullchain)
 	setOrAppend(srv, indent, "ssl_certificate_key", privkey)
-	addListenSSL(srv, indent, httpsPort)
+	addListenSSL(srv, indent, httpPort, httpsPort)
 }
 
 // childIndent returns the leading whitespace of the first directive child of
@@ -637,36 +642,89 @@ func setOrAppend(b *parser.Block, indent, name, arg string) {
 	})
 }
 
-// addListenSSL ensures the server block has a `listen <port> ssl` directive.
-// If a plain `listen` is already there on the same port, we add the `ssl`
-// keyword; otherwise we append a new directive.
-func addListenSSL(b *parser.Block, indent string, port int) {
-	portStr := fmt.Sprintf("%d", port)
+// addListenSSL ensures the server block has the right `listen ... ssl`
+// directive(s). Mirrors certbot _make_server_ssl (configurator.py:709-784):
+//
+//  1. If the block already has any `listen` matching the HTTPS port (with or
+//     without `ssl`), make sure each carries the `ssl` flag and stop —
+//     respecting whatever host/port tuples the user already configured.
+//  2. Otherwise, for every existing `listen` matching the HTTP01 port (e.g.
+//     `listen 127.0.0.1:80;`), emit a parallel SSL listen preserving the
+//     host (`listen 127.0.0.1:443 ssl;`).
+//  3. If neither matched, fall back to bare defaults: `[::]:443 ssl` for
+//     IPv6, `443 ssl` for IPv4, derived from whatever existing listens hint
+//     at family preference (or both if no hint).
+func addListenSSL(b *parser.Block, indent string, httpPort, httpsPort int) {
+	httpStr := fmt.Sprintf("%d", httpPort)
+	httpsStr := fmt.Sprintf("%d", httpsPort)
+	// Pass 1: existing HTTPS-port listens — promote to ssl if needed and
+	// trust whatever the user configured.
+	foundHTTPS := false
 	for _, n := range b.Body {
 		d, ok := n.(*parser.Directive)
-		if !ok || d.Name != "listen" {
+		if !ok || d.Name != "listen" || len(d.Args) == 0 {
 			continue
 		}
-		if len(d.Args) == 0 {
+		first := strings.Trim(d.Args[0], `"'`)
+		_, p, ok := splitListenAddr(first)
+		if !ok || p != httpsStr {
+			continue
+		}
+		foundHTTPS = true
+		if !containsArg(d.Args, "ssl") {
+			d.Args = append(d.Args, "ssl")
+		}
+	}
+	if foundHTTPS {
+		return
+	}
+	// Pass 2: derive SSL listens from HTTP-port listens, preserving host.
+	var derived []string
+	hasV4, hasV6 := false, false
+	for _, n := range b.Body {
+		d, ok := n.(*parser.Directive)
+		if !ok || d.Name != "listen" || len(d.Args) == 0 {
 			continue
 		}
 		first := strings.Trim(d.Args[0], `"'`)
 		host, p, ok := splitListenAddr(first)
-		_ = host
-		if !ok || p != portStr {
+		if !ok || p != httpStr {
 			continue
 		}
-		if !containsArg(d.Args, "ssl") {
-			d.Args = append(d.Args, "ssl")
+		isV6 := strings.HasPrefix(host, "[")
+		if isV6 {
+			hasV6 = true
+		} else {
+			hasV4 = true
 		}
-		return
+		if host != "" {
+			derived = append(derived, host+":"+httpsStr)
+		} else {
+			derived = append(derived, httpsStr)
+		}
 	}
-	b.Body = append(b.Body, &parser.Directive{
-		Whitespace: "\n" + indent,
-		Name:       "listen",
-		Args:       []string{portStr, "ssl"},
-		Semicolon:  true,
-	})
+	if len(derived) == 0 {
+		// No HTTP listen either — fall back to the same default set
+		// nginx itself would have used. Match Certbot's behavior of
+		// adding both IPv4 and IPv6 default listens when no hint.
+		if !hasV4 && !hasV6 {
+			hasV4, hasV6 = true, true
+		}
+		if hasV6 {
+			derived = append(derived, "[::]:"+httpsStr)
+		}
+		if hasV4 {
+			derived = append(derived, httpsStr)
+		}
+	}
+	for _, addr := range derived {
+		b.Body = append(b.Body, &parser.Directive{
+			Whitespace: "\n" + indent,
+			Name:       "listen",
+			Args:       []string{addr, "ssl"},
+			Semicolon:  true,
+		})
+	}
 }
 
 // splitListenAddr parses an nginx listen value into host/port.
@@ -799,10 +857,14 @@ func testAndReload(ctx context.Context, cfg *config.Config) error {
 	if ctl == "" {
 		ctl = "nginx"
 	}
-	if out, err := exec.CommandContext(ctx, ctl, "-t").CombinedOutput(); err != nil {
+	testCmd := exec.CommandContext(ctx, ctl, "-t")
+	testCmd.Env = extenv.Env()
+	if out, err := testCmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("nginx: `%s -t` failed: %w\n%s", ctl, err, string(out))
 	}
-	if out, err := exec.CommandContext(ctx, ctl, "-s", "reload").CombinedOutput(); err == nil {
+	reload := exec.CommandContext(ctx, ctl, "-s", "reload")
+	reload.Env = extenv.Env()
+	if out, err := reload.CombinedOutput(); err == nil {
 		_ = out
 		// Sleep 1s post-reload so subsequent challenge verification
 		// doesn't race the worker swap. Matches Certbot's
@@ -815,6 +877,7 @@ func testAndReload(ctx context.Context, cfg *config.Config) error {
 	// pointing at the discovered nginx.conf so the right config tree gets
 	// loaded.
 	cmd := exec.CommandContext(ctx, ctl, "-c", nginxConfigPath(cfg))
+	cmd.Env = extenv.Env()
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("nginx: reload failed and `%s` (start) also failed: %w\n%s", ctl, err, string(out))
 	}
@@ -859,13 +922,17 @@ func (p *Plugin) injectChallengeLocations(configPath, webroot string) error {
 		}
 	}
 	// Inject the include + server_names_hash_bucket_size at the top of
-	// http {} in the root file. Track whether we added them so cleanup
-	// can remove them. The challenge conf lives under config_dir to
-	// match Certbot's http_01.py:46-47 (so `find /etc/letsencrypt -name
-	// le_http_01*` finds it the same way under both tools).
+	// the http {} block — searching across ALL parsed files (not just
+	// the root nginx.conf). Debian/Ubuntu layouts often place `http {}`
+	// in /etc/nginx/conf.d/*.conf rather than the root; pre-fix this
+	// silently no-op'd and http-01 challenges then failed because the
+	// include never landed. Mirrors certbot e32f4fc5f.
 	challengeConfPath := filepath.Join(p.cfg.ConfigDir, "le_http_01_cert_challenge.conf")
-	p.addedInclude = ensureHTTPInclude(files[0].AST, challengeConfPath)
-	p.addedBucketSize = ensureBucketSize(files[0].AST)
+	if owner := findHTTPBlockFile(files); owner != nil {
+		p.addedInclude = ensureHTTPInclude(owner.AST, challengeConfPath)
+		p.addedBucketSize = ensureBucketSize(owner.AST)
+		p.httpBlockFile = owner.Path
+	}
 	p.challengeConfPath = challengeConfPath
 
 	// Seed the challenge conf with an empty default_server so reload
@@ -907,13 +974,40 @@ func (p *Plugin) removeChallengeLocations() error {
 			return err
 		}
 		stripChallengeRewrites(root.Nodes)
+		// Only strip include/bucket here if this is ALSO the http {} file.
+		// Otherwise we strip them below from the dedicated http file.
+		if sl.confPath == p.httpBlockFile {
+			if p.addedInclude {
+				stripHTTPInclude(root, p.challengeConfPath)
+			}
+			if p.addedBucketSize {
+				stripBucketSize(root)
+			}
+		}
+		if err := os.WriteFile(sl.confPath, []byte(root.String()), 0o644); err != nil {
+			return err
+		}
+	}
+	// If the http {} block lives in a file that wasn't touched as a
+	// challenge-rewrite target (common Debian/Ubuntu layout where
+	// http {} is in nginx.conf but vhosts live in sites-enabled/*.conf),
+	// strip include/bucket directly from that file now.
+	if p.httpBlockFile != "" && !seen[p.httpBlockFile] && (p.addedInclude || p.addedBucketSize) {
+		srcBytes, err := os.ReadFile(p.httpBlockFile)
+		if err != nil {
+			return err
+		}
+		root, err := parser.Parse(string(srcBytes))
+		if err != nil {
+			return err
+		}
 		if p.addedInclude {
 			stripHTTPInclude(root, p.challengeConfPath)
 		}
 		if p.addedBucketSize {
 			stripBucketSize(root)
 		}
-		if err := os.WriteFile(sl.confPath, []byte(root.String()), 0o644); err != nil {
+		if err := os.WriteFile(p.httpBlockFile, []byte(root.String()), 0o644); err != nil {
 			return err
 		}
 	}
@@ -1066,6 +1160,21 @@ func findHTTPBlock(nodes []parser.Node) *parser.Block {
 		}
 		if inner := findHTTPBlock(b.Body); inner != nil {
 			return inner
+		}
+	}
+	return nil
+}
+
+// findHTTPBlockFile returns the parsed file whose AST contains an `http {}`
+// block. Certbot's nginx parser walks the entire include tree to find the
+// http block — Debian/Ubuntu's /etc/nginx layout places `http {}` in the
+// root nginx.conf, but other distros (or operator-customized layouts) put
+// it in a separately-included conf.d/ file. Returns nil if no http block
+// exists anywhere in the include tree.
+func findHTTPBlockFile(files []*parsedFile) *parsedFile {
+	for _, f := range files {
+		if findHTTPBlock(f.AST.Nodes) != nil {
+			return f
 		}
 	}
 	return nil
