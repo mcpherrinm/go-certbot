@@ -98,6 +98,23 @@ func Certonly(ctx context.Context, cfg *config.Config, reg *plugins.Registry) er
 					return fmt.Errorf("Please provide both --cert-name and --key-type to change the type of the existing %q lineage from %s to %s", certName, prior, cfg.KeyType)
 				}
 			}
+			// --reuse-key conflicts with changing key parameters
+			// (--key-type, --rsa-key-size, --elliptic-curve) unless
+			// --new-key is also set to acknowledge the key swap.
+			// Mirrors certbot's renewal._reuse_key check: a user
+			// passing --reuse-key with a new key size signals
+			// confusion — we'd either silently re-issue with the OLD
+			// key (ignoring the new size) or silently issue a NEW
+			// key (ignoring --reuse-key). Both are surprising.
+			// test_new_key asserts "Unable to change the
+			// --rsa-key-size".
+			if cfg.ReuseKey && !cfg.NewKey {
+				if prior := lineageKeyType(cfg, certName); prior != "" {
+					if msg := keyParamChangeMessage(cfg, certName, prior); msg != "" {
+						return errors.New(msg)
+					}
+				}
+			}
 			mergeExistingKeyType(cfg, certName)
 		}
 	}
@@ -230,6 +247,33 @@ func lineageKeyType(cfg *config.Config, certName string) string {
 		return ""
 	}
 	return conf.RenewalParams["key_type"]
+}
+
+// keyParamChangeMessage returns the certbot-style error string when
+// --reuse-key is set AND a key parameter (--key-type, --rsa-key-size,
+// --elliptic-curve) was set by the user AND differs from the lineage's
+// stored value. Empty string means no conflict.
+func keyParamChangeMessage(cfg *config.Config, certName, priorKeyType string) string {
+	conf, err := renewalconf.Load(filepath.Join(cfg.RenewalConfigsDir(), certName+".conf"))
+	if err != nil {
+		return ""
+	}
+	if cfg.SetByUser("key-type") && cfg.KeyType != priorKeyType {
+		return fmt.Sprintf("Unable to change the --key-type from %s to %s for the %s lineage while --reuse-key is set. Pass --new-key to allow the key swap, or drop --reuse-key.", priorKeyType, cfg.KeyType, certName)
+	}
+	if cfg.SetByUser("rsa-key-size") {
+		priorSize, _, _ := conf.Int("rsa_key_size")
+		if priorSize != 0 && priorSize != cfg.RSAKeySize {
+			return fmt.Sprintf("Unable to change the --rsa-key-size from %d to %d for the %s lineage while --reuse-key is set. Pass --new-key to allow the key swap, or drop --reuse-key.", priorSize, cfg.RSAKeySize, certName)
+		}
+	}
+	if cfg.SetByUser("elliptic-curve") {
+		priorCurve := conf.RenewalParams["elliptic_curve"]
+		if priorCurve != "" && priorCurve != cfg.EllipticCurve {
+			return fmt.Sprintf("Unable to change the --elliptic-curve from %s to %s for the %s lineage while --reuse-key is set. Pass --new-key to allow the key swap, or drop --reuse-key.", priorCurve, cfg.EllipticCurve, certName)
+		}
+	}
+	return ""
 }
 
 // mergeExistingKeyType reads the existing lineage's renewal conf and

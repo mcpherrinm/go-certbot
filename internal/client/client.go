@@ -5,6 +5,7 @@ package client
 
 import (
 	"context"
+	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -185,12 +186,24 @@ func (c *Client) Obtain(ctx context.Context, auth plugins.Authenticator, domains
 		Profile:        c.cfg.PreferredProfile,
 		KeyType:        kt,
 	}
+	// --reuse-key: load the prior privkey from archive/<certname>/ and
+	// pass it via req.PrivateKey. lego will use the existing key
+	// instead of generating a new one (getObtainRequestPrivateKey at
+	// certificate.go:780-789). --new-key (or the test for changed key
+	// parameters above) overrides reuse-key for this run. Mirrors
+	// certbot's renewal._reuse_key (renewal.py).
+	if c.cfg.ReuseKey && !c.cfg.NewKey {
+		if reuseKey, err := loadPriorPrivkey(c.cfg.ConfigDir, certName); err == nil && reuseKey != nil {
+			req.PrivateKey = reuseKey
+		}
+	}
 	// P-521 / secp521r1: lego's certcrypto only defines EC256/EC384, so
 	// pre-generate the key ourselves and pass it via req.PrivateKey
 	// (lego's getObtainRequestPrivateKey honors PrivateKey when set —
 	// certificate.go:780-789). Certbot supports P-521 so a drop-in
-	// replacement should too.
-	if c.cfg.KeyType == "ecdsa" {
+	// replacement should too. Don't overwrite a reuse-key-loaded key
+	// from above.
+	if req.PrivateKey == nil && c.cfg.KeyType == "ecdsa" {
 		switch c.cfg.EllipticCurve {
 		case "secp521r1", "P-521":
 			key, err := ecdsa.GenerateKey(elliptic.P521(), rand.Reader)
@@ -313,6 +326,42 @@ func certKeyType(cfg *config.Config) (certcrypto.KeyType, error) {
 		return "", fmt.Errorf("client: unsupported elliptic_curve %q (supported: secp256r1, secp384r1, secp521r1)", cfg.EllipticCurve)
 	}
 	return "", fmt.Errorf("client: unsupported key_type %q (supported: rsa, ecdsa)", cfg.KeyType)
+}
+
+// loadPriorPrivkey loads the highest-numbered privkey<N>.pem from
+// archive/<certName>/ and decodes it as a crypto.Signer (RSA or ECDSA).
+// Used by --reuse-key to feed the prior key back into lego's ObtainRequest.
+// Returns (nil, nil) when no prior key exists (initial issuance).
+func loadPriorPrivkey(configDir, certName string) (crypto.Signer, error) {
+	// Read the live/<name>/privkey.pem symlink target if present;
+	// otherwise fall back to scanning archive/. The live symlink is
+	// the canonical "currently deployed" key.
+	live := storage.LiveDir(configDir, certName)
+	livePath := live + "/privkey.pem"
+	data, err := os.ReadFile(livePath)
+	if err != nil {
+		return nil, nil
+	}
+	block, _ := pem.Decode(data)
+	if block == nil {
+		return nil, fmt.Errorf("client: empty PEM in %s", livePath)
+	}
+	// We write PKCS#8 in Obtain's output. Try PKCS#8 first; fall back
+	// to PKCS#1 (RSA) and SEC1 (EC) for keys written by older
+	// go-certbot or by certbot.
+	if key, err := x509.ParsePKCS8PrivateKey(block.Bytes); err == nil {
+		if signer, ok := key.(crypto.Signer); ok {
+			return signer, nil
+		}
+		return nil, fmt.Errorf("client: prior key in %s does not implement crypto.Signer", livePath)
+	}
+	if key, err := x509.ParsePKCS1PrivateKey(block.Bytes); err == nil {
+		return key, nil
+	}
+	if key, err := x509.ParseECPrivateKey(block.Bytes); err == nil {
+		return key, nil
+	}
+	return nil, fmt.Errorf("client: cannot parse prior privkey in %s", livePath)
 }
 
 // emailsToContacts splits a possibly-comma-separated email value into one
