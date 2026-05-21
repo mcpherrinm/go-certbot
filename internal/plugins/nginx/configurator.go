@@ -902,6 +902,26 @@ func setOrAppend(b *parser.Block, indent, name, arg string) {
 func addListenSSL(b *parser.Block, indent string, httpPort, httpsPort int) {
 	httpStr := fmt.Sprintf("%d", httpPort)
 	httpsStr := fmt.Sprintf("%d", httpsPort)
+	// If the block has NO listen directives at all, nginx defaults to
+	// port 80. After we add ssl listens that implicit default goes away
+	// and the vhost loses its HTTP listener. Add an explicit `listen
+	// 80;` (or HTTP01Port) FIRST to preserve the original behavior.
+	// Mirrors certbot _make_server_ssl (configurator.py:735-737).
+	hasListen := false
+	for _, n := range b.Body {
+		if d, ok := n.(*parser.Directive); ok && d.Name == "listen" {
+			hasListen = true
+			break
+		}
+	}
+	if !hasListen {
+		b.Body = append(b.Body, &parser.Directive{
+			Whitespace: "\n" + indent,
+			Name:       "listen",
+			Args:       []string{httpStr},
+			Semicolon:  true,
+		})
+	}
 	// Pass 1: existing HTTPS-port listens — promote to ssl if needed and
 	// trust whatever the user configured.
 	foundHTTPS := false

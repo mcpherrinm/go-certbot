@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/letsencrypt/go-certbot/internal/account"
 	"github.com/letsencrypt/go-certbot/internal/client"
@@ -111,10 +112,60 @@ func Revoke(ctx context.Context, cfg *config.Config, reg *plugins.Registry) erro
 				true)
 		}
 		if doDelete {
+			if hasOverlappingArchiveDir(cfg, cfg.CertName) {
+				fmt.Fprintf(os.Stderr,
+					"Not deleting revoked certificates due to overlapping archive dirs. "+
+						"More than one certificate is using %s\n",
+					archiveDirFor(cfg, cfg.CertName))
+				return nil
+			}
 			return Delete(ctx, cfg, reg)
 		}
 	}
 	return nil
+}
+
+// hasOverlappingArchiveDir returns true iff any renewal conf OTHER than
+// certName points at the same archive_dir. Mirrors certbot's pre-delete
+// safety check in main.revoke (main.py:802-815): without this, revoking a
+// cert whose renewal conf was hand-copied or shares archive_dir with
+// another lineage would delete files still referenced by the sibling.
+func hasOverlappingArchiveDir(cfg *config.Config, certName string) bool {
+	if certName == "" {
+		return false
+	}
+	target := archiveDirFor(cfg, certName)
+	if target == "" {
+		return false
+	}
+	entries, err := os.ReadDir(cfg.RenewalConfigsDir())
+	if err != nil {
+		return false
+	}
+	for _, e := range entries {
+		if !e.Type().IsRegular() || !strings.HasSuffix(e.Name(), ".conf") {
+			continue
+		}
+		otherName := strings.TrimSuffix(e.Name(), ".conf")
+		if otherName == certName {
+			continue
+		}
+		if archiveDirFor(cfg, otherName) == target {
+			return true
+		}
+	}
+	return false
+}
+
+// archiveDirFor reads renewal/<certName>.conf and returns the archive_dir
+// top-level key. Returns "" on any error so callers fail-open (treat as
+// no overlap detected).
+func archiveDirFor(cfg *config.Config, certName string) string {
+	conf, err := renewalconf.Load(filepath.Join(cfg.RenewalConfigsDir(), certName+".conf"))
+	if err != nil {
+		return ""
+	}
+	return conf.Top["archive_dir"]
 }
 
 // revokeWithCertKey performs cert-key revocation per RFC 8555 §7.6. The cert's
