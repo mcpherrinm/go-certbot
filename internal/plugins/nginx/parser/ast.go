@@ -33,21 +33,54 @@ type Directive struct {
 	Whitespace string // whitespace before Name
 	Name       string
 	Args       []string // raw token values (quoted strings keep their quotes)
+	// ArgLeadingWS is the whitespace appearing immediately before each Args[i]
+	// at parse time. nil or empty means "use a single space" — preserved so
+	// that multi-line directives (e.g. `server_name foo\n    # c\n    bar;`)
+	// can round-trip with their original indentation. Always either empty or
+	// the same length as Args.
+	ArgLeadingWS []string
 	// Whether the directive was terminated with a semicolon. Always true for
 	// real nginx directives, but we keep the bit explicit so Emit can be lossless.
 	Semicolon bool
 	// Inline comment that appeared on the same line after the ';'. Empty if
 	// none. Includes leading whitespace and the '#'.
 	TrailingComment string
+	// InternalComments preserves comments that appeared INSIDE the directive
+	// between args (e.g. `server_name *.example.com  # internal\n  www.example.com;`).
+	// AfterArgIndex is the index in Args after which the comment appeared
+	// (-1 means before the first arg). Used for round-trip fidelity; rare
+	// in practice but valid nginx and certbot supports it (#10147).
+	InternalComments []InternalComment
+}
+
+// InternalComment is a comment that appeared between directive args.
+type InternalComment struct {
+	AfterArgIndex int    // -1 = before first arg, 0 = after Args[0], etc.
+	Whitespace    string // whitespace preceding the '#'
+	Value         string // the comment text including leading '#'
 }
 
 func (d *Directive) isNode() {}
 func (d *Directive) emit(sb *strings.Builder) {
 	sb.WriteString(d.Whitespace)
 	sb.WriteString(d.Name)
-	for _, a := range d.Args {
-		sb.WriteString(" ")
+	emitInternal := func(after int) {
+		for _, ic := range d.InternalComments {
+			if ic.AfterArgIndex == after {
+				sb.WriteString(ic.Whitespace)
+				sb.WriteString(ic.Value)
+			}
+		}
+	}
+	emitInternal(-1)
+	for i, a := range d.Args {
+		sep := " "
+		if i < len(d.ArgLeadingWS) && d.ArgLeadingWS[i] != "" {
+			sep = d.ArgLeadingWS[i]
+		}
+		sb.WriteString(sep)
 		sb.WriteString(a)
+		emitInternal(i)
 	}
 	if d.Semicolon {
 		sb.WriteString(";")
