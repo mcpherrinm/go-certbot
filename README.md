@@ -15,10 +15,14 @@ rewritten in Go on top of [lego v5](https://github.com/go-acme/lego).
 
 ## Status
 
-**Phase 1.** A working `certonly --standalone` end-to-end against any
-ACME-compatible server, reading and writing Certbot 5.x's on-disk layout
-verbatim. Other verbs and plugins return a clear "planned for Phase N" error.
-See [`CHANGES.md`](CHANGES.md) for the rollout plan.
+**Phase 2.** Building on Phase 1, this version adds the `renew` and
+`reconfigure` verbs, `webroot` and `manual` authenticators, the full
+hooks framework (pre / post / deploy commands and
+`renewal-hooks/{pre,post,deploy}/` directories), and EFF email
+subscription. Other verbs (`certificates`, `delete`, `revoke`,
+account management) and the nginx/apache/DNS plugins return a clear
+"planned for Phase N" error. See [`CHANGES.md`](CHANGES.md) for the
+rollout plan.
 
 The upstream Certbot source tree is vendored as a git submodule under
 `reference/certbot/` for cross-reference. (We avoid the Go-reserved

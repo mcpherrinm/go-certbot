@@ -18,10 +18,6 @@ func Run(_ context.Context, _ *config.Config, _ *plugins.Registry) error {
 	return notImplemented("run", "Phase 1 final (requires installer)")
 }
 
-func Renew(_ context.Context, _ *config.Config, _ *plugins.Registry) error {
-	return notImplemented("renew", "Phase 2")
-}
-
 func Certificates(_ context.Context, _ *config.Config, _ *plugins.Registry) error {
 	return notImplemented("certificates", "Phase 3")
 }
@@ -77,6 +73,3 @@ func Plugins(_ context.Context, _ *config.Config, reg *plugins.Registry) error {
 	return nil
 }
 
-func Reconfigure(_ context.Context, _ *config.Config, _ *plugins.Registry) error {
-	return notImplemented("reconfigure", "Phase 2")
-}

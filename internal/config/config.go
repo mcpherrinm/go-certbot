@@ -48,6 +48,7 @@ type Config struct {
 	TOS                          bool
 	Account                      string
 	NoEFFEmail                   bool
+	EFFEmailExplicit             bool // --eff-email was passed (vs unset)
 
 	// Certificate request
 	Domains            []string
@@ -74,7 +75,12 @@ type Config struct {
 	Standalone    bool
 	Webroot       bool
 	WebrootPath   []string
-	Manual        bool
+	// WebrootMap is the resolved domain → webroot path map. Built before
+	// pflag parsing from the `-w`/`-d` interleaving order in os.Args; mirrors
+	// Certbot's _WebrootPathProcessor. Persisted under [[webroot_map]] in the
+	// renewal conf and restored on `renew`.
+	WebrootMap map[string]string
+	Manual     bool
 
 	// HTTP-01
 	HTTP01Port    int
@@ -92,9 +98,13 @@ type Config struct {
 	Verbose          int
 
 	// Hooks
-	PreHook    string
-	PostHook   string
-	DeployHook string
+	PreHook            string
+	PostHook           string
+	DeployHook         string
+	DisableHookValidation bool
+	ManualAuthHook     string
+	ManualCleanupHook  string
+	ManualPublicIPLoggingOK bool
 
 	// User agent
 	UserAgent        string

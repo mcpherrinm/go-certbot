@@ -26,6 +26,7 @@ func registerFlags(fs *pflag.FlagSet, c *config.Config) {
 	fs.BoolVar(&c.RegisterUnsafelyWithoutEmail, "register-unsafely-without-email", false, "Register without providing an email address.")
 	fs.StringVar(&c.Account, "account", "", "Account id to use; default = first found.")
 	fs.BoolVar(&c.NoEFFEmail, "no-eff-email", false, "Don't subscribe to the EFF mailing list.")
+	fs.BoolVar(&c.EFFEmailExplicit, "eff-email", false, "Subscribe to the EFF mailing list after successful issuance.")
 
 	// Domains
 	fs.StringSliceVarP(&c.Domains, "domain", "d", c.Domains, "Domain name to include (repeatable).")
@@ -111,6 +112,9 @@ func registerFlags(fs *pflag.FlagSet, c *config.Config) {
 	fs.StringVar(&c.PostHook, "post-hook", c.PostHook, "Command to run after any attempt.")
 	fs.StringVar(&c.DeployHook, "deploy-hook", c.DeployHook, "Command to run after a successful issuance.")
 	fs.StringVar(&c.DeployHook, "renew-hook", c.DeployHook, "Alias for --deploy-hook (legacy name).")
+	fs.BoolVar(&c.DisableHookValidation, "disable-hook-validation", c.DisableHookValidation, "Skip the check that hook commands are executable.")
+	fs.StringVar(&c.ManualAuthHook, "manual-auth-hook", c.ManualAuthHook, "Path to a script that publishes challenge data (manual plugin).")
+	fs.StringVar(&c.ManualCleanupHook, "manual-cleanup-hook", c.ManualCleanupHook, "Path to a script that removes challenge data (manual plugin).")
 
 	// Default-True bool pairs (`--no-X` flips off).
 	registerBoolDefaultTrue(fs, c, &c.Autorenew, "autorenew", "Track this cert for auto-renewal.")

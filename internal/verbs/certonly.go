@@ -1,6 +1,4 @@
-// Package verbs implements Certbot's subcommand handlers. Phase 1 only
-// implements certonly; other verbs return a "not implemented in this phase"
-// error so the CLI surface stays consistent.
+// Package verbs implements Certbot's subcommand handlers.
 package verbs
 
 import (
@@ -8,10 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"path/filepath"
 
 	"github.com/letsencrypt/go-certbot/internal/account"
 	"github.com/letsencrypt/go-certbot/internal/client"
 	"github.com/letsencrypt/go-certbot/internal/config"
+	"github.com/letsencrypt/go-certbot/internal/eff"
+	"github.com/letsencrypt/go-certbot/internal/hooks"
 	"github.com/letsencrypt/go-certbot/internal/plugins"
 )
 
@@ -21,25 +22,45 @@ func Certonly(ctx context.Context, cfg *config.Config, reg *plugins.Registry) er
 		return errors.New("certonly: at least one -d/--domain is required")
 	}
 	if cfg.CSR != "" {
-		return errors.New("certonly: --csr issuance is not yet implemented (Phase 1)")
+		return errors.New("certonly: --csr issuance is not yet implemented")
 	}
 	if cfg.Apache || cfg.Nginx {
-		return errors.New("certonly: --apache and --nginx installers are not yet implemented (Phase 1)")
+		return errors.New("certonly: --apache and --nginx installers are not yet implemented")
 	}
-	if cfg.Webroot || cfg.Manual {
-		return errors.New("certonly: --webroot and --manual are not yet implemented (Phase 1); use --standalone")
+
+	authName, err := resolveAuthenticatorName(cfg)
+	if err != nil {
+		return err
 	}
-	if !cfg.Standalone && cfg.Authenticator == "" {
-		return errors.New("certonly: --standalone (or --authenticator standalone) is required in Phase 1")
-	}
-	if cfg.Authenticator != "" && cfg.Authenticator != "standalone" {
-		return fmt.Errorf("certonly: authenticator %q is not yet implemented (Phase 1)", cfg.Authenticator)
+
+	if !cfg.DisableHookValidation {
+		for _, h := range []struct{ cmd, label string }{
+			{cfg.PreHook, "pre"},
+			{cfg.PostHook, "post"},
+			{cfg.DeployHook, "deploy"},
+		} {
+			if err := hooks.Validate(h.cmd, h.label); err != nil {
+				return err
+			}
+		}
 	}
 
 	certName := cfg.CertName
 	if certName == "" {
 		certName = cfg.Domains[0]
 	}
+
+	// pre_hook runs before challenge work; post_hook always runs after.
+	if err := hooks.Run(ctx, cfg.PreHook, nil); err != nil {
+		return err
+	}
+	if err := hooks.RunDir(ctx, cfg.HookDir("pre"), nil); err != nil {
+		return err
+	}
+	defer func() {
+		_ = hooks.Run(ctx, cfg.PostHook, nil)
+		_ = hooks.RunDir(ctx, cfg.HookDir("post"), nil)
+	}()
 
 	// Load or create an account.
 	accountsDir, err := cfg.AccountsDir()
@@ -63,7 +84,7 @@ func Certonly(ctx context.Context, cfg *config.Config, reg *plugins.Registry) er
 		return err
 	}
 
-	auth, err := reg.Authenticator("standalone")
+	auth, err := reg.Authenticator(authName)
 	if err != nil {
 		return err
 	}
@@ -83,7 +104,51 @@ func Certonly(ctx context.Context, cfg *config.Config, reg *plugins.Registry) er
 	fmt.Printf("  privkey:   %s\n", lineage.Live.Privkey)
 	fmt.Printf("  chain:     %s\n", lineage.Live.Chain)
 	fmt.Printf("  fullchain: %s\n", lineage.Live.Fullchain)
+
+	// deploy_hook runs only on success, with RENEWED_LINEAGE / RENEWED_DOMAINS.
+	env := hooks.DeployEnv(filepath.Dir(lineage.Live.Cert), cfg.Domains)
+	if err := hooks.Run(ctx, cfg.DeployHook, env); err != nil {
+		slog.Warn("deploy_hook failed", "err", err)
+	}
+	if err := hooks.RunDir(ctx, cfg.HookDir("deploy"), env); err != nil {
+		slog.Warn("deploy-hook directory failed", "err", err)
+	}
+
+	// EFF subscription (only for fresh accounts, only if user opted in).
+	if cfg.EFFEmailExplicit && cfg.Email != "" && !cfg.DryRun {
+		if err := eff.Subscribe(ctx, cfg.Email); err != nil {
+			slog.Warn("EFF subscribe failed", "err", err)
+		}
+	}
 	return nil
+}
+
+// resolveAuthenticatorName chooses the authenticator plugin name from the
+// flag soup. Mirrors Certbot's plugin_selection.choose_configurator_plugins
+// for the certonly path.
+func resolveAuthenticatorName(cfg *config.Config) (string, error) {
+	if cfg.Authenticator != "" {
+		return cfg.Authenticator, nil
+	}
+	count := 0
+	picked := ""
+	for name, on := range map[string]bool{
+		"standalone": cfg.Standalone,
+		"webroot":    cfg.Webroot,
+		"manual":     cfg.Manual,
+	} {
+		if on {
+			count++
+			picked = name
+		}
+	}
+	if count > 1 {
+		return "", errors.New("certonly: more than one authenticator selected; pick one of --standalone/--webroot/--manual")
+	}
+	if count == 0 {
+		return "", errors.New("certonly: an authenticator is required (--standalone / --webroot / --manual / --authenticator)")
+	}
+	return picked, nil
 }
 
 func loadOrCreateAccount(cfg *config.Config, storage *account.FileStorage) (*account.Account, error) {

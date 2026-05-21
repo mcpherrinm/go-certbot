@@ -5,7 +5,37 @@ This file tracks every behavior in **go-certbot** that differs from upstream
 drop-in compatibility, so this file should stay short. Anything not listed
 here should behave identically to Certbot.
 
-## Phase 1 (current)
+## Phase 2 (current)
+
+### Implemented
+
+- `renew` verb: iterates `renewal/*.conf`, restores `[renewalparams]` with
+  CLI-overridable merge semantics matching Certbot's `set_by_user` gating,
+  parses `renew_before_expiry` (English-language durations: "30 days",
+  "6 weeks", "3 months", bare integers = days), skips certs that aren't
+  near expiry (default window: 30 days) unless `--force-renewal` is set.
+- `reconfigure` verb: writes user-set flags back to a renewal `.conf`
+  without re-issuance.
+- `webroot` plugin: writes the http-01 file into one or more webroot
+  directories. Single `--webroot-path` applies to all domains; N paths for
+  N domains produces a per-domain map (Certbot semantics).
+- `manual` plugin: runs `--manual-auth-hook` and `--manual-cleanup-hook`
+  scripts with Certbot's env contract (`CERTBOT_DOMAIN`,
+  `CERTBOT_VALIDATION`, `CERTBOT_TOKEN`, `CERTBOT_AUTH_OUTPUT`). This is
+  the bridge that lets third-party DNS plugins keep working — write a
+  hook script that calls your favorite tool.
+- Hooks framework: `--pre-hook` / `--post-hook` / `--deploy-hook` plus
+  directory hooks under `renewal-hooks/{pre,post,deploy}/`. Deploy hooks
+  receive `RENEWED_LINEAGE` and `RENEWED_DOMAINS`. Pre-hook runs once per
+  invocation before any challenge work; post-hook always runs after
+  (success or failure); deploy-hook only on successful issuance/renewal.
+  Hook commands are validated for executability before invocation
+  unless `--disable-hook-validation` is set.
+- EFF mailing-list subscription via `--eff-email` (POST to
+  `supporters.eff.org/subscribe/certbot`, same form Certbot uses).
+  `--no-eff-email` and `--dry-run` suppress.
+
+## Phase 1
 
 ### Implemented
 
@@ -31,8 +61,6 @@ here should behave identically to Certbot.
 | Verb | Planned phase |
 | --- | --- |
 | `run` (the default) | Phase 1 final (after installers) |
-| `renew` | Phase 2 |
-| `reconfigure` | Phase 2 |
 | `certificates`, `delete`, `revoke`, `register`, `unregister`, `update_account`, `show_account` | Phase 3 |
 | `install`, `enhance`, `rollback` | Phase 5 (nginx) / Phase 6 (apache) |
 
@@ -40,7 +68,6 @@ Plugins not yet implemented (using them returns a clear error):
 
 | Plugin | Planned phase |
 | --- | --- |
-| `webroot`, `manual` | Phase 2 |
 | `dns-{cloudflare,digitalocean,dnsimple,dnsmadeeasy,gehirn,google,linode,luadns,nsone,ovh,rfc2136,route53,sakuracloud}` | Phase 4 (wraps lego providers) |
 | `nginx` | Phase 5 |
 | `apache` | Phase 6 |

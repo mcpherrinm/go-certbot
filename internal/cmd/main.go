@@ -15,7 +15,9 @@ import (
 
 	"github.com/letsencrypt/go-certbot/internal/config"
 	"github.com/letsencrypt/go-certbot/internal/plugins"
+	"github.com/letsencrypt/go-certbot/internal/plugins/manual"
 	"github.com/letsencrypt/go-certbot/internal/plugins/standalone"
+	"github.com/letsencrypt/go-certbot/internal/plugins/webroot"
 	"github.com/letsencrypt/go-certbot/internal/verbs"
 )
 
@@ -46,6 +48,9 @@ func Main(args []string) int {
 
 	cfg := config.NewDefault()
 	cfg.Verb = verb
+	// Pre-scan argv to capture -w/-d interleaving for the webroot plugin
+	// before pflag flattens the slices and loses cross-flag order.
+	applyWebrootMap(cfg, args)
 
 	fs := pflag.NewFlagSet("go-certbot", pflag.ContinueOnError)
 	fs.Usage = func() { printHelp(os.Stderr, verb) }
@@ -95,6 +100,8 @@ func Main(args []string) int {
 
 	reg := plugins.NewRegistry()
 	reg.RegisterAuthenticator(standalone.New())
+	reg.RegisterAuthenticator(webroot.New())
+	reg.RegisterAuthenticator(manual.New())
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
