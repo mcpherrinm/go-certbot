@@ -238,6 +238,13 @@ func Write(configDir, certName string, fullchainPEM, chainPEM, privkeyPEM []byte
 // recovers from interrupted-renewal state where archive/N+1 exists but the
 // live/ symlinks still point at N.
 //
+// Also recovers from a half-completed Certbot update_all_links_to: if any
+// previous_{cert,privkey,chain,fullchain}.pem symlink exists alongside the
+// live/ links, that's a crash signal from Certbot. Per storage.py:711-720,
+// we restore each live link to its previous_* target, then remove the
+// previous_* sentinels. This makes go-certbot resilient to a Certbot run
+// killed mid-link-update on the same lineage.
+//
 // Returns the version it pointed at (highest available), or 0 if archive
 // is empty.
 func EnsureDeployed(configDir, certName string) (int, error) {
@@ -247,6 +254,13 @@ func EnsureDeployed(configDir, certName string) (int, error) {
 		if errors.Is(err, os.ErrNotExist) {
 			return 0, nil
 		}
+		return 0, err
+	}
+	// Certbot half-completed-update recovery: if previous_*.pem
+	// symlinks exist in live/<certname>/, restore each kind's live
+	// link to the previous_*'s target. This restores the lineage to
+	// the pre-interrupted state before any further write.
+	if err := recoverPreviousLinks(configDir, certName); err != nil {
 		return 0, err
 	}
 	highest := 0
@@ -332,6 +346,42 @@ func writeLiveTopReadme(configDir string) error {
 		"Each subdirectory contains four symlinks pointing into archive/. Do not\n" +
 		"move or delete the files in here; they are managed by certbot.\n"
 	return writeFile(path, []byte(body), 0o644)
+}
+
+// recoverPreviousLinks restores live/<certname>/{cert,privkey,chain,fullchain}.pem
+// from a sibling previous_{cert,privkey,chain,fullchain}.pem symlink if one
+// exists, then removes the sentinel. Mirrors certbot._previous_symlinks /
+// _fix_symlinks (storage.py:688-720): Certbot writes previous_* before
+// rotating live/, and removes them after the rotation completes; a stray
+// previous_* indicates the rotation was interrupted (killed mid-update,
+// disk full, etc.). Restoring to the previous_* target undoes the half-
+// rotation so the next write starts from a consistent state.
+func recoverPreviousLinks(configDir, certName string) error {
+	live := liveSet(configDir, certName)
+	for _, pair := range []struct {
+		current, prevName string
+	}{
+		{live.Cert, "previous_cert.pem"},
+		{live.Privkey, "previous_privkey.pem"},
+		{live.Chain, "previous_chain.pem"},
+		{live.Fullchain, "previous_fullchain.pem"},
+	} {
+		prev := filepath.Join(filepath.Dir(pair.current), pair.prevName)
+		target, err := os.Readlink(prev)
+		if err != nil {
+			continue // not a symlink, or doesn't exist — common case
+		}
+		// Restore current link to point at the same target the
+		// previous_* link pointed at, then remove previous_*.
+		_ = os.Remove(pair.current)
+		if err := os.Symlink(target, pair.current); err != nil {
+			return fmt.Errorf("storage: restore %s: %w", pair.current, err)
+		}
+		if err := os.Remove(prev); err != nil {
+			return fmt.Errorf("storage: remove %s: %w", prev, err)
+		}
+	}
+	return nil
 }
 
 // computePrivkeyMode returns the file mode + path of the prior version's

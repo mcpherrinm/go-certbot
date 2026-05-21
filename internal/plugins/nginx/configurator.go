@@ -398,6 +398,43 @@ func isDefaultServer(b *parser.Block) bool {
 	return false
 }
 
+// isDefaultServerOnPort returns true iff the block has a `listen` directive
+// that BOTH names `port` (or is bare/wildcard-on-port) AND carries
+// `default_server`. Mirrors certbot _get_default_vhost's port-matching
+// prefilter (configurator.py:436-460): when picking a fallback target for
+// HTTPS install, we want a default_server on :443 rather than one on :80.
+func isDefaultServerOnPort(b *parser.Block, port string) bool {
+	if port == "" {
+		return isDefaultServer(b)
+	}
+	for _, n := range b.Body {
+		d, ok := n.(*parser.Directive)
+		if !ok || d.Name != "listen" || len(d.Args) == 0 {
+			continue
+		}
+		// Port match: either the first arg names this port, or
+		// there's no port at all (nginx's implicit default 80).
+		_, p, parsed := splitListenAddr(strings.Trim(d.Args[0], `"'`))
+		matches := false
+		switch {
+		case parsed && p == port:
+			matches = true
+		case parsed && p == "" && port == "80":
+			// bare hostname listen = default port 80.
+			matches = true
+		}
+		if !matches {
+			continue
+		}
+		for _, a := range d.Args {
+			if a == "default_server" || a == "default" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func hasHTTPRedirectAlready(files []*parsedFile, names []string) bool {
 	for _, f := range files {
 		for _, n := range f.AST.Nodes {
@@ -507,22 +544,37 @@ func findMatchingServers(cfg *parser.Config, domains []string) []*parser.Block {
 	// If no exact / wildcard / regex match was found, fall back to any
 	// vhost that's flagged `default_server` on its listen line — that's
 	// the catch-all nginx routes unmatched requests to. Mirrors
-	// certbot-nginx's get_vhosts default-server fallback.
+	// certbot-nginx's get_vhosts default-server fallback. Prefer
+	// default_servers on port 80 (the HTTP-01 challenge port) then 443
+	// (HTTPS) then any, so the fallback matches the request shape that
+	// would have hit the named vhost. Certbot's _get_default_vhost does
+	// the same port filter (configurator.py:436-460).
 	if len(out) == 0 {
-		var fallback func(nodes []parser.Node)
-		fallback = func(nodes []parser.Node) {
+		var collect func(nodes []parser.Node, port string, into *[]*parser.Block)
+		collect = func(nodes []parser.Node, port string, into *[]*parser.Block) {
 			for _, n := range nodes {
 				b, ok := n.(*parser.Block)
 				if !ok {
 					continue
 				}
-				if b.Name == "server" && isDefaultServer(b) {
-					out = append(out, b)
+				if b.Name == "server" && isDefaultServerOnPort(b, port) {
+					*into = append(*into, b)
 				}
-				fallback(b.Body)
+				collect(b.Body, port, into)
 			}
 		}
-		fallback(cfg.Nodes)
+		var port80, port443, any []*parser.Block
+		collect(cfg.Nodes, "80", &port80)
+		collect(cfg.Nodes, "443", &port443)
+		switch {
+		case len(port80) > 0:
+			out = port80
+		case len(port443) > 0:
+			out = port443
+		default:
+			collect(cfg.Nodes, "", &any)
+			out = any
+		}
 	}
 	return out
 }
