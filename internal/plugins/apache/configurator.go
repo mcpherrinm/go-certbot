@@ -274,14 +274,22 @@ func wrapInIfModuleSSL(sec *parser.Section) string {
 // the per-name RewriteCond prevents the rule firing for vhosts that share
 // the same :80 listener but aren't part of our cert. Idempotent.
 func addRewriteRedirect(sec *parser.Section) {
-	for _, n := range sec.Body {
-		if d, ok := n.(*parser.Directive); ok && strings.EqualFold(d.Name, "RewriteRule") {
-			for _, a := range d.Args {
-				if strings.HasPrefix(strings.TrimSpace(a), `https://`) {
-					return
-				}
-			}
-		}
+	// Detect an existing certbot/go-certbot redirect by exact-match on
+	// the 3-arg RewriteRule signature ("^",
+	// "https://%{SERVER_NAME}%{REQUEST_URI}", "[END,NE,R=permanent]").
+	// We also need to recurse into nested sections (e.g. <IfModule
+	// mod_rewrite.c>) because operators often wrap RewriteRule blocks
+	// in module guards. Mirrors certbot _verify_no_certbot_redirect
+	// (configurator.py:2114-2157) which uses find_dir.
+	//
+	// Pre-fix we matched any RewriteRule arg starting with "https://",
+	// which false-positived on innocent rewrites like
+	// `RewriteRule ^/old https://other.example.com/new` and skipped
+	// adding the cert redirect. We also failed to look inside nested
+	// sections, so a rewrite hidden in <IfModule> caused us to emit a
+	// duplicate at the top level on re-runs.
+	if hasCertbotRedirect(sec.Body) {
+		return
 	}
 	indent := childIndent(sec)
 	sec.Body = append(sec.Body,
@@ -307,6 +315,47 @@ func addRewriteRedirect(sec *parser.Section) {
 		Args:    []string{"^", "https://%{SERVER_NAME}%{REQUEST_URI}", "[END,NE,R=permanent]"},
 		Newline: "\n",
 	})
+}
+
+// hasCertbotRedirect walks `nodes` recursively (descending into nested
+// sections) looking for a 3-arg RewriteRule whose args match the canonical
+// certbot/go-certbot redirect signature:
+//
+//	RewriteRule ^ https://%{SERVER_NAME}%{REQUEST_URI} [END,NE,R=permanent]
+//
+// Anything else (e.g. legacy OLD_REWRITE_HTTPS_ARGS variants or innocent
+// rewrites pointing at other domains) is ignored.
+func hasCertbotRedirect(nodes []parser.Node) bool {
+	for _, n := range nodes {
+		switch nn := n.(type) {
+		case *parser.Directive:
+			if !strings.EqualFold(nn.Name, "RewriteRule") {
+				continue
+			}
+			if isCertbotRedirectRule(nn.Args) {
+				return true
+			}
+		case *parser.Section:
+			if hasCertbotRedirect(nn.Body) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// isCertbotRedirectRule matches the canonical certbot 3-arg rewrite.
+func isCertbotRedirectRule(args []string) bool {
+	if len(args) != 3 {
+		return false
+	}
+	clean := make([]string, len(args))
+	for i, a := range args {
+		clean[i] = strings.Trim(a, `"'`)
+	}
+	return clean[0] == "^" &&
+		clean[1] == "https://%{SERVER_NAME}%{REQUEST_URI}" &&
+		clean[2] == "[END,NE,R=permanent]"
 }
 
 // vhostNames returns the active ServerName + every ServerAlias for a

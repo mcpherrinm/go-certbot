@@ -232,7 +232,17 @@ func (p *Plugin) Install(ctx context.Context, cfg *config.Config, domains []stri
 	if err != nil {
 		return err
 	}
-	hits := findMatchingServersAcrossFiles(files, domains)
+	// Select THE best server per requested domain rather than the union
+	// of all overlapping matches. Pre-fix install touched every vhost
+	// whose server_name overlapped any domain — for a config with both
+	// `server_name example.com` and `server_name *.example.com`,
+	// installing a cert for `example.com` ended up mutating both. Match
+	// certbot _choose_vhost_single (configurator.py:475-494).
+	hits := selectBestServerPerDomain(files, domains)
+	if len(hits) == 0 {
+		// Fall back to default_server matches (the catch-all path).
+		hits = findMatchingServersAcrossFiles(files, domains)
+	}
 	if len(hits) == 0 {
 		return fmt.Errorf("nginx: no server block matched any of %v in %s (or its includes)", domains, configPath)
 	}
@@ -504,6 +514,159 @@ func findMatchingServers(cfg *parser.Config, domains []string) []*parser.Block {
 		fallback(cfg.Nodes)
 	}
 	return out
+}
+
+// selectBestServerPerDomain picks ONE server block per requested domain
+// using certbot/nginx's name-selection priority: exact > longest
+// start-wildcard (*.example.com) > longest end-wildcard (mail.*) >
+// regex; with SSL preferred over non-SSL within a tie. Mirrors
+// certbot configurator.py:_choose_vhost_single + _select_best_name_match
+// (configurator.py:475-494).
+//
+// Pre-fix Install touched every server whose server_name overlapped any
+// requested domain, including less-specific wildcards the user didn't
+// intend to receive the cert. Returns the union of selected vhosts (a
+// single vhost can be returned multiple times if best for multiple
+// domains; deduped by pointer).
+func selectBestServerPerDomain(files []*parsedFile, domains []string) []serverHit {
+	type candidate struct {
+		hit   serverHit
+		score int
+	}
+	type bestEntry struct {
+		hit   serverHit
+		score int
+	}
+	// First pass: collect all server blocks across files.
+	type sNode struct {
+		hit serverHit
+	}
+	var allServers []sNode
+	for _, f := range files {
+		var visit func(nodes []parser.Node)
+		visit = func(nodes []parser.Node) {
+			for _, n := range nodes {
+				b, ok := n.(*parser.Block)
+				if !ok {
+					continue
+				}
+				if b.Name == "server" {
+					allServers = append(allServers, sNode{hit: serverHit{File: f, Server: b}})
+				}
+				visit(b.Body)
+			}
+		}
+		visit(f.AST.Nodes)
+	}
+	// Per-domain best, then collect unique hits.
+	best := map[string]bestEntry{} // domain → best hit
+	for _, dom := range domains {
+		lcDom := strings.ToLower(dom)
+		for _, s := range allServers {
+			score := serverNameScore(s.hit.Server, lcDom)
+			if score == 0 {
+				continue
+			}
+			// SSL preference: bump score if the server already
+			// listens with ssl. Tie-break only.
+			if serverIsHTTPS(s.hit.Server) {
+				score++
+			}
+			cur, ok := best[lcDom]
+			if !ok || score > cur.score {
+				best[lcDom] = bestEntry{hit: s.hit, score: score}
+			}
+		}
+	}
+	// Dedupe results by *parser.Block pointer.
+	seen := map[*parser.Block]bool{}
+	var out []serverHit
+	for _, dom := range domains {
+		lcDom := strings.ToLower(dom)
+		entry, ok := best[lcDom]
+		if !ok {
+			continue
+		}
+		if seen[entry.hit.Server] {
+			continue
+		}
+		seen[entry.hit.Server] = true
+		out = append(out, entry.hit)
+	}
+	_ = candidate{} // keep unused-var quiet during incremental work
+	return out
+}
+
+// serverNameScore returns 0 if no match, or a positive integer scoring
+// the match's specificity per certbot's selection rules. Larger == more
+// specific.
+//
+// Score scheme (per Certbot's certbot/_internal/plugins/nginx/parser.py
+// best-match logic):
+//
+//	1000 + len(name)  exact match (longer FQDN ranks higher)
+//	 500 + len(name)  start wildcard (*.example.com) — leading-dot variant
+//	 400 + len(name)  end wildcard (mail.*)
+//	 100              regex match
+//	   0              no match
+//
+// The constants leave space for a +1 SSL-tie-break bump at the caller.
+func serverNameScore(srv *parser.Block, lcDom string) int {
+	best := 0
+	for _, n := range srv.Body {
+		d, ok := n.(*parser.Directive)
+		if !ok || d.Name != "server_name" {
+			continue
+		}
+		for _, raw := range d.Args {
+			name := strings.ToLower(strings.Trim(raw, `"'`))
+			score := nameMatchScore(name, lcDom)
+			if score > best {
+				best = score
+			}
+		}
+	}
+	return best
+}
+
+// nameMatchScore is the per-name-token scorer.
+func nameMatchScore(name, lcDom string) int {
+	if name == "" {
+		return 0
+	}
+	if name == lcDom {
+		return 1000 + len(name)
+	}
+	if strings.HasPrefix(name, "*.") {
+		suffix := name[1:]
+		if strings.HasSuffix(lcDom, suffix) {
+			return 500 + len(name)
+		}
+	}
+	if strings.HasPrefix(name, ".") {
+		bare := name[1:]
+		if lcDom == bare || strings.HasSuffix(lcDom, name) {
+			return 500 + len(name)
+		}
+	}
+	if strings.HasSuffix(name, ".*") {
+		prefix := name[:len(name)-1] // "mail."
+		if strings.HasPrefix(lcDom, prefix) {
+			return 400 + len(name)
+		}
+	}
+	if strings.HasPrefix(name, "~") {
+		pat := strings.TrimPrefix(name, "~")
+		if strings.HasPrefix(pat, "*") {
+			pat = "(?i)" + strings.TrimPrefix(pat, "*")
+		}
+		if re, err := regexpCompile(pat); err == nil {
+			if re.MatchString(lcDom) {
+				return 100
+			}
+		}
+	}
+	return 0
 }
 
 // serverMatchesAny returns true if the server block's server_name covers any

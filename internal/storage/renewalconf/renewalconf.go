@@ -29,6 +29,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -242,11 +243,20 @@ func emitKV(sb *strings.Builder, order []string, m map[string]string) {
 		fmt.Fprintf(sb, "%s = %s\n", k, formatValue(m[k]))
 		written[k] = true
 	}
-	for k, v := range m {
-		if written[k] {
-			continue
+	// Emit any keys not in the explicit insertion-order list in sorted
+	// (alphabetical) order. Without this, Go's map iteration randomness
+	// makes two Save() calls produce diff'able output, defeating
+	// VCS-tracked renewal confs and producing noisy git diffs after
+	// touch-only renewals.
+	var leftovers []string
+	for k := range m {
+		if !written[k] {
+			leftovers = append(leftovers, k)
 		}
-		fmt.Fprintf(sb, "%s = %s\n", k, formatValue(v))
+	}
+	sort.Strings(leftovers)
+	for _, k := range leftovers {
+		fmt.Fprintf(sb, "%s = %s\n", k, formatValue(m[k]))
 	}
 }
 

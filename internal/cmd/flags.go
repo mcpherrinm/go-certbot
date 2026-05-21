@@ -412,6 +412,20 @@ func registerFlags(fs *pflag.FlagSet, c *config.Config) {
 		if c.CSR.Path != "" && c.Verb != "" && c.Verb != "certonly" {
 			fail("Currently, a CSR file may only be specified when obtaining a new or replacement via the certonly command.")
 		}
+		// --dry-run is only valid with certonly/renew/reconfigure
+		// (cli_utils.py:282-284). Pre-fix we applied dry-run side
+		// effects (rewrite to staging, flip --break-my-certs) for any
+		// verb, which made `certbot install --dry-run` quietly point
+		// at the staging account directory.
+		if c.DryRun {
+			switch c.Verb {
+			case "", "certonly", "renew", "run", "reconfigure":
+				// `run` is allowed because Certbot's certonly+install
+				// fused path is `run`; staging works there too.
+			default:
+				fail("--dry-run currently only works with the certonly, renew, run, or reconfigure verbs")
+			}
+		}
 	})
 
 	// Hide flags Certbot marks help=argparse.SUPPRESS (cli/__init__.py:84-99,

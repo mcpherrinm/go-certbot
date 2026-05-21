@@ -35,6 +35,38 @@ func TestFindMatchingServersExact(t *testing.T) {
 	}
 }
 
+// TestSelectBestServerPerDomain mirrors certbot _choose_vhost_single
+// (configurator.py:475-494). For a config with overlapping wildcards,
+// install must touch only THE most-specific matching server per domain.
+func TestSelectBestServerPerDomain(t *testing.T) {
+	src := `http {
+    server {
+        listen 80;
+        server_name *.example.com;
+    }
+    server {
+        listen 80;
+        server_name example.com;
+    }
+    server {
+        listen 80;
+        server_name *.example.*;
+    }
+}
+`
+	cfg := parseOrFatal(t, src)
+	files := []*parsedFile{{Path: "/tmp/x.conf", AST: cfg}}
+	hits := selectBestServerPerDomain(files, []string{"example.com"})
+	if len(hits) != 1 {
+		t.Fatalf("expected exactly 1 best match, got %d", len(hits))
+	}
+	srv := hits[0].Server
+	// Must be the EXACT-match block, not *.example.com or *.example.*.
+	if got := serverNames(srv); len(got) != 1 || got[0] != "example.com" {
+		t.Errorf("expected exact-match `server_name example.com`, got %v", got)
+	}
+}
+
 // TestFindMatchingServersCaseInsensitive mirrors certbot's
 // parser._exact_match / _wildcard_match which lowercase both sides
 // (parser.py:525-565). DNS names are case-insensitive per RFC 4343.
