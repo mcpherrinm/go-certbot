@@ -176,6 +176,7 @@ func registerFlags(fs *pflag.FlagSet, c *config.Config) {
 
 	// Rollback
 	fs.IntVar(&c.RollbackCheckpoints, "checkpoints", c.RollbackCheckpoints, "Number of previous checkpoints to revert (rollback verb; default 1).")
+	fs.StringVar(&c.RenewBeforeExpiry, "renew-before-expiry", c.RenewBeforeExpiry, "Interval before expiry at which to renew (e.g. \"30 days\"). Persisted into renewal.conf via reconfigure.")
 	fs.BoolVar(&c.Nginx, "nginx", c.Nginx, "Use the nginx plugin.")
 	fs.StringVar(&c.NginxServerRoot, "nginx-server-root", c.NginxServerRoot, "Nginx server root (default /etc/nginx).")
 	fs.StringVar(&c.NginxCtl, "nginx-ctl", c.NginxCtl, "Nginx control binary (default nginx).")

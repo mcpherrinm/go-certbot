@@ -106,6 +106,11 @@ type Config struct {
 	UIR    bool
 	Staple bool
 
+	// RenewBeforeExpiry holds the user-set --renew-before-expiry interval
+	// (e.g. "30 days", "1 week"). Stored as Certbot's free-form string so
+	// renew can round-trip it through renewal.conf without loss.
+	RenewBeforeExpiry string
+
 	// Rollback
 	RollbackCheckpoints int
 	Standalone    bool
