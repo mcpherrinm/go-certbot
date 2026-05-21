@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 
 	"github.com/go-acme/lego/v5/challenge"
@@ -22,6 +23,23 @@ import (
 	"github.com/letsencrypt/go-certbot/internal/config"
 	"github.com/letsencrypt/go-certbot/internal/plugins"
 )
+
+// iisWebConfig is the IIS configuration that lets static challenge files
+// (no extension, no MIME mapping by default) get served as text/plain.
+// Matches webroot.py:227-238.
+const iisWebConfig = `<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+  <system.webServer>
+    <staticContent>
+      <mimeMap fileExtension="." mimeType="text/plain" />
+    </staticContent>
+    <handlers>
+      <clear />
+      <add name="StaticFile" path="*" verb="*" modules="StaticFileModule,DefaultDocumentModule,DirectoryListingModule" resourceType="Either" requireAccess="Read" />
+    </handlers>
+  </system.webServer>
+</configuration>
+`
 
 // Authenticator implements the webroot HTTP-01 provider.
 type Authenticator struct {
@@ -149,8 +167,15 @@ func (a *Authenticator) Present(_ context.Context, domain, token, keyAuth string
 			toCreate = append([]string{dir}, toCreate...)
 		}
 	}
-	if err := os.MkdirAll(challengeDir, 0o755); err != nil {
-		return fmt.Errorf("webroot: mkdir %s: %w", challengeDir, err)
+	// Set umask 0o022 around prefix creation so the well-known/acme-challenge
+	// directories are world-readable even on systems with restrictive
+	// process umask (Certbot wraps with filesystem.temp_umask(0o022),
+	// webroot.py:200-224).
+	prev := setUmask(0o022)
+	mkErr := os.MkdirAll(challengeDir, 0o755)
+	setUmask(prev)
+	if mkErr != nil {
+		return fmt.Errorf("webroot: mkdir %s: %w", challengeDir, mkErr)
 	}
 	// Best-effort: chown each newly-created prefix dir to match the
 	// webroot's owner so a privileged go-certbot run doesn't leave
@@ -168,6 +193,18 @@ func (a *Authenticator) Present(_ context.Context, domain, token, keyAuth string
 	a.writtenFiles = append(a.writtenFiles, challengePath)
 	a.createdDirs = append(a.createdDirs, toCreate...)
 	a.mu.Unlock()
+	// On Windows, drop a web.config that tells IIS to serve extension-less
+	// files as text/plain — without it the challenge file 404s.
+	if runtime.GOOS == "windows" {
+		webConfigPath := filepath.Join(challengeDir, "web.config")
+		if _, err := os.Stat(webConfigPath); os.IsNotExist(err) {
+			if err := os.WriteFile(webConfigPath, []byte(iisWebConfig), 0o644); err == nil {
+				a.mu.Lock()
+				a.writtenFiles = append(a.writtenFiles, webConfigPath)
+				a.mu.Unlock()
+			}
+		}
+	}
 	return nil
 }
 

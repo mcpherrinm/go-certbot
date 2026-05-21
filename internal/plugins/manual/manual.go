@@ -31,14 +31,23 @@ import (
 	"github.com/go-acme/lego/v5/challenge"
 
 	"github.com/letsencrypt/go-certbot/internal/config"
+	"github.com/letsencrypt/go-certbot/internal/display"
 	"github.com/letsencrypt/go-certbot/internal/hooks"
 	"github.com/letsencrypt/go-certbot/internal/plugins"
+)
+
+const (
+	httpInstructions = "Create a file containing just this data:\n\n%s\n\n" +
+		"And make it available on your web server at this URL:\n\n%s\n\n" +
+		"Press Enter to Continue"
+	dnsInstructions = "Please deploy a DNS TXT record under the name:\n\n%s\n\nwith the following value:\n\n%s\n\nBefore continuing, verify the TXT record has been deployed.\n\nPress Enter to Continue"
 )
 
 // Authenticator backs --manual.
 type Authenticator struct {
 	authHook    string
 	cleanupHook string
+	interactive bool
 	allDomains  []string
 	kind        plugins.ChallengeKind
 	// presented counts Present calls; the N-th call (0-indexed) gets
@@ -72,7 +81,10 @@ func (a *Authenticator) Description() string {
 // CERTBOT_ALL_DOMAINS / CERTBOT_REMAINING_CHALLENGES.
 func (a *Authenticator) Prepare(_ context.Context, cfg *config.Config, domains []string) (plugins.ChallengeKind, challenge.Provider, error) {
 	if cfg.ManualAuthHook == "" {
-		return 0, nil, errors.New("manual: --manual-auth-hook is required (interactive mode is not yet implemented)")
+		if cfg.NonInteractive {
+			return 0, nil, errors.New("manual: --manual-auth-hook is required in non-interactive mode")
+		}
+		a.interactive = true
 	}
 	a.authHook = cfg.ManualAuthHook
 	a.cleanupHook = cfg.ManualCleanupHook
@@ -92,7 +104,9 @@ func (a *Authenticator) Cleanup(_ context.Context) error { return nil }
 
 // Present runs the auth hook for the given domain. The hook publishes the
 // challenge response somewhere reachable by the CA (e.g. drop the http-01
-// file in a webroot, or update a DNS TXT record).
+// file in a webroot, or update a DNS TXT record). In interactive mode
+// (no auth-hook configured) prints Certbot's DNS/HTTP-01 instructions
+// and blocks on stdin until the user presses Enter.
 func (a *Authenticator) Present(ctx context.Context, domain, token, keyAuth string) error {
 	idx := int(a.presented.Add(1) - 1)
 	remaining := len(a.allDomains) - idx - 1
@@ -100,6 +114,26 @@ func (a *Authenticator) Present(ctx context.Context, domain, token, keyAuth stri
 		remaining = 0
 	}
 	env := a.baseEnv(domain, keyAuth, token, remaining)
+
+	if a.interactive {
+		// Compute the value the user has to publish. For HTTP-01 it's the
+		// keyAuth string at the well-known URL; for DNS-01 it's the
+		// already-hashed value in env (mirroring manual.py:206-238).
+		switch a.kind {
+		case plugins.DNS01:
+			fmt.Fprintf(os.Stderr, dnsInstructions+"\n",
+				"_acme-challenge."+domain, envValue(env, "CERTBOT_VALIDATION"))
+		default:
+			fmt.Fprintf(os.Stderr, httpInstructions+"\n",
+				keyAuth,
+				"http://"+domain+"/.well-known/acme-challenge/"+token)
+		}
+		_ = display.YesNoDefault("Press Y to continue", true)
+		a.mu.Lock()
+		a.perDomainEnv[domain] = env
+		a.mu.Unlock()
+		return nil
+	}
 
 	out, err := hooks.RunCapture(ctx, a.authHook, env)
 	if err != nil {
@@ -110,6 +144,16 @@ func (a *Authenticator) Present(ctx context.Context, domain, token, keyAuth stri
 	a.authOutputs[domain] = strings.TrimSpace(out)
 	a.mu.Unlock()
 	return nil
+}
+
+func envValue(env []string, key string) string {
+	prefix := key + "="
+	for _, e := range env {
+		if strings.HasPrefix(e, prefix) {
+			return strings.TrimPrefix(e, prefix)
+		}
+	}
+	return ""
 }
 
 // CleanUp runs the cleanup hook for the given domain.

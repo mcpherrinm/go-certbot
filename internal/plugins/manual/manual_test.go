@@ -69,10 +69,14 @@ echo "$CERTBOT_DOMAIN $CERTBOT_AUTH_OUTPUT" > CLEANFILE
 	}
 }
 
-func TestPrepareWithoutAuthHookErrors(t *testing.T) {
+// In non-interactive mode without --manual-auth-hook, Prepare should error.
+// (In interactive mode the plugin enters block-on-stdin mode — see
+// httpInstructions / dnsInstructions usage.)
+func TestPrepareWithoutAuthHookNonInteractiveErrors(t *testing.T) {
 	a := New()
 	cfg := config.NewDefault()
+	cfg.NonInteractive = true
 	if _, _, err := a.Prepare(context.Background(), cfg, []string{"x"}); err == nil {
-		t.Errorf("expected error without --manual-auth-hook")
+		t.Errorf("expected error without --manual-auth-hook in non-interactive mode")
 	}
 }
