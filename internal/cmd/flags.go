@@ -256,7 +256,13 @@ func registerFlags(fs *pflag.FlagSet, c *config.Config) {
 	// Normalize aliases (`http`/`http_01` → `http-01`, `dns`/`dns_01` →
 	// `dns-01`) so downstream comparisons can match the canonical name.
 	// Mirrors Certbot's _PrefChallAction (cli_utils.py:185-221).
+	// Trim whitespace around each entry so `--preferred-challenges
+	// 'http, dns'` (Certbot's cli_test exercises the space variant)
+	// works the same as `'http,dns'`.
 	c.PostParseHooks = append(c.PostParseHooks, func() {
+		for i, ch := range c.PreferredChallenges {
+			c.PreferredChallenges[i] = strings.TrimSpace(ch)
+		}
 		for i, ch := range c.PreferredChallenges {
 			switch ch {
 			case "http", "http_01":
@@ -335,6 +341,34 @@ func registerFlags(fs *pflag.FlagSet, c *config.Config) {
 		if c.Verb == "certonly" && c.CSR.Path != "" && c.SetByUser("cert-path") {
 			c.AuthCertPath = c.CertPath
 			c.CertPath = ""
+		}
+	})
+	// Convert install/revoke path flags to absolute paths so the
+	// resolved paths survive the `cd` Certbot performs into a temp
+	// working dir, and so renewal.conf records absolute paths.
+	// Mirrors certbot _internal/cli/paths_parser.py's `path_surgery`
+	// and the test_install_abspath test (cli_test.py:142-156).
+	c.PostParseHooks = append(c.PostParseHooks, func() {
+		abs := func(p string) string {
+			if p == "" {
+				return p
+			}
+			if a, err := filepath.Abs(p); err == nil {
+				return a
+			}
+			return p
+		}
+		if c.SetByUser("cert-path") {
+			c.CertPath = abs(c.CertPath)
+		}
+		if c.SetByUser("key-path") {
+			c.KeyPath = abs(c.KeyPath)
+		}
+		if c.SetByUser("chain-path") {
+			c.AuthChainPath = abs(c.AuthChainPath)
+		}
+		if c.SetByUser("fullchain-path") {
+			c.FullchainPath = abs(c.FullchainPath)
 		}
 	})
 
