@@ -233,3 +233,32 @@ func TestPreservesInsertionOrder(t *testing.T) {
 		t.Errorf("param order not preserved:\n%s", b)
 	}
 }
+
+func TestSavePreservesMode(t *testing.T) {
+	if testing.Short() {
+		t.Skip("perm test")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "example.conf")
+	if err := os.WriteFile(path, []byte("version = 5.6.0\ncert = /a\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	f, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.SetTop("cert", "/changed")
+	if err := f.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fi.Mode().Perm(); got != 0o640 {
+		t.Errorf("perm after rewrite: got %o want 0640 (mirrors certbot test_atomic_rewrite)", got)
+	}
+}

@@ -234,7 +234,16 @@ func (f *File) Save(path string) error {
 		fmt.Fprintf(&sb, "[%s]\n", name)
 		emitKV(&sb, f.keyOrder["section:"+name], f.Sections[name])
 	}
-	return writeFile(path, []byte(sb.String()), 0o644)
+	// Preserve the file mode of an existing conf on rewrite. certbot's
+	// storage.atomic_rewrite (verified by test_atomic_rewrite) carries the
+	// prior mode forward, so an operator who chmod'd renewal/foo.conf to
+	// 0o640 for a non-root renewal monitor doesn't see it reset to 0o644
+	// after every renewal.
+	mode := os.FileMode(0o644)
+	if fi, err := os.Stat(path); err == nil {
+		mode = fi.Mode().Perm()
+	}
+	return writeFile(path, []byte(sb.String()), mode)
 }
 
 func emitKV(sb *strings.Builder, order []string, m map[string]string) {
