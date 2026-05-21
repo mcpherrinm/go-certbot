@@ -344,13 +344,35 @@ func findHTTPVHosts(files []*parsedFile, names []string) []*parser.Block {
 	return out
 }
 
+// serverNames returns every name across all server_name directives in the
+// block. Mirrors certbot-nginx's parser._get_servernames which collects
+// names from EVERY server_name directive (multiple are legal in nginx).
 func serverNames(b *parser.Block) []string {
+	var out []string
 	for _, n := range b.Body {
 		if d, ok := n.(*parser.Directive); ok && d.Name == "server_name" {
-			return append([]string(nil), d.Args...)
+			out = append(out, d.Args...)
 		}
 	}
-	return nil
+	return out
+}
+
+// isDefaultServer reports whether any of the block's listen directives has
+// the `default_server` flag. Used as a catch-all match when no server_name
+// matches the requested SAN.
+func isDefaultServer(b *parser.Block) bool {
+	for _, n := range b.Body {
+		d, ok := n.(*parser.Directive)
+		if !ok || d.Name != "listen" {
+			continue
+		}
+		for _, a := range d.Args {
+			if a == "default_server" || a == "default" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func hasHTTPRedirectAlready(files []*parsedFile, names []string) bool {
@@ -459,6 +481,26 @@ func findMatchingServers(cfg *parser.Config, domains []string) []*parser.Block {
 		}
 	}
 	visit(cfg.Nodes)
+	// If no exact / wildcard / regex match was found, fall back to any
+	// vhost that's flagged `default_server` on its listen line — that's
+	// the catch-all nginx routes unmatched requests to. Mirrors
+	// certbot-nginx's get_vhosts default-server fallback.
+	if len(out) == 0 {
+		var fallback func(nodes []parser.Node)
+		fallback = func(nodes []parser.Node) {
+			for _, n := range nodes {
+				b, ok := n.(*parser.Block)
+				if !ok {
+					continue
+				}
+				if b.Name == "server" && isDefaultServer(b) {
+					out = append(out, b)
+				}
+				fallback(b.Body)
+			}
+		}
+		fallback(cfg.Nodes)
+	}
 	return out
 }
 
