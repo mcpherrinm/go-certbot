@@ -83,7 +83,21 @@ func Certonly(ctx context.Context, cfg *config.Config, reg *plugins.Registry) er
 		// the lineage's key_type but resets key SIZE to the default
 		// (i.e. we do NOT also restore rsa_key_size; that uses the
 		// CLI default 2048).
+		//
+		// If --key-type is set AND it differs from the lineage's
+		// current key_type AND --cert-name isn't pinned, error out.
+		// Mirrors certbot _handle_key_type_change: an accidental
+		// `certonly -d X --key-type rsa` on a domain that happens to
+		// match an existing ecdsa lineage shouldn't silently flip
+		// the key type. The user must opt in via --cert-name to
+		// confirm they meant THIS specific lineage. test_renew_with
+		// _ec_keys asserts the exact error wording.
 		if reuse != "newcert" {
+			if reuse != "" && cfg.SetByUser("key-type") && cfg.CertName == "" {
+				if prior := lineageKeyType(cfg, certName); prior != "" && prior != cfg.KeyType {
+					return fmt.Errorf("Please provide both --cert-name and --key-type to change the type of the existing %q lineage from %s to %s", certName, prior, cfg.KeyType)
+				}
+			}
 			mergeExistingKeyType(cfg, certName)
 		}
 	}
@@ -206,6 +220,16 @@ func resolveAuthenticatorName(cfg *config.Config) (string, error) {
 		return "", errors.New("certonly: an authenticator is required (--standalone / --webroot / --manual / --dns-* / --authenticator)")
 	}
 	return picked, nil
+}
+
+// lineageKeyType returns the key_type stored in the given lineage's
+// renewal conf, or "" if not present or the file can't be read.
+func lineageKeyType(cfg *config.Config, certName string) string {
+	conf, err := renewalconf.Load(filepath.Join(cfg.RenewalConfigsDir(), certName+".conf"))
+	if err != nil {
+		return ""
+	}
+	return conf.RenewalParams["key_type"]
 }
 
 // mergeExistingKeyType reads the existing lineage's renewal conf and
