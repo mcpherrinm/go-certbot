@@ -31,6 +31,11 @@ import (
 // _default_renewal_time (renewal.py:426).
 const shortCertCutoff = 10 * 24 * time.Hour
 
+// acmeV1Directory is Let's Encrypt's old ACMEv1 directory URL. The endpoint
+// was retired in 2021. Certbot maps it to the v2 default on conf read
+// (renewal.py:338-341).
+const acmeV1Directory = "https://acme-v01.api.letsencrypt.org/directory"
+
 // Renew implements `go-certbot renew`. Iterates renewal/*.conf, restores the
 // recorded params (with CLI overrides winning), checks expiry, and runs
 // obtain. Hooks follow Certbot's ordering (hooks.py:75-189):
@@ -346,6 +351,29 @@ func renewOne(ctx context.Context, cli *config.Config, reg *plugins.Registry, co
 // registered on a different one.
 func mergeFromRenewalConf(cfg *config.Config, conf *renewalconf.File) {
 	rp := conf.RenewalParams
+	// Treat configobj's "None" sentinel as "absent" — certbot's _restore_str
+	// returns None when the on-disk value is the literal string "None"
+	// (renewal.py:343). Without normalizing here, mergeFromRenewalConf would
+	// happily install "None" as the value for, e.g., key_type or installer.
+	for k, v := range rp {
+		if v == "None" {
+			delete(rp, k)
+		}
+	}
+	// ACMEv1 URL migration: certbot _restore_str (renewal.py:338-341) rewrites
+	// the long-deprecated v01 directory URL to the current v02 default on
+	// read so old lineages from Let's Encrypt's v1 era still renew. Mirror
+	// the rewrite — Let's Encrypt's v01 directory has been EOL'd for years
+	// and never comes back, so the user almost certainly wants v02.
+	if v := rp["server"]; v == acmeV1Directory {
+		rp["server"] = config.DefaultLetsEncryptDirectory
+	}
+	// Legacy "http01_port = None" entries (from certbot < 0.30 days) blow
+	// up int parsing — drop them so the CLI default applies. Matches
+	// renewal.py:315-317.
+	if rp["http01_port"] == "None" {
+		delete(rp, "http01_port")
+	}
 	// VAR_MODIFIERS: server → account, webroot-path → webroot-map, staging
 	// → server, dry-run → staging → server.
 	serverSetByUser := cfg.SetByUser("server") || cfg.SetByUser("staging") || cfg.SetByUser("dry-run") || cfg.SetByUser("test-cert")
