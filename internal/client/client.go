@@ -85,11 +85,18 @@ func (c *Client) EnsureRegistered(ctx context.Context, accountStorage *account.F
 	}
 	if c.cfg.Email == "" && !c.cfg.RegisterUnsafelyWithoutEmail {
 		if c.cfg.NonInteractive {
-			return errors.New("client: --email is required (or pass --register-unsafely-without-email)")
-		}
-		c.cfg.Email = display.Email("Enter email address (used for urgent renewal and security notices):")
-		if c.cfg.Email == "" {
-			return errors.New("client: --email is required (or pass --register-unsafely-without-email)")
+			// Certbot 3.3.0 dropped --register-unsafely-without-email's
+			// requirement in non-interactive mode: an empty email is
+			// treated as an explicit no-email opt-in.
+			c.cfg.RegisterUnsafelyWithoutEmail = true
+		} else {
+			c.cfg.Email = display.Email("Enter email address (used for urgent renewal and security notices):")
+			if c.cfg.Email == "" {
+				// Interactive: pressing Enter at the prompt registers
+				// without email, matching certbot._internal.main._determine_account
+				// and the accounts verb.
+				c.cfg.RegisterUnsafelyWithoutEmail = true
+			}
 		}
 	}
 
@@ -178,7 +185,14 @@ func (c *Client) Obtain(ctx context.Context, auth plugins.Authenticator, domains
 		return nil, fmt.Errorf("client: ACME order: %w", err)
 	}
 
-	lineage, err := storage.Write(c.cfg.ConfigDir, certName, resource.Certificate, resource.IssuerCertificate, resource.PrivateKey, storage.WriteOptions{
+	// Certbot saves private keys in PKCS#8 (PEM `PRIVATE KEY`). lego returns
+	// PKCS#1 for RSA and SEC1 for EC; re-wrap for on-disk parity.
+	pkcs8Key, err := toPKCS8(resource.PrivateKey)
+	if err != nil {
+		return nil, fmt.Errorf("client: re-encode key as PKCS#8: %w", err)
+	}
+
+	lineage, err := storage.Write(c.cfg.ConfigDir, certName, resource.Certificate, resource.IssuerCertificate, pkcs8Key, storage.WriteOptions{
 		StrictPermissions: c.cfg.StrictPermissions,
 	})
 	if err != nil {
@@ -268,6 +282,41 @@ func certKeyType(cfg *config.Config) (certcrypto.KeyType, error) {
 		return "", fmt.Errorf("client: unsupported elliptic_curve %q", cfg.EllipticCurve)
 	}
 	return "", fmt.Errorf("client: unsupported key_type %q", cfg.KeyType)
+}
+
+// toPKCS8 rewraps a PEM-encoded private key into a PKCS#8 `PRIVATE KEY`
+// block. lego emits PKCS#1 (`RSA PRIVATE KEY`) and SEC1 (`EC PRIVATE KEY`);
+// Certbot has saved keys in PKCS#8 since 3.2.0 (the older format was a
+// regression). Idempotent: already-PKCS#8 input is returned verbatim.
+func toPKCS8(keyPEM []byte) ([]byte, error) {
+	block, _ := pem.Decode(keyPEM)
+	if block == nil {
+		return nil, errors.New("empty PEM")
+	}
+	var key any
+	switch block.Type {
+	case "PRIVATE KEY":
+		return keyPEM, nil
+	case "RSA PRIVATE KEY":
+		k, err := x509.ParsePKCS1PrivateKey(block.Bytes)
+		if err != nil {
+			return nil, err
+		}
+		key = k
+	case "EC PRIVATE KEY":
+		k, err := x509.ParseECPrivateKey(block.Bytes)
+		if err != nil {
+			return nil, err
+		}
+		key = k
+	default:
+		return nil, fmt.Errorf("unsupported PEM type %q", block.Type)
+	}
+	der, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		return nil, err
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}), nil
 }
 
 // userAgent composes the User-Agent string Certbot sends to the ACME server.
