@@ -39,6 +39,16 @@ func Revoke(ctx context.Context, cfg *config.Config, reg *plugins.Registry) erro
 		if certPath == "" {
 			return fmt.Errorf("revoke: renewal conf for %q has no fullchain path", cfg.CertName)
 		}
+		// Pin server + account to the issuing CA. Without this, revoking a
+		// cert that was issued by a non-default CA fails with "unrecognized
+		// account". Matches Certbot main.py:1355-1378 (reconstitute fills
+		// server/account from the lineage before _determine_account).
+		if v := conf.RenewalParams["server"]; v != "" && !cfg.SetByUser("server") {
+			cfg.Server = v
+		}
+		if v := conf.RenewalParams["account"]; v != "" && !cfg.SetByUser("account") {
+			cfg.Account = v
+		}
 	}
 	certBytes, err := os.ReadFile(certPath)
 	if err != nil {
@@ -83,15 +93,24 @@ func Revoke(ctx context.Context, cfg *config.Config, reg *plugins.Registry) erro
 
 	// Mirrors Certbot's main.revoke 786-794: prompt the user to also
 	// delete the lineage (default Yes) unless --no-delete-after-revoke
-	// was passed or there's no lineage to delete.
+	// was passed.
 	if cfg.CertName != "" {
-		delete := cfg.DeleteAfterRevoke
-		if !cfg.NonInteractive && !cfg.SetByUser("delete-after-revoke") && !cfg.SetByUser("no-delete-after-revoke") {
-			delete = display.YesNoDefault(
+		var doDelete bool
+		switch {
+		case cfg.SetByUser("delete-after-revoke"):
+			doDelete = cfg.DeleteAfterRevoke
+		case cfg.SetByUser("no-delete-after-revoke"):
+			doDelete = false
+		case cfg.NonInteractive:
+			// Certbot errors out in non-interactive mode if neither flag
+			// was passed (main.py:788-791 uses force_interactive=True).
+			return errors.New("revoke: --delete-after-revoke or --no-delete-after-revoke must be set in non-interactive mode")
+		default:
+			doDelete = display.YesNoDefault(
 				"Would you like to delete the certificate(s) you just revoked, along with all earlier and later versions of the certificate?",
 				true)
 		}
-		if delete {
+		if doDelete {
 			return Delete(ctx, cfg, reg)
 		}
 	}

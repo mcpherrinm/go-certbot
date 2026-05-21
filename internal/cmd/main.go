@@ -47,7 +47,10 @@ func Main(args []string) int {
 	// `--version` always prints and exits.
 	for _, a := range args {
 		if a == "--version" {
-			fmt.Println("go-certbot 1.4.0")
+			// Print "certbot X.Y.Z" so shell snippets like
+			// `certbot --version | awk '{print $2}'` parse correctly
+			// across both implementations.
+			fmt.Println("certbot 1.4.0")
 			return 0
 		}
 	}

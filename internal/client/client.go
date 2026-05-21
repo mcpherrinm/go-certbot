@@ -12,7 +12,6 @@ import (
 	"net"
 	"os"
 	"runtime"
-	"strings"
 	"time"
 
 	"github.com/go-acme/lego/v5/acme"
@@ -205,8 +204,10 @@ func (c *Client) RenewalInfo(ctx context.Context, leaf *x509.Certificate) (*cert
 	info, err := c.lego.Certificate.GetRenewalInfo(ctx, leaf)
 	if err != nil {
 		// Treat unsupported / 404 as "no ARI" rather than an error so renew
-		// falls back to renew_before_expiry.
-		if strings.Contains(err.Error(), "404") || strings.Contains(err.Error(), "not found") {
+		// falls back to renew_before_expiry. Use lego's typed error so a
+		// URL like "/.../404x/..." doesn't accidentally swallow the failure.
+		var pd *acme.ProblemDetails
+		if errors.As(err, &pd) && pd.HTTPStatus == 404 {
 			return nil, nil
 		}
 		return nil, err
@@ -293,7 +294,11 @@ func userAgent(cfg *config.Config) string {
 	if verb == "" {
 		verb = "run"
 	}
-	ua := fmt.Sprintf("CertbotACMEClient/%s (go-certbot; %s/%s) Authenticator/%s Installer/%s (%s; flags: %s) Go/%s",
+	// Match Certbot's UA token (_internal/client.py:92-105): "certbot" as
+	// the cli_command identifier (not "go-certbot"), Py/<go-runtime> as
+	// the runtime tag so CA log parsers keying on "Py/" still classify
+	// requests as Certbot-shaped.
+	ua := fmt.Sprintf("CertbotACMEClient/%s (certbot; %s/%s) Authenticator/%s Installer/%s (%s; flags: %s) Py/%s",
 		version, runtime.GOOS, runtime.GOARCH, authn, inst, verb, uaFlags(cfg), runtime.Version())
 	if cfg.UserAgentComment != "" {
 		ua += " " + cfg.UserAgentComment
