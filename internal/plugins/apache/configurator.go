@@ -23,6 +23,7 @@ package apache
 
 import (
 	"context"
+	cryptorand "crypto/rand"
 	"errors"
 	"fmt"
 	"os"
@@ -174,6 +175,11 @@ func (p *Plugin) Install(ctx context.Context, cfg *config.Config, domains []stri
 				}
 			}
 			clone := cloneAsSSLVHost(h.Sec, fullchainPath, privkeyPath, chainPath, sslSnippet)
+			// Prepend the per-vhost managed-by marker INSIDE the vhost
+			// body so Certbot's scan-by-marker logic (configurator.py:
+			// 1748,1774) finds it. The bare file-top marker also stays
+			// (it's how we detect "this clone already exists" on re-run).
+			injectManagedComment(clone, managedByMarkerID())
 			body := managedByMarker + "\n" + wrapInIfModuleSSL(clone)
 			extras = append(extras, extraFile{path: leSSLPath, body: body})
 		}
@@ -246,10 +252,12 @@ func wrapInIfModuleSSL(sec *parser.Section) string {
 	return wrapped.String()
 }
 
-// addRewriteRedirect inserts a `RewriteEngine on` + `RewriteCond` + `RewriteRule`
-// trio into a matching :80 vhost, redirecting HTTP requests to HTTPS. Matches
-// Certbot's _set_https_redirection. Idempotent: skips if a redirect already
-// exists.
+// addRewriteRedirect inserts a `RewriteEngine on` plus one
+// `RewriteCond %{SERVER_NAME} =name [OR]` per matched name and a
+// trailing `RewriteRule ^ https://%{SERVER_NAME}%{REQUEST_URI} [END,NE,R=permanent]`.
+// Matches Certbot's _set_https_redirection (configurator.py:2094-2102):
+// the per-name RewriteCond prevents the rule firing for vhosts that share
+// the same :80 listener but aren't part of our cert. Idempotent.
 func addRewriteRedirect(sec *parser.Section) {
 	for _, n := range sec.Body {
 		if d, ok := n.(*parser.Directive); ok && strings.EqualFold(d.Name, "RewriteRule") {
@@ -263,8 +271,49 @@ func addRewriteRedirect(sec *parser.Section) {
 	indent := childIndent(sec)
 	sec.Body = append(sec.Body,
 		&parser.Directive{Indent: indent, Name: "RewriteEngine", Args: []string{"on"}, Newline: "\n"},
-		&parser.Directive{Indent: indent, Name: "RewriteRule", Args: []string{"^", "https://%{SERVER_NAME}%{REQUEST_URI}", "[END,NE,R=permanent]"}, Newline: "\n"},
 	)
+	// One RewriteCond per name. All but the last get the `[OR]` flag.
+	names := vhostNames(sec)
+	for i, name := range names {
+		flag := "[OR]"
+		if i == len(names)-1 {
+			flag = ""
+		}
+		args := []string{"%{SERVER_NAME}", "=" + name}
+		if flag != "" {
+			args = append(args, flag)
+		}
+		sec.Body = append(sec.Body, &parser.Directive{
+			Indent: indent, Name: "RewriteCond", Args: args, Newline: "\n",
+		})
+	}
+	sec.Body = append(sec.Body, &parser.Directive{
+		Indent: indent, Name: "RewriteRule",
+		Args:    []string{"^", "https://%{SERVER_NAME}%{REQUEST_URI}", "[END,NE,R=permanent]"},
+		Newline: "\n",
+	})
+}
+
+// vhostNames returns the ServerName + ServerAlias values for a vhost
+// section (single ServerName, plus aliases). Used by the RewriteCond
+// per-domain guard.
+func vhostNames(sec *parser.Section) []string {
+	var out []string
+	for _, n := range sec.Body {
+		d, ok := n.(*parser.Directive)
+		if !ok {
+			continue
+		}
+		switch strings.ToLower(d.Name) {
+		case "servername":
+			if len(d.Args) > 0 {
+				out = append(out, d.Args[0])
+			}
+		case "serveralias":
+			out = append(out, d.Args...)
+		}
+	}
+	return out
 }
 
 // apacheConfigPath returns where to read/write, honoring explicit overrides
@@ -552,9 +601,37 @@ func removeDirective(sec *parser.Section, name string) {
 // managedByMarker matches Certbot's exact marker text
 // (certbot-apache/_internal/constants.py:83 — "DO NOT REMOVE - Managed by
 // Certbot") so a mixed-tool deployment (Certbot then go-certbot, or
-// vice-versa) detects the existing cloned vhost and updates in place
-// instead of duplicating it.
+// vice-versa) detects the existing cloned vhost.
 const managedByMarker = "# DO NOT REMOVE - Managed by Certbot"
+
+// managedByMarkerID returns Certbot's UUID-suffixed marker, placed inside
+// each cloned vhost so per-vhost detection works (configurator.py:1748,
+// 1774). The UUID is random per-vhost; reused across runs only when we
+// find an existing managed clone (updateExistingSSLVHost).
+func managedByMarkerID() string {
+	return managedByMarker + ", VirtualHost id: " + randomUUID4()
+}
+
+// injectManagedComment prepends a comment node to sec's body containing
+// the managed-by marker (including a per-vhost UUID). Matches the
+// `# DO NOT REMOVE - Managed by Certbot, VirtualHost id: <uuid>` line
+// Certbot writes inside each managed vhost.
+func injectManagedComment(sec *parser.Section, marker string) {
+	indent := childIndent(sec)
+	c := &parser.CommentLine{Verbatim: indent + marker, Newline: "\n"}
+	sec.Body = append([]parser.Node{c}, sec.Body...)
+}
+
+// randomUUID4 returns a UUID4-formatted random ID (8-4-4-4-12 hex with
+// version-4 and variant bits set per RFC 4122). No external dep.
+func randomUUID4() string {
+	var b [16]byte
+	_, _ = cryptorand.Read(b[:])
+	b[6] = (b[6] & 0x0f) | 0x40 // version 4
+	b[8] = (b[8] & 0x3f) | 0x80 // variant
+	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
+		b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
 
 // updateExistingSSLVHost walks an already-cloned -le-ssl.conf parse tree and
 // refreshes its SSLCertificateFile / SSLCertificateKeyFile to the current

@@ -161,8 +161,14 @@ func renewOne(ctx context.Context, cli *config.Config, reg *plugins.Registry, co
 	if err != nil {
 		return renewOutcome{kind: outcomeParseError}, err
 	}
+	// Lineages flagged `autorenew = False` are skipped per
+	// renewal.py:140. cli.ForceRenewal overrides.
+	if !merged.Autorenew && !cli.ForceRenewal {
+		fmt.Println("Certificate is configured with autorenew=False; skipping.")
+		return renewOutcome{kind: outcomeSkipped, sans: append([]string(nil), merged.Domains...)}, nil
+	}
 	if !needs && !cli.ForceRenewal {
-		fmt.Printf("Certificate not yet due for renewal; renew_before_expiry not reached. Cert expires on %s.\n", expiresAt.Format("2006-01-02"))
+		fmt.Println("Certificate not yet due for renewal")
 		return renewOutcome{kind: outcomeSkipped, sans: append([]string(nil), merged.Domains...)}, nil
 	}
 	// If the ACME server supports ARI and the suggested window is in the
@@ -282,6 +288,14 @@ func mergeFromRenewalConf(cfg *config.Config, conf *renewalconf.File) {
 	}
 	if v, ok := conf.Bool("must_staple"); ok && !cfg.SetByUser("must-staple") {
 		cfg.MustStaple = v
+	}
+	// Honor `autorenew = False` from the conf so lineages flagged for
+	// no-autorenew are skipped by `renew`. Certbot reads this via
+	// BOOL_CONFIG_ITEMS (renewal.py:55) and the renew loop bypasses the
+	// lineage entirely. We mirror by setting Autorenew=false on the merged
+	// config; renewOne consults it.
+	if v, ok := conf.Bool("autorenew"); ok && !cfg.SetByUser("autorenew") {
+		cfg.Autorenew = v
 	}
 	if v, ok := conf.Bool("reuse_key"); ok && !cfg.SetByUser("reuse-key") {
 		cfg.ReuseKey = v
@@ -451,7 +465,8 @@ func needsRenewal(certPath string, conf *renewalconf.File) (bool, time.Time, err
 
 // parseRenewBefore parses Certbot's English-language interval, including
 // concatenated sequences like "6 months 1 week" (storage.add_time_interval).
-// Bare integers mean days.
+// Bare integers mean days. Zero-valued intervals like "0 days" are accepted
+// and mean "always renew" (Certbot via parsedatetime).
 func parseRenewBefore(s string) (time.Duration, error) {
 	s = strings.TrimSpace(strings.ToLower(s))
 	if s == "" {
@@ -462,7 +477,11 @@ func parseRenewBefore(s string) (time.Duration, error) {
 		return time.Duration(n) * 24 * time.Hour, nil
 	}
 	tokens := strings.Fields(s)
+	if len(tokens) < 2 {
+		return 0, fmt.Errorf("could not parse interval %q", s)
+	}
 	var total time.Duration
+	saw := false
 	for i := 0; i < len(tokens)-1; i += 2 {
 		n, err := strconv.Atoi(tokens[i])
 		if err != nil {
@@ -489,8 +508,9 @@ func parseRenewBefore(s string) (time.Duration, error) {
 			return 0, fmt.Errorf("unknown unit %q", unit)
 		}
 		total += time.Duration(n) * step
+		saw = true
 	}
-	if total == 0 {
+	if !saw {
 		return 0, fmt.Errorf("could not parse interval %q", s)
 	}
 	return total, nil

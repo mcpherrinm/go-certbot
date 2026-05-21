@@ -113,10 +113,8 @@ func Run(ctx context.Context, cfg *config.Config, reg *plugins.Registry) error {
 		slog.Warn("deploy-hook directory failed", "err", err)
 	}
 
-	if cfg.EFFEmailExplicit && cfg.Email != "" && !cfg.DryRun {
-		if err := eff.Subscribe(ctx, cfg.Email); err != nil {
-			slog.Warn("EFF subscribe failed", "err", err)
-		}
+	if !cfg.DryRun && eff.Decide(cfg) {
+		_ = eff.Subscribe(ctx, cfg.Email)
 	}
 	return nil
 }

@@ -152,6 +152,15 @@ func (a *Authenticator) Present(_ context.Context, domain, token, keyAuth string
 	if err := os.MkdirAll(challengeDir, 0o755); err != nil {
 		return fmt.Errorf("webroot: mkdir %s: %w", challengeDir, err)
 	}
+	// Best-effort: chown each newly-created prefix dir to match the
+	// webroot's owner so a privileged go-certbot run doesn't leave
+	// root-owned dirs that the (non-root) web server can't traverse.
+	// Matches Certbot's _copy_owner_and_apply_mode behavior.
+	if rootInfo, err := os.Stat(path); err == nil {
+		for _, d := range toCreate {
+			_ = copyOwnership(d, rootInfo)
+		}
+	}
 	if err := os.WriteFile(challengePath, []byte(keyAuth), 0o644); err != nil {
 		return fmt.Errorf("webroot: write %s: %w", challengePath, err)
 	}
@@ -160,6 +169,20 @@ func (a *Authenticator) Present(_ context.Context, domain, token, keyAuth string
 	a.createdDirs = append(a.createdDirs, toCreate...)
 	a.mu.Unlock()
 	return nil
+}
+
+// copyOwnership chowns dst to match src's uid/gid. Best-effort: returns nil
+// on platforms where Sys() doesn't expose Unix uid/gid (e.g. Windows).
+func copyOwnership(dst string, src os.FileInfo) error {
+	type sysStat interface {
+		Uid() uint32
+		Gid() uint32
+	}
+	st, ok := src.Sys().(*unixStat)
+	if !ok {
+		return nil
+	}
+	return os.Chown(dst, int(st.Uid), int(st.Gid))
 }
 
 // CleanUp implements lego's challenge.Provider (per-challenge cleanup).

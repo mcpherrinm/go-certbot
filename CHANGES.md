@@ -5,7 +5,107 @@ This file tracks every behavior in **go-certbot** that differs from upstream
 drop-in compatibility, so this file should stay short. Anything not listed
 here should behave identically to Certbot.
 
-## Phase 11 (current) — go-certbot 1.3.0 — deep parity
+## Phase 12 (current) — go-certbot 1.4.0 — review-3 sweep
+
+Third comprehensive code review surfaced ~40 additional differences. The
+highest-impact P0/P1 fixes land here.
+
+### Account storage (P0 — broke byte-equivalence)
+
+- **JSON separators**: every account file (`regr.json`, `meta.json`,
+  `private_key.json`) is now byte-equivalent to Python's `json.dumps`
+  default: keys and values separated by `, ` and `: ` (with spaces).
+- **JWK field order** matches josepy exactly: `kty` is appended *last*
+  (RSA: `n,e,d,p,q,dp,dq,qi,kty`; EC: `d,x,y,crv,kty`).
+- **Thumbprint** now hashes the RFC 7638 canonical JSON of the JWK's
+  required public fields only (sorted lex, no spaces). `show_account`'s
+  Account Thumbprint line is now byte-equivalent to Certbot's.
+
+### Renewal/config
+
+- `parseRenewBefore "0 days"` now accepts as "always renew" (Certbot via
+  parsedatetime returns 0 too).
+- `autorenew = False` now skips the lineage on `renew`.
+- `reconfigure --deploy-hook ""` clears the hook (via DeleteParam) rather
+  than leaving an empty stub.
+
+### CLI
+
+- **Slice duplication fix**: argv values are now snapshot/restored over
+  ini-loaded values instead of double-parsing argv (which appended).
+- `--directory-hooks` / `--no-directory-hooks` and `--validate-hooks` /
+  `--no-validate-hooks` flags wired (fields existed since phase 10).
+- `--eff-email` tri-state now properly resolves into `*bool`.
+- `--dry-run` side effects applied: implies `--staging` + `--break-my-certs`;
+  auto-agrees TOS + sets `--register-unsafely-without-email` when no email.
+- `--staging` + custom `--server` is now rejected.
+- Apache plugin flags wired: `--apache-bin`, `--apache-enmod`,
+  `--apache-dismod`, `--apache-le-vhost-ext`, `--apache-vhost-root`,
+  `--apache-logs-root`, `--apache-challenge-location`,
+  `--apache-handle-modules`, `--apache-handle-sites`.
+- `--nginx-sleep-seconds` wired; default 1, honored in testAndReload.
+- Validations: `--key-type` choices, `--elliptic-curve` choices,
+  `--max-log-backups` non-negative, `--user-agent-comment` rejects `()`.
+
+### Hooks / webroot / EFF
+
+- **Webroot chowns created prefix dirs** to match webroot owner (best-effort).
+- **PostEnv truncates** `RENEWED_DOMAINS`/`FAILED_DOMAINS` at 16 KiB with
+  a warning, matching `hooks.py:173-179`.
+- **EFF subscription is now non-fatal** (errors go to stderr, callers
+  ignore). Added a `User-Agent` header.
+- **`eff.Decide(cfg)`** wires the interactive `_want_subscription`
+  prompt when `--eff-email` / `--no-eff-email` aren't set.
+- **`display.Email`** now accepts a blank line as "skip" (matches
+  `display_ops.get_email`); Register switches to
+  `--register-unsafely-without-email` when the user hits Enter.
+
+### Verbs / display
+
+- `enhance --redirect` now supported on both nginx and apache. Nginx
+  uses the per-domain `if ($host = X)` block; Apache uses
+  `RewriteCond %{SERVER_NAME} =name [OR]` per name plus RewriteRule.
+
+### Standalone
+
+- Bind errors now distinguish `EACCES` ("permission denied, try sudo or
+  --http-01-port") from `EADDRINUSE` ("address already in use") with
+  Certbot-style helpful messages.
+
+### Signal handling
+
+- The SIGINT goroutine no longer kills tests via stale `os.Exit(130)`
+  after the handler exited cleanly. It now checks a `handlerDone`
+  channel before scheduling the force-exit timer.
+
+### Apache
+
+- **Marker text** is now placed *inside* each cloned vhost via a
+  per-vhost UUID comment (`# DO NOT REMOVE - Managed by Certbot,
+  VirtualHost id: <uuid4>`), matching Certbot's vhost-id detection.
+- **`RewriteCond %{SERVER_NAME} =name [OR]`** per-domain guard added
+  before the redirect RewriteRule.
+- **Per-OS coverage** corrected: Alpine `Ctl=apachectl`, Arch
+  `VHostRoot=/etc/httpd/conf`, plus Darwin (`/etc/apache2/other`) and
+  Void (`/etc/apache/extra`).
+
+### Nginx
+
+- **Challenge conf** now lives in `config_dir/le_http_01_cert_challenge.conf`
+  (matches Certbot's `http_01.py:46-47`) instead of the work-dir scratch.
+- **Redirect blocks prepend** instead of append (`insert_at_top=True`).
+- **`ssl_dhparam` install**: `<config_dir>/ssl-dhparams.pem` (the
+  RFC 7919 ffdhe2048 group Certbot ships) is now written, with
+  `ssl_dhparam <path>;` added to every SSL server block.
+- **Historical SHA whitelist** prevents clobbering user-modified
+  `options-ssl-nginx.conf` / `ssl-dhparams.pem`.
+
+### DNS plugins
+
+- `dns_common` permission warning now matches Certbot's mask
+  (`0o007` — world-readable only); was overly strict at `0o077`.
+
+## Phase 11 — go-certbot 1.3.0 — deep parity
 
 Picks up the architectural items deferred from phase 10. Every change here
 brings go-certbot closer to byte-equivalent on-disk state with Certbot.

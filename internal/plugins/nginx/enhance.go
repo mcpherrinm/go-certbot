@@ -47,6 +47,12 @@ func (p *Plugin) Enhance(ctx context.Context, cfg *config.Config, domains []stri
 				// Certbot's behavior when --uir is passed without --apache.
 			case plugins.EnhanceStaple:
 				addStaple(srv)
+			case plugins.EnhanceRedirect:
+				// nginx redirect: for each matched HTTPS server, find the
+				// sibling HTTP server (by ServerName) and inject an
+				// `if ($host = X) { return 301 ... }` block. Reuses the
+				// Install-time helper.
+				ensureRedirectExists([]*parsedFile{{AST: root}}, []serverHit{{Server: srv}}, domains)
 			default:
 				return fmt.Errorf("nginx: unknown enhancement %q", e)
 			}

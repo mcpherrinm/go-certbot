@@ -54,10 +54,14 @@ func (i *Input) Notify(msg string) {
 	fmt.Fprintln(i.Out, msg)
 }
 
-// Email prompts for an email address until the user supplies a non-empty
-// string. Matches `display_ops.get_email`. Empty replies are rejected.
+// Email prompts for an email address. Matches Certbot's
+// `display_ops.get_email`: a blank reply is returned to the caller so
+// register can decide whether to switch to unsafely-without-email mode.
+// A single retry on a blank line is permitted (the first blank prints a
+// hint, the second blank returns "").
 func (i *Input) Email(prompt string) string {
 	scanner := bufio.NewScanner(i.In)
+	blanks := 0
 	for {
 		fmt.Fprint(i.Out, prompt+" ")
 		if !scanner.Scan() {
@@ -67,7 +71,11 @@ func (i *Input) Email(prompt string) string {
 		if s != "" {
 			return s
 		}
-		fmt.Fprintln(i.Out, "(an email address is required)")
+		blanks++
+		if blanks >= 1 {
+			return ""
+		}
+		fmt.Fprintln(i.Out, "(blank skips email; press Enter again to confirm)")
 	}
 }
 

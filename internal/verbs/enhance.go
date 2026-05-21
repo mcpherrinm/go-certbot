@@ -18,8 +18,9 @@ import (
 // unless -d is supplied. --installer (or --nginx / --apache) picks the
 // plugin; falls back to whatever installer the renewal conf recorded.
 func Enhance(ctx context.Context, cfg *config.Config, reg *plugins.Registry) error {
-	if !cfg.HSTS && !cfg.UIR && !cfg.Staple {
-		return errors.New("enhance: select at least one of --hsts / --uir / --staple")
+	wantsRedirect := cfg.Redirect != nil && *cfg.Redirect
+	if !cfg.HSTS && !cfg.UIR && !cfg.Staple && !wantsRedirect {
+		return errors.New("enhance: select at least one of --hsts / --uir / --staple-ocsp / --redirect")
 	}
 
 	domains := cfg.Domains
@@ -74,6 +75,9 @@ func Enhance(ctx context.Context, cfg *config.Config, reg *plugins.Registry) err
 	}
 	if cfg.Staple {
 		asks = append(asks, plugins.EnhanceStaple)
+	}
+	if wantsRedirect {
+		asks = append(asks, plugins.EnhanceRedirect)
 	}
 	if err := enhancer.Enhance(ctx, cfg, domains, asks); err != nil {
 		return err

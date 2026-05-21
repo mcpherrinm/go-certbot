@@ -63,10 +63,18 @@ func Reconfigure(_ context.Context, cfg *config.Config, reg *plugins.Registry) e
 	}
 	changed := 0
 	for _, s := range all {
-		if cfg.SetByUser(s.flag) {
-			f.SetParam(s.key, s.encode(cfg))
-			changed++
+		if !cfg.SetByUser(s.flag) {
+			continue
 		}
+		v := s.encode(cfg)
+		if v == "" {
+			// User explicitly cleared the value (e.g. `--deploy-hook ""`);
+			// remove the key from the conf rather than leaving an empty stub.
+			f.DeleteParam(s.key)
+		} else {
+			f.SetParam(s.key, v)
+		}
+		changed++
 	}
 	if changed == 0 {
 		fmt.Println("reconfigure: nothing to update (no overriding flags provided)")

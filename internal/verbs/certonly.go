@@ -131,10 +131,8 @@ func Certonly(ctx context.Context, cfg *config.Config, reg *plugins.Registry) er
 	}
 
 	// EFF subscription (only for fresh accounts, only if user opted in).
-	if cfg.EFFEmailExplicit && cfg.Email != "" && !cfg.DryRun {
-		if err := eff.Subscribe(ctx, cfg.Email); err != nil {
-			slog.Warn("EFF subscribe failed", "err", err)
-		}
+	if !cfg.DryRun && eff.Decide(cfg) {
+		_ = eff.Subscribe(ctx, cfg.Email)
 	}
 	return nil
 }
