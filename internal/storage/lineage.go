@@ -156,8 +156,20 @@ func Write(configDir, certName string, fullchainPEM, chainPEM, privkeyPEM []byte
 	if err := writeFile(arc.Fullchain, fullchainPEM, 0o644); err != nil {
 		return nil, err
 	}
-	if err := writeFile(arc.Privkey, privkeyPEM, 0o600); err != nil {
+	// Compute privkey mode + owner from the prior archive version, if any.
+	// Mirrors certbot.compat.filesystem.compute_private_key_mode +
+	// copy_ownership_and_apply_mode (storage.py:1191-1196): mode is
+	// 0600 | (prior_mode & (S_IRGRP|S_IWGRP|S_IXGRP|S_IROTH)) so a user
+	// who chmodded an earlier key to add group-read keeps that bit
+	// across renewals, and gid is propagated.
+	privMode, copyFrom := computePrivkeyMode(configDir, certName, version)
+	if err := writeFile(arc.Privkey, privkeyPEM, privMode); err != nil {
 		return nil, err
+	}
+	if copyFrom != "" {
+		if err := copyGroupOwnership(copyFrom, arc.Privkey); err != nil {
+			return nil, err
+		}
 	}
 
 	liveFiles := liveSet(configDir, certName)
@@ -288,6 +300,29 @@ func writeLiveTopReadme(configDir string) error {
 		"Each subdirectory contains four symlinks pointing into archive/. Do not\n" +
 		"move or delete the files in here; they are managed by certbot.\n"
 	return writeFile(path, []byte(body), 0o644)
+}
+
+// computePrivkeyMode returns the file mode + path of the prior version's
+// privkey to copy gid from. If there's no prior privkey (initial issuance)
+// it returns the base 0o600 mode and "". Mirrors
+// certbot.compat.filesystem.compute_private_key_mode (filesystem.py:449):
+// preserve user-set group/other read+write+execute bits on the previous
+// privkey across renewals.
+func computePrivkeyMode(configDir, certName string, newVersion int) (os.FileMode, string) {
+	if newVersion <= 1 {
+		return 0o600, ""
+	}
+	prior := archiveSet(configDir, certName, newVersion-1)
+	info, err := os.Stat(prior.Privkey)
+	if err != nil {
+		return 0o600, ""
+	}
+	const mask os.FileMode = 0o077 // S_IRWXG | S_IROTH | S_IWOTH | S_IXOTH
+	// Certbot's mask is narrower: 0o074 = S_IRGRP|S_IWGRP|S_IXGRP|S_IROTH.
+	// We use that exact mask to round-trip.
+	const certbotMask os.FileMode = 0o074
+	_ = mask
+	return 0o600 | (info.Mode().Perm() & certbotMask), prior.Privkey
 }
 
 func writeFile(path string, data []byte, mode os.FileMode) error {

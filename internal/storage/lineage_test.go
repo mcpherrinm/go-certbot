@@ -93,3 +93,36 @@ func TestWriteIncrementsVersion(t *testing.T) {
 		t.Errorf("live link points at %q, expected cert2.pem", target)
 	}
 }
+
+// TestWritePropagatesPrivkeyMode mirrors certbot integration test
+// test_renew_files_propagate_permissions: when a user chmods their
+// privkey to add a group/other read bit, the next renewal must keep
+// that bit.
+func TestWritePropagatesPrivkeyMode(t *testing.T) {
+	if testing.Short() {
+		t.Skip("filesystem perms test")
+	}
+	dir := t.TempDir()
+	full, chain, key := makePEMChain(t)
+	if _, err := Write(dir, "x", full, chain, key, WriteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	priv1 := filepath.Join(dir, "archive", "x", "privkey1.pem")
+	// User chmods their privkey to add group-read + other-read.
+	if err := os.Chmod(priv1, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Write(dir, "x", full, chain, key, WriteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	priv2 := filepath.Join(dir, "archive", "x", "privkey2.pem")
+	st, err := os.Stat(priv2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 0o644 has bits 0o044 in the certbotMask (S_IRGRP|S_IROTH).
+	// Result: 0o600 | 0o044 = 0o644.
+	if got := st.Mode().Perm(); got != 0o644 {
+		t.Errorf("renewed privkey perm: got %o want 0644 (propagated from prior)", got)
+	}
+}
