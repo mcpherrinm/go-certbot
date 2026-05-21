@@ -38,7 +38,7 @@ func (a *Authenticator) Prepare(_ context.Context, cfg *config.Config, _ []strin
 	_ = cred.SetEnv("application_key", "OVH_APPLICATION_KEY")
 	_ = cred.SetEnv("application_secret", "OVH_APPLICATION_SECRET")
 	_ = cred.SetEnv("consumer_key", "OVH_CONSUMER_KEY")
-	common.PropagationEnv("OVH_", common.PropagationFor(cfg, "ovh"))
+	common.PropagationEnv("OVH_", common.PropagationFor(cfg, "ovh", 120))
 	p, err := ovh.NewDNSProvider()
 	if err != nil {
 		return 0, nil, fmt.Errorf("ovh: %w", err)

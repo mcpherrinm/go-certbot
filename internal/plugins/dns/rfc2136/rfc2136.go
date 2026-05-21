@@ -14,6 +14,7 @@ package rfc2136
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"strings"
 
@@ -24,6 +25,18 @@ import (
 	"github.com/letsencrypt/go-certbot/internal/plugins"
 	"github.com/letsencrypt/go-certbot/internal/plugins/dns/common"
 )
+
+// Algorithms accepted by certbot-dns-rfc2136 (uppercase, no trailing dot).
+// Matches certbot-dns-rfc2136 ALGORITHMS table; rejecting unknown values here
+// surfaces the typo at preflight rather than mid-update.
+var acceptedAlgorithms = map[string]struct{}{
+	"HMAC-MD5":    {},
+	"HMAC-SHA1":   {},
+	"HMAC-SHA224": {},
+	"HMAC-SHA256": {},
+	"HMAC-SHA384": {},
+	"HMAC-SHA512": {},
+}
 
 type Authenticator struct{}
 
@@ -41,8 +54,18 @@ func (a *Authenticator) Prepare(_ context.Context, cfg *config.Config, _ []strin
 		return 0, nil, err
 	}
 	server := cred.Get("server")
+	if net.ParseIP(server) == nil {
+		return 0, nil, fmt.Errorf(
+			"The configured target DNS server (%s) is not a valid IPv4 or IPv6 address. A hostname is not allowed.",
+			server)
+	}
 	if port := cred.Get("port"); port != "" {
 		server += ":" + port
+	}
+	if alg := cred.Get("algorithm"); alg != "" {
+		if _, ok := acceptedAlgorithms[strings.ToUpper(alg)]; !ok {
+			return 0, nil, fmt.Errorf("Unknown algorithm: %s.", alg)
+		}
 	}
 	_ = os.Setenv("DNSUPDATE_NAMESERVER", server)
 	_ = cred.SetEnv("name", "DNSUPDATE_TSIG_KEY")
@@ -53,7 +76,7 @@ func (a *Authenticator) Prepare(_ context.Context, cfg *config.Config, _ []strin
 	if alg := cred.Get("algorithm"); alg != "" {
 		_ = os.Setenv("DNSUPDATE_TSIG_ALGORITHM", normalizeTSIGAlg(alg))
 	}
-	common.PropagationEnv("DNSUPDATE_", common.PropagationFor(cfg, "rfc2136"))
+	common.PropagationEnv("DNSUPDATE_", common.PropagationFor(cfg, "rfc2136", 60))
 	p, err := dnsupdate.NewDNSProvider()
 	if err != nil {
 		return 0, nil, fmt.Errorf("rfc2136: %w", err)

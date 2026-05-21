@@ -47,7 +47,7 @@ func (a *Authenticator) Prepare(_ context.Context, cfg *config.Config, _ []strin
 		fmt.Fprintln(os.Stderr,
 			"dns-route53: no --dns-route53-credentials and no AWS_ACCESS_KEY_ID set; relying on the AWS SDK credential chain (instance role / shared config / SSO).")
 	}
-	common.PropagationEnv("AWS_", common.PropagationFor(cfg, "route53"))
+	common.PropagationEnv("AWS_", common.PropagationFor(cfg, "route53", 10))
 	p, err := route53.NewDNSProvider()
 	if err != nil {
 		return 0, nil, fmt.Errorf("route53: %w", err)

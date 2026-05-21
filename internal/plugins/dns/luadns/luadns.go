@@ -34,7 +34,7 @@ func (a *Authenticator) Prepare(_ context.Context, cfg *config.Config, _ []strin
 	}
 	_ = cred.SetEnv("email", "LUADNS_API_USERNAME")
 	_ = cred.SetEnv("token", "LUADNS_API_TOKEN")
-	common.PropagationEnv("LUADNS_", common.PropagationFor(cfg, "luadns"))
+	common.PropagationEnv("LUADNS_", common.PropagationFor(cfg, "luadns", 30))
 	p, err := luadns.NewDNSProvider()
 	if err != nil {
 		return 0, nil, fmt.Errorf("luadns: %w", err)

@@ -32,7 +32,7 @@ func (a *Authenticator) Prepare(_ context.Context, cfg *config.Config, _ []strin
 		return 0, nil, err
 	}
 	_ = cred.SetEnv("token", "DO_AUTH_TOKEN")
-	common.PropagationEnv("DO_", common.PropagationFor(cfg, "digitalocean"))
+	common.PropagationEnv("DO_", common.PropagationFor(cfg, "digitalocean", 10))
 	p, err := digitalocean.NewDNSProvider()
 	if err != nil {
 		return 0, nil, fmt.Errorf("digitalocean: %w", err)

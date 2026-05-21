@@ -88,8 +88,40 @@ func TestRoundTrip(t *testing.T) {
 	if !reflect.DeepEqual(got.Top, f.Top) {
 		t.Errorf("top differs:\n  got %v\n want %v", got.Top, f.Top)
 	}
-	if !reflect.DeepEqual(got.RenewalParams, f.RenewalParams) {
-		t.Errorf("params differ:\n  got %v\n want %v", got.RenewalParams, f.RenewalParams)
+	// Compare semantically: scalars equal, lists equal (configobj normalizes
+	// list separators on write, so the raw map value is allowed to differ).
+	wantDomains, _ := f.List("domains")
+	gotDomains, _ := got.List("domains")
+	if !reflect.DeepEqual(wantDomains, gotDomains) {
+		t.Errorf("domains differ:\n  got %v\n want %v", gotDomains, wantDomains)
+	}
+	for k := range f.RenewalParams {
+		if k == "domains" {
+			continue
+		}
+		if got.RenewalParams[k] != f.RenewalParams[k] {
+			t.Errorf("param %s differs: got %q want %q", k, got.RenewalParams[k], f.RenewalParams[k])
+		}
+	}
+}
+
+func TestFormatValueListSemantics(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"", ""},
+		{"plain", "plain"},
+		{"a=b", "a=b"},   // bare = is fine for configobj
+		{"a.com,b.com", "a.com, b.com"},
+		{"a.com,", "a.com,"}, // single-element keeps trailing comma
+		{"a.com, b.com,c.com", "a.com, b.com, c.com"},
+		{"foo bar", "foo bar"}, // internal space allowed bare
+		{"\"already quoted\"", "\"already quoted\""},
+		{"'sq'", "'sq'"},
+		{"has#hash", "\"has#hash\""},
+		{" leading", "\" leading\""},
+	} {
+		if got := formatValue(tc.in); got != tc.want {
+			t.Errorf("formatValue(%q) = %q, want %q", tc.in, got, tc.want)
+		}
 	}
 }
 

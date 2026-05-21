@@ -34,7 +34,7 @@ func (a *Authenticator) Prepare(_ context.Context, cfg *config.Config, _ []strin
 	}
 	_ = cred.SetEnv("api_key", "DNSMADEEASY_API_KEY")
 	_ = cred.SetEnv("secret_key", "DNSMADEEASY_API_SECRET")
-	common.PropagationEnv("DNSMADEEASY_", common.PropagationFor(cfg, "dnsmadeeasy"))
+	common.PropagationEnv("DNSMADEEASY_", common.PropagationFor(cfg, "dnsmadeeasy", 60))
 	p, err := dnsmadeeasy.NewDNSProvider()
 	if err != nil {
 		return 0, nil, fmt.Errorf("dnsmadeeasy: %w", err)

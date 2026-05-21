@@ -30,7 +30,7 @@ func (a *Authenticator) Prepare(_ context.Context, cfg *config.Config, _ []strin
 		return 0, nil, err
 	}
 	_ = cred.SetEnv("key", "LINODE_TOKEN")
-	common.PropagationEnv("LINODE_", common.PropagationFor(cfg, "linode"))
+	common.PropagationEnv("LINODE_", common.PropagationFor(cfg, "linode", 120))
 	p, err := linode.NewDNSProvider()
 	if err != nil {
 		return 0, nil, fmt.Errorf("linode: %w", err)

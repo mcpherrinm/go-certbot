@@ -36,7 +36,7 @@ func (a *Authenticator) Prepare(_ context.Context, cfg *config.Config, _ []strin
 	// (not API_TOKEN / API_SECRET). See lego providers/dns/gehirn/gehirn.go:23-24.
 	_ = cred.SetEnv("api_token", "GEHIRN_TOKEN_ID")
 	_ = cred.SetEnv("api_secret", "GEHIRN_TOKEN_SECRET")
-	common.PropagationEnv("GEHIRN_", common.PropagationFor(cfg, "gehirn"))
+	common.PropagationEnv("GEHIRN_", common.PropagationFor(cfg, "gehirn", 30))
 	p, err := gehirn.NewDNSProvider()
 	if err != nil {
 		return 0, nil, fmt.Errorf("gehirn: %w", err)

@@ -30,7 +30,7 @@ func (a *Authenticator) Prepare(_ context.Context, cfg *config.Config, _ []strin
 		return 0, nil, err
 	}
 	_ = cred.SetEnv("token", "DNSIMPLE_OAUTH_TOKEN")
-	common.PropagationEnv("DNSIMPLE_", common.PropagationFor(cfg, "dnsimple"))
+	common.PropagationEnv("DNSIMPLE_", common.PropagationFor(cfg, "dnsimple", 30))
 	p, err := dnsimple.NewDNSProvider()
 	if err != nil {
 		return 0, nil, fmt.Errorf("dnsimple: %w", err)

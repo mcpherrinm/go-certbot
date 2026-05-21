@@ -42,7 +42,7 @@ func (a *Authenticator) Prepare(_ context.Context, cfg *config.Config, _ []strin
 		}
 		_ = os.Setenv("GOOGLE_APPLICATION_CREDENTIALS", path)
 	}
-	common.PropagationEnv("GCE_", common.PropagationFor(cfg, "google"))
+	common.PropagationEnv("GCE_", common.PropagationFor(cfg, "google", 60))
 	p, err := gcloud.NewDNSProvider()
 	if err != nil {
 		return 0, nil, fmt.Errorf("dns-google: %w", err)
