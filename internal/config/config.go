@@ -64,11 +64,18 @@ type Config struct {
 	ReuseKey           bool
 	NewKey             bool
 	AllowSubsetOfNames bool
-	CSR                string
-	CertPath           string // existing fullchain PEM, e.g. for --revoke / --install
-	KeyPath            string // private key, e.g. for --install or --revoke --key-path
-	Reason             string // revocation reason word
-	DeleteAfterRevoke  bool
+	// CSR holds the --csr argument as both the absolute path the user
+	// supplied and the file's contents read at flag-set time. Mirrors
+	// Certbot's argparse type=read_file: ``config.csr = (path, contents)``
+	// (cli/subparsers.py:34-37; helpful.py:332-355 consumes `config.csr[0:2]`).
+	CSR      CSRArg
+	CertPath string // existing fullchain PEM, e.g. for --revoke / --install
+	KeyPath  string // private key, e.g. for --install or --revoke --key-path
+	// Reason is the revocation reason as a Certbot REVOCATION_REASONS int
+	// (0=unspecified, 1=keyCompromise, 3=affiliationChanged, 4=superseded,
+	// 5=cessationOfOperation). Defaults to 0 to match constants.py:94.
+	Reason            int
+	DeleteAfterRevoke bool
 
 	// Plugin selection
 	Authenticator string
@@ -77,13 +84,11 @@ type Config struct {
 	Apache        bool
 	Nginx         bool
 	// Nginx-specific
-	NginxConfig         string // explicit nginx.conf path; overrides NginxServerRoot
-	NginxServerRoot     string // /etc/nginx default
-	NginxCtl            string // nginx binary (default "nginx")
-	NginxSleepSeconds   int    // sleep after reload; default 1
-	Redirect        *bool  // tri-state: nil = ask/auto, true = add 301, false = skip
+	NginxServerRoot   string // /etc/nginx default
+	NginxCtl          string // nginx binary (default "nginx")
+	NginxSleepSeconds int    // sleep after reload; default 1
+	Redirect          *bool  // tri-state: nil = ask/auto, true = add 301, false = skip
 	// Apache-specific
-	ApacheConfig            string // explicit apache2.conf path; overrides ApacheServerRoot
 	ApacheServerRoot        string // /etc/apache2 default
 	ApacheCtl               string // apachectl binary (default "apachectl")
 	ApacheBin               string // override for `httpd` binary; falls back to ApacheCtl
@@ -101,11 +106,16 @@ type Config struct {
 	UIR    bool
 	Staple bool
 
+	// RenewBeforeExpiry holds the user-set --renew-before-expiry interval
+	// (e.g. "30 days", "1 week"). Stored as Certbot's free-form string so
+	// renew can round-trip it through renewal.conf without loss.
+	RenewBeforeExpiry string
+
 	// Rollback
 	RollbackCheckpoints int
-	Standalone    bool
-	Webroot       bool
-	WebrootPath   []string
+	Standalone          bool
+	Webroot             bool
+	WebrootPath         []string
 	// WebrootMap is the resolved domain → webroot path map. Built before
 	// pflag parsing from the `-w`/`-d` interleaving order in os.Args; mirrors
 	// Certbot's _WebrootPathProcessor. Persisted under [[webroot_map]] in the
@@ -136,12 +146,12 @@ type Config struct {
 	Verbose          int
 
 	// Hooks
-	PreHook            string
-	PostHook           string
-	DeployHook         string
-	DisableHookValidation bool
-	ManualAuthHook     string
-	ManualCleanupHook  string
+	PreHook                 string
+	PostHook                string
+	DeployHook              string
+	DisableHookValidation   bool
+	ManualAuthHook          string
+	ManualCleanupHook       string
 	ManualPublicIPLoggingOK bool
 
 	// User agent
@@ -171,12 +181,12 @@ type Config struct {
 	FullchainPath string // --fullchain-path
 
 	// `certificates`, `delete`, `revoke` numeric controls.
-	Num                int
-	BreakMyCerts       bool
-	ReinstallExisting  bool
+	Num                 int
+	BreakMyCerts        bool
+	ReinstallExisting   bool
 	RenewWithNewDomains bool
-	RunDeployHooks     bool
-	AutoHSTS           bool
+	RunDeployHooks      bool
+	AutoHSTS            bool
 	DisableRenewUpdates bool
 
 	// Three-state defaults-True flags (`--no-X` flips them off). Stored as
@@ -192,11 +202,11 @@ type Config struct {
 	PluginIfaces   []string // --authenticators / --installers selector
 
 	// Logging.
-	VerboseLevel      string
-	TextMode          bool
-	MaxLogBackups     int
+	VerboseLevel       string
+	TextMode           bool
+	MaxLogBackups      int
 	PreconfiguredRenew bool
-	DebugChallenges   bool
+	DebugChallenges    bool
 
 	// Sources tracks which fields were user-set, for renewal merge logic.
 	Sources map[string]ArgumentSource
@@ -225,6 +235,7 @@ func NewDefault() *Config {
 		DirectoryHooks:        true,
 		Autorenew:             true,
 		ValidateHooks:         true,
+		RollbackCheckpoints:   1, // matches Certbot constants.py:96
 		AuthCertPath:          "./cert.pem",
 		AuthChainPath:         "./chain.pem",
 		Sources:               map[string]ArgumentSource{},
@@ -232,6 +243,14 @@ func NewDefault() *Config {
 		DNSCredentials:        map[string]string{},
 		DNSPropagationSeconds: map[string]int{},
 	}
+}
+
+// CSRArg holds the (path, contents) tuple Certbot stores in config.csr.
+// Both fields are populated at flag-set time; Path stays empty when --csr
+// wasn't passed.
+type CSRArg struct {
+	Path     string
+	Contents []byte
 }
 
 // MarkSet records that a field was set by the named source.

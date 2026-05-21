@@ -27,12 +27,12 @@ func loadIni(path string, fs *pflag.FlagSet, c *config.Config) error {
 		return fmt.Errorf("cli.ini: read %s: %w", path, err)
 	}
 	cfg, err := ini.LoadSources(ini.LoadOptions{
-		Loose:                       false,
-		Insensitive:                 false,
-		IgnoreInlineComment:         false,
-		AllowBooleanKeys:            true,
-		SpaceBeforeInlineComment:    true,
-		KeyValueDelimiters:          "=",
+		Loose:                    false,
+		Insensitive:              false,
+		IgnoreInlineComment:      false,
+		AllowBooleanKeys:         true,
+		SpaceBeforeInlineComment: true,
+		KeyValueDelimiters:       "=",
 	}, b)
 	if err != nil {
 		return fmt.Errorf("cli.ini: parse %s: %w", path, err)

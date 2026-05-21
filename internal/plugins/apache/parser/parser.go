@@ -39,7 +39,7 @@ func (c *Config) String() string {
 
 // Directive is a single line: indent + name + args + trailing.
 type Directive struct {
-	Indent          string   // leading whitespace
+	Indent          string // leading whitespace
 	Name            string
 	Args            []string // already-cleaned arg tokens (quoted strings keep quotes)
 	TrailingComment string   // including leading space and '#'; empty if none
@@ -63,15 +63,15 @@ func (d *Directive) emit(sb *strings.Builder) {
 // Section is `<Name attrs>...</Name>`. The closing tag is regenerated using
 // Name verbatim; whitespace around it is preserved.
 type Section struct {
-	OpenIndent      string
-	Name            string   // VirtualHost, Directory, Location, IfModule, ...
-	Args            []string
-	OpenTrailing    string   // trailing comment after '>'; empty if none
-	OpenNewline     string   // "\n" after the open tag
-	Body            []Node
-	CloseIndent     string
-	CloseTrailing   string
-	CloseNewline    string
+	OpenIndent    string
+	Name          string // VirtualHost, Directory, Location, IfModule, ...
+	Args          []string
+	OpenTrailing  string // trailing comment after '>'; empty if none
+	OpenNewline   string // "\n" after the open tag
+	Body          []Node
+	CloseIndent   string
+	CloseTrailing string
+	CloseNewline  string
 }
 
 func (s *Section) isNode() {}

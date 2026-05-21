@@ -25,8 +25,10 @@ type Authenticator struct{}
 
 func New() *Authenticator { return &Authenticator{} }
 
-func (a *Authenticator) Name() string        { return "dns-cloudflare" }
-func (a *Authenticator) Description() string { return "Obtain certificates using a DNS TXT record via the Cloudflare API." }
+func (a *Authenticator) Name() string { return "dns-cloudflare" }
+func (a *Authenticator) Description() string {
+	return "Obtain certificates using a DNS TXT record via the Cloudflare API."
+}
 func (a *Authenticator) Cleanup(_ context.Context) error { return nil }
 
 func (a *Authenticator) Prepare(_ context.Context, cfg *config.Config, _ []string) (plugins.ChallengeKind, challenge.Provider, error) {
@@ -50,7 +52,7 @@ func (a *Authenticator) Prepare(_ context.Context, cfg *config.Config, _ []strin
 		_ = cred.SetEnv("email", "CLOUDFLARE_EMAIL")
 		_ = cred.SetEnv("api_key", "CLOUDFLARE_API_KEY")
 	}
-	common.PropagationEnv("CLOUDFLARE_", common.PropagationFor(cfg, "cloudflare"))
+	common.PropagationEnv("CLOUDFLARE_", common.PropagationFor(cfg, "cloudflare", 10))
 	p, err := cloudflare.NewDNSProvider()
 	if err != nil {
 		return 0, nil, fmt.Errorf("cloudflare: %w", err)

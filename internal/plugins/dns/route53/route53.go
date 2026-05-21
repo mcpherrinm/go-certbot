@@ -26,10 +26,12 @@ import (
 
 type Authenticator struct{}
 
-func New() *Authenticator                                 { return &Authenticator{} }
-func (a *Authenticator) Name() string                     { return "dns-route53" }
-func (a *Authenticator) Description() string              { return "Obtain certificates using a DNS TXT record via AWS Route 53." }
-func (a *Authenticator) Cleanup(_ context.Context) error  { return nil }
+func New() *Authenticator             { return &Authenticator{} }
+func (a *Authenticator) Name() string { return "dns-route53" }
+func (a *Authenticator) Description() string {
+	return "Obtain certificates using a DNS TXT record via AWS Route 53."
+}
+func (a *Authenticator) Cleanup(_ context.Context) error { return nil }
 
 func (a *Authenticator) Prepare(_ context.Context, cfg *config.Config, _ []string) (plugins.ChallengeKind, challenge.Provider, error) {
 	if path := common.CredentialsFor(cfg, "route53"); path != "" {
@@ -47,7 +49,7 @@ func (a *Authenticator) Prepare(_ context.Context, cfg *config.Config, _ []strin
 		fmt.Fprintln(os.Stderr,
 			"dns-route53: no --dns-route53-credentials and no AWS_ACCESS_KEY_ID set; relying on the AWS SDK credential chain (instance role / shared config / SSO).")
 	}
-	common.PropagationEnv("AWS_", common.PropagationFor(cfg, "route53"))
+	common.PropagationEnv("AWS_", common.PropagationFor(cfg, "route53", 10))
 	p, err := route53.NewDNSProvider()
 	if err != nil {
 		return 0, nil, fmt.Errorf("route53: %w", err)

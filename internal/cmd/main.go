@@ -17,9 +17,10 @@ import (
 
 	"github.com/letsencrypt/go-certbot/internal/checkpoint"
 	"github.com/letsencrypt/go-certbot/internal/config"
+	"github.com/letsencrypt/go-certbot/internal/errorhandler"
 	"github.com/letsencrypt/go-certbot/internal/logfile"
 	"github.com/letsencrypt/go-certbot/internal/plugins"
-	"github.com/letsencrypt/go-certbot/internal/processlock"
+	"github.com/letsencrypt/go-certbot/internal/plugins/apache"
 	dnscloudflare "github.com/letsencrypt/go-certbot/internal/plugins/dns/cloudflare"
 	dnsdigitalocean "github.com/letsencrypt/go-certbot/internal/plugins/dns/digitalocean"
 	dnsdnsimple "github.com/letsencrypt/go-certbot/internal/plugins/dns/dnsimple"
@@ -33,21 +34,46 @@ import (
 	dnsrfc2136 "github.com/letsencrypt/go-certbot/internal/plugins/dns/rfc2136"
 	dnsroute53 "github.com/letsencrypt/go-certbot/internal/plugins/dns/route53"
 	dnssakuracloud "github.com/letsencrypt/go-certbot/internal/plugins/dns/sakuracloud"
-	"github.com/letsencrypt/go-certbot/internal/plugins/apache"
 	"github.com/letsencrypt/go-certbot/internal/plugins/manual"
 	"github.com/letsencrypt/go-certbot/internal/plugins/nginx"
 	"github.com/letsencrypt/go-certbot/internal/plugins/standalone"
 	"github.com/letsencrypt/go-certbot/internal/plugins/webroot"
+	"github.com/letsencrypt/go-certbot/internal/processlock"
 	"github.com/letsencrypt/go-certbot/internal/verbs"
 )
 
+// exitWithAdvice mirrors Certbot's standard crash advice line
+// (log.py:387-403). Printed on uncaught panic + visible to the user
+// alongside the file containing the stack trace.
+const exitWithAdvice = "Ask for help or search for solutions at https://community.letsencrypt.org. See the logfile %s or re-run Certbot with -v for more details."
+
 // Main runs the CLI with the given args (omit os.Args[0]). Returns the
 // process exit code.
-func Main(args []string) int {
+func Main(args []string) (rc int) {
+	// Top-level panic recovery: dump the stack to the log file (or
+	// stderr if the log isn't open yet) and print Certbot's
+	// exit_with_advice line. The recovered process exits 1 like
+	// Certbot does on an uncaught exception (log.py:362-364).
+	defer func() {
+		if r := recover(); r != nil {
+			errorhandler.RunAll()
+			logPath := logfile.LastPath()
+			if logPath == "" {
+				logPath = "(no log file)"
+			}
+			fmt.Fprintf(os.Stderr, "An unexpected error occurred: %v\n", r)
+			fmt.Fprintf(os.Stderr, exitWithAdvice+"\n", logPath)
+			logfile.WriteCrashTrace(fmt.Sprint(r))
+			rc = 1
+		}
+	}()
 	// `--version` always prints and exits.
 	for _, a := range args {
 		if a == "--version" {
-			fmt.Println("go-certbot 1.4.0")
+			// Print "certbot X.Y.Z" so shell snippets like
+			// `certbot --version | awk '{print $2}'` parse correctly
+			// across both implementations.
+			fmt.Println("certbot 1.4.0")
 			return 0
 		}
 	}
@@ -145,6 +171,12 @@ func Main(args []string) int {
 	}
 	defer locks.Release()
 
+	// Roll back any in-progress checkpoint left over by a crashed earlier
+	// run. Matches Certbot's Reverter.recovery_routine (reverter.py:80-104).
+	if err := checkpoint.RecoverInterrupted(cfg.WorkDir); err != nil {
+		fmt.Fprintln(os.Stderr, "go-certbot: warning: failed to recover interrupted checkpoint:", err)
+	}
+
 	reg := plugins.NewRegistry()
 	reg.RegisterAuthenticator(standalone.New())
 	reg.RegisterAuthenticator(webroot.New())
@@ -173,11 +205,11 @@ func Main(args []string) int {
 	defer cancel()
 
 	// Background goroutine: when ctx is cancelled by SIGINT/SIGTERM (NOT
-	// by the deferred cancel() on normal exit), restore any in-flight
-	// checkpoint and print Certbot's exit message. The handlerDone signal
-	// lets us tell the two apart: if the handler has already finished
-	// when ctx.Done() fires, the cancel was the deferred one and we
-	// shouldn't act.
+	// by the deferred cancel() on normal exit), walk the LIFO cleanup
+	// stack, restore any in-flight checkpoint, then print Certbot's exit
+	// message. We exit 1 to match certbot's signal-exit convention
+	// (log.py:362-364 — sys.exit('Exiting due to user request.'), which
+	// produces exit code 1, NOT bash's 128+SIGINT=130).
 	handlerDone := make(chan struct{})
 	sigFired := make(chan struct{})
 	go func() {
@@ -188,17 +220,19 @@ func Main(args []string) int {
 			return
 		default:
 		}
-		if err := checkpoint.RestoreInFlight(); err == nil {
-			fmt.Fprintln(os.Stderr, "Exiting due to user request.")
-		} else {
+		errorhandler.RunAll()
+		if err := checkpoint.RestoreInFlight(); err != nil {
 			fmt.Fprintln(os.Stderr, "Exiting due to user request (warning: in-flight checkpoint rollback failed:", err, ")")
+		} else {
+			fmt.Fprintln(os.Stderr, "Exiting due to user request.")
 		}
 		close(sigFired)
-		// Give the active handler a moment to wrap up, then force-exit
-		// so we don't hang on a misbehaving plugin.
+		// Brief grace period for the active handler to wrap up.
+		// Re-raise the signal at end so the process exits with the
+		// standard handler termination rather than forced os.Exit.
 		go func() {
 			time.Sleep(5 * time.Second)
-			os.Exit(130)
+			_ = syscall.Kill(os.Getpid(), syscall.SIGTERM)
 		}()
 	}()
 
@@ -217,7 +251,7 @@ func Main(args []string) int {
 		// message; suppress the handler error.
 		select {
 		case <-sigFired:
-			return 130
+			return 1
 		default:
 		}
 		fmt.Fprintln(os.Stderr, "go-certbot:", err)
@@ -262,18 +296,42 @@ func dispatch(verb string) func(context.Context, *config.Config, *plugins.Regist
 	return nil
 }
 
-// extractVerb pulls the leading positional subcommand (if any) from args.
-// Returns ("", args) if the first arg is a flag or args is empty (which
-// matches Certbot's "run" default).
+// verbSet enumerates every subcommand we know how to dispatch. Used by
+// extractVerb to scan ALL of argv (not just position 0) for a verb token,
+// matching Certbot's HelpfulArgumentParser.add_verbs flow (helpful.py:369-378)
+// which pops the first verb-shaped token from anywhere on the command line.
+var verbSet = map[string]struct{}{
+	"run": {}, "everything": {},
+	"certonly": {}, "auth": {},
+	"renew": {}, "certificates": {},
+	"delete": {}, "revoke": {},
+	"register": {}, "unregister": {},
+	"update_account": {}, "show_account": {},
+	"install": {}, "enhance": {},
+	"rollback": {}, "plugins": {},
+	"reconfigure": {},
+}
+
+// extractVerb scans args for the first token that names a subcommand and
+// returns that verb plus args with the token removed. Returns ("", args)
+// if no verb token appears (which matches Certbot's "run" default).
 func extractVerb(args []string) (string, []string) {
-	if len(args) == 0 {
-		return "", nil
+	for i, a := range args {
+		if a == "" || a[0] == '-' {
+			continue
+		}
+		if _, ok := verbSet[a]; !ok {
+			continue
+		}
+		// Normalize the legacy aliases (auth → certonly, everything → run)
+		// at the call site? No — dispatch() handles them. We just need to
+		// remove the token from the slice the FlagSet will see.
+		rest := make([]string, 0, len(args)-1)
+		rest = append(rest, args[:i]...)
+		rest = append(rest, args[i+1:]...)
+		return a, rest
 	}
-	first := args[0]
-	if len(first) > 0 && first[0] == '-' {
-		return "", args
-	}
-	return first, args[1:]
+	return "", args
 }
 
 func printHelp(out io.Writer, topic string) {

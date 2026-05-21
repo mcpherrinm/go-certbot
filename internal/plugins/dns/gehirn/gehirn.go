@@ -19,10 +19,12 @@ import (
 
 type Authenticator struct{}
 
-func New() *Authenticator                                 { return &Authenticator{} }
-func (a *Authenticator) Name() string                     { return "dns-gehirn" }
-func (a *Authenticator) Description() string              { return "Obtain certificates using a DNS TXT record via the Gehirn DNS API." }
-func (a *Authenticator) Cleanup(_ context.Context) error  { return nil }
+func New() *Authenticator             { return &Authenticator{} }
+func (a *Authenticator) Name() string { return "dns-gehirn" }
+func (a *Authenticator) Description() string {
+	return "Obtain certificates using a DNS TXT record via the Gehirn DNS API."
+}
+func (a *Authenticator) Cleanup(_ context.Context) error { return nil }
 
 func (a *Authenticator) Prepare(_ context.Context, cfg *config.Config, _ []string) (plugins.ChallengeKind, challenge.Provider, error) {
 	cred, err := common.LoadCredentials(common.CredentialsFor(cfg, "gehirn"), "dns_gehirn")
@@ -36,7 +38,7 @@ func (a *Authenticator) Prepare(_ context.Context, cfg *config.Config, _ []strin
 	// (not API_TOKEN / API_SECRET). See lego providers/dns/gehirn/gehirn.go:23-24.
 	_ = cred.SetEnv("api_token", "GEHIRN_TOKEN_ID")
 	_ = cred.SetEnv("api_secret", "GEHIRN_TOKEN_SECRET")
-	common.PropagationEnv("GEHIRN_", common.PropagationFor(cfg, "gehirn"))
+	common.PropagationEnv("GEHIRN_", common.PropagationFor(cfg, "gehirn", 30))
 	p, err := gehirn.NewDNSProvider()
 	if err != nil {
 		return 0, nil, fmt.Errorf("gehirn: %w", err)

@@ -7,30 +7,27 @@ import (
 )
 
 // registerRedirectFlags wires the tri-state --redirect / --no-redirect pair.
-// nil = not specified (plugins should fall back to safe defaults), true =
-// always add the HTTPS redirect, false = never add it.
+// Certbot represents this as None / True / False (constants.py:67); we use a
+// *bool. The pre-parse value is nil so plugins can distinguish "user didn't
+// pick" (fall back to interactive/auto) from "user said false".
 func registerRedirectFlags(fs *pflag.FlagSet, c *config.Config) {
-	if c.Redirect == nil {
-		c.Redirect = new(bool)
-		*c.Redirect = false
-	}
-	// pflag doesn't have a clean tri-state boolean, so we register the two
-	// flags separately and read which was set via flagSet.Visit in trackSources.
-	fs.BoolVar(c.Redirect, "redirect", *c.Redirect,
-		"Add an HTTP→HTTPS redirect to managed server blocks (nginx).")
+	// Use throwaway locals for pflag binding so c.Redirect stays nil until a
+	// user explicitly picks via --redirect or --no-redirect (otherwise plugins
+	// would see *false from the unparsed default).
+	redirect := false
 	noRedirect := false
+	fs.BoolVar(&redirect, "redirect", false,
+		"Add an HTTP→HTTPS redirect to managed server blocks.")
 	fs.BoolVar(&noRedirect, "no-redirect", false,
 		"Do not add an HTTP→HTTPS redirect.")
-	// Hook to flip cfg.Redirect to false if --no-redirect was set; the
-	// post-parse trackSources runs Visit() and our hook plays follow-up.
 	c.PostParseHooks = append(c.PostParseHooks, func() {
-		if c.SetByUser("no-redirect") {
+		switch {
+		case c.SetByUser("no-redirect"):
 			b := false
 			c.Redirect = &b
-		} else if c.SetByUser("redirect") {
-			b := true
+		case c.SetByUser("redirect"):
+			b := redirect
 			c.Redirect = &b
 		}
-		_ = noRedirect
 	})
 }

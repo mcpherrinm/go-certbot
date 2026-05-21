@@ -5,6 +5,8 @@ go 1.25.0
 require (
 	github.com/go-acme/lego/v5 v5.0.4
 	github.com/spf13/pflag v1.0.10
+	golang.org/x/crypto v0.51.0
+	golang.org/x/term v0.43.0
 	gopkg.in/ini.v1 v1.67.2
 )
 
@@ -78,7 +80,6 @@ require (
 	go.opentelemetry.io/otel/metric v1.43.0 // indirect
 	go.opentelemetry.io/otel/trace v1.43.0 // indirect
 	go.uber.org/ratelimit v0.3.1 // indirect
-	golang.org/x/crypto v0.51.0 // indirect
 	golang.org/x/mod v0.35.0 // indirect
 	golang.org/x/net v0.54.0 // indirect
 	golang.org/x/oauth2 v0.36.0 // indirect

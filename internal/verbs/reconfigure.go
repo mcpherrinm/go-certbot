@@ -44,11 +44,14 @@ func Reconfigure(_ context.Context, cfg *config.Config, reg *plugins.Registry) e
 		encode    func(*config.Config) string
 	}
 	all := []setter{
+		{"authenticator", "authenticator", func(c *config.Config) string { return c.Authenticator }},
+		{"installer", "installer", func(c *config.Config) string { return c.Installer }},
 		{"key-type", "key_type", func(c *config.Config) string { return c.KeyType }},
 		{"rsa-key-size", "rsa_key_size", func(c *config.Config) string { return strconv.Itoa(c.RSAKeySize) }},
 		{"elliptic-curve", "elliptic_curve", func(c *config.Config) string { return c.EllipticCurve }},
 		{"must-staple", "must_staple", func(c *config.Config) string { return boolStr(c.MustStaple) }},
 		{"reuse-key", "reuse_key", func(c *config.Config) string { return boolStr(c.ReuseKey) }},
+		{"allow-subset-of-names", "allow_subset_of_names", func(c *config.Config) string { return boolStr(c.AllowSubsetOfNames) }},
 		{"preferred-chain", "preferred_chain", func(c *config.Config) string { return c.PreferredChain }},
 		{"preferred-profile", "preferred_profile", func(c *config.Config) string { return c.PreferredProfile }},
 		{"required-profile", "required_profile", func(c *config.Config) string { return c.RequiredProfile }},
@@ -59,7 +62,25 @@ func Reconfigure(_ context.Context, cfg *config.Config, reg *plugins.Registry) e
 		// Persist deploy-hook under the historic `renew_hook` key so older
 		// Certbot can pick it up (storage.py:512-516).
 		{"deploy-hook", "renew_hook", func(c *config.Config) string { return c.DeployHook }},
-		{"webroot-path", "webroot_path", func(c *config.Config) string { return strings.Join(c.WebrootPath, ",") + "," }},
+		{"renew-before-expiry", "renew_before_expiry", func(c *config.Config) string { return c.RenewBeforeExpiry }},
+		{"preferred-challenges", "pref_challs", func(c *config.Config) string {
+			if len(c.PreferredChallenges) == 0 {
+				return ""
+			}
+			if len(c.PreferredChallenges) == 1 {
+				return c.PreferredChallenges[0] + ","
+			}
+			return strings.Join(c.PreferredChallenges, ", ")
+		}},
+		{"webroot-path", "webroot_path", func(c *config.Config) string {
+			if len(c.WebrootPath) == 0 {
+				return ""
+			}
+			if len(c.WebrootPath) == 1 {
+				return c.WebrootPath[0] + ","
+			}
+			return strings.Join(c.WebrootPath, ", ")
+		}},
 	}
 	changed := 0
 	for _, s := range all {
@@ -73,6 +94,27 @@ func Reconfigure(_ context.Context, cfg *config.Config, reg *plugins.Registry) e
 			f.DeleteParam(s.key)
 		} else {
 			f.SetParam(s.key, v)
+		}
+		changed++
+	}
+	// DNS-prefixed flat keys: --dns-<plugin>-credentials and
+	// --dns-<plugin>-propagation-seconds. Certbot writes these flat in
+	// [renewalparams] (plugin's add_parser_arguments + dns_common.py).
+	for plugin, path := range cfg.DNSCredentials {
+		if path == "" {
+			continue
+		}
+		f.SetParam("dns_"+plugin+"_credentials", path)
+		changed++
+	}
+	for plugin, sec := range cfg.DNSPropagationSeconds {
+		f.SetParam("dns_"+plugin+"_propagation_seconds", strconv.Itoa(sec))
+		changed++
+	}
+	// --webroot-map persists as a [[webroot_map]] nested section.
+	if len(cfg.WebrootMap) > 0 {
+		for domain, path := range cfg.WebrootMap {
+			f.SetNested("webroot_map", domain, path)
 		}
 		changed++
 	}

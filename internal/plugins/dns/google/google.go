@@ -23,10 +23,12 @@ import (
 
 type Authenticator struct{}
 
-func New() *Authenticator                                 { return &Authenticator{} }
-func (a *Authenticator) Name() string                     { return "dns-google" }
-func (a *Authenticator) Description() string              { return "Obtain certificates using a DNS TXT record via the Google Cloud DNS API." }
-func (a *Authenticator) Cleanup(_ context.Context) error  { return nil }
+func New() *Authenticator             { return &Authenticator{} }
+func (a *Authenticator) Name() string { return "dns-google" }
+func (a *Authenticator) Description() string {
+	return "Obtain certificates using a DNS TXT record via the Google Cloud DNS API."
+}
+func (a *Authenticator) Cleanup(_ context.Context) error { return nil }
 
 func (a *Authenticator) Prepare(_ context.Context, cfg *config.Config, _ []string) (plugins.ChallengeKind, challenge.Provider, error) {
 	path := common.CredentialsFor(cfg, "google")
@@ -42,7 +44,7 @@ func (a *Authenticator) Prepare(_ context.Context, cfg *config.Config, _ []strin
 		}
 		_ = os.Setenv("GOOGLE_APPLICATION_CREDENTIALS", path)
 	}
-	common.PropagationEnv("GCE_", common.PropagationFor(cfg, "google"))
+	common.PropagationEnv("GCE_", common.PropagationFor(cfg, "google", 60))
 	p, err := gcloud.NewDNSProvider()
 	if err != nil {
 		return 0, nil, fmt.Errorf("dns-google: %w", err)

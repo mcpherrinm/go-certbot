@@ -14,6 +14,7 @@ import (
 	"github.com/go-acme/lego/v5/challenge/http01"
 
 	"github.com/letsencrypt/go-certbot/internal/config"
+	"github.com/letsencrypt/go-certbot/internal/display"
 	"github.com/letsencrypt/go-certbot/internal/plugins"
 )
 
@@ -39,7 +40,21 @@ func (a *Authenticator) Prepare(_ context.Context, cfg *config.Config, _ []strin
 		port = 80
 	}
 	addr := cfg.HTTP01Address
-	if err := preflightBind(addr, port); err != nil {
+	for {
+		err := preflightBind(addr, port)
+		if err == nil {
+			break
+		}
+		if isAddrInUse(err) && !cfg.NonInteractive {
+			// Certbot's standalone prompts the user to retry on
+			// EADDRINUSE (standalone.py:196-204). Default No so a
+			// non-attended terminal doesn't loop forever.
+			if display.YesNoDefault("Please stop the server using "+
+				portLabel(addr, port)+
+				" before pressing Enter, or choose Cancel. Retry?", false) {
+				continue
+			}
+		}
 		return 0, nil, err
 	}
 	a.server = http01.NewProviderServer(addr, strconv.Itoa(port))
@@ -59,16 +74,25 @@ func preflightBind(addr string, port int) error {
 	}
 	l, err := net.Listen("tcp", fmt.Sprintf("%s:%d", host, port))
 	if err != nil {
+		// Match Certbot's ASCII-only error wording so scripts grepping
+		// stderr for these phrases keep working (standalone.py:189-201).
 		if isPermission(err) {
-			return fmt.Errorf("standalone: cannot bind %s:%d — permission denied. Standalone often needs root for port 80; pass --http-01-port or run with sudo.", host, port)
+			return fmt.Errorf("standalone: could not bind TCP port %d because you don't have the appropriate permissions (for example, you aren't running this program as root).", port)
 		}
 		if isAddrInUse(err) {
-			return fmt.Errorf("standalone: cannot bind %s:%d — address already in use. Stop the running web server (or pass --apache/--nginx to use it) and retry.", host, port)
+			return fmt.Errorf("standalone: could not bind TCP port %d because it is already in use by another process on this system (such as a web server). Please stop the program in question and then try again.", port)
 		}
 		return fmt.Errorf("standalone: bind %s:%d: %w", host, port, err)
 	}
 	_ = l.Close()
 	return nil
+}
+
+func portLabel(addr string, port int) string {
+	if addr == "" {
+		return fmt.Sprintf("port %d", port)
+	}
+	return fmt.Sprintf("%s:%d", addr, port)
 }
 
 func isPermission(err error) bool {

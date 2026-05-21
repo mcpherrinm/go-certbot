@@ -205,59 +205,85 @@ func (f *File) Save(path string) error {
 		return fmt.Errorf("renewalconf: mkdir: %w", err)
 	}
 	var sb strings.Builder
-	emitKV(&sb, f.topOrder, f.Top, "")
+	emitKV(&sb, f.topOrder, f.Top)
 
-	sb.WriteString("\n# Options used in the renewal process\n[renewalparams]\n")
-	emitKV(&sb, f.paramsOrder, f.RenewalParams, "")
+	sb.WriteString("[renewalparams]\n")
+	emitKV(&sb, f.paramsOrder, f.RenewalParams)
 
-	// Nested sections inside [renewalparams].
+	// Nested sections inside [renewalparams]. configobj writes nested keys
+	// flush-left when the parent had no indent_type recorded; Certbot's
+	// freshly-emitted confs follow that convention.
 	for _, name := range f.nestedOrder {
 		fmt.Fprintf(&sb, "[[%s]]\n", name)
-		emitKV(&sb, f.keyOrder["nested:"+name], f.Nested[name], "  ")
+		emitKV(&sb, f.keyOrder["nested:"+name], f.Nested[name])
 	}
 	// Other top-level sections (preserved verbatim from input).
 	for _, name := range f.sectionsOrder {
-		fmt.Fprintf(&sb, "\n[%s]\n", name)
-		emitKV(&sb, f.keyOrder["section:"+name], f.Sections[name], "")
+		fmt.Fprintf(&sb, "[%s]\n", name)
+		emitKV(&sb, f.keyOrder["section:"+name], f.Sections[name])
 	}
 	return writeFile(path, []byte(sb.String()), 0o644)
 }
 
-func emitKV(sb *strings.Builder, order []string, m map[string]string, indent string) {
+func emitKV(sb *strings.Builder, order []string, m map[string]string) {
 	written := map[string]bool{}
 	for _, k := range order {
-		fmt.Fprintf(sb, "%s%s = %s\n", indent, k, quoteIfNeeded(m[k]))
+		fmt.Fprintf(sb, "%s = %s\n", k, formatValue(m[k]))
 		written[k] = true
 	}
 	for k, v := range m {
 		if written[k] {
 			continue
 		}
-		fmt.Fprintf(sb, "%s%s = %s\n", indent, k, quoteIfNeeded(v))
+		fmt.Fprintf(sb, "%s = %s\n", k, formatValue(v))
 	}
 }
 
-// quoteIfNeeded quotes a value with double-quotes if it contains characters
-// configobj would interpret specially. Matches what configobj.Section.write
-// does for values containing `=` or `#` or leading/trailing whitespace.
-func quoteIfNeeded(v string) string {
+// formatValue emits a value the way configobj would. configobj's writer
+// behaves per the list_values=True default:
+//
+//   - A value parsed as a list (any unquoted string containing `,`) is written
+//     bare, e.g. `domains = a.com, b.com`, with a trailing comma for the
+//     single-element case (`only.com,`).
+//   - A scalar value preserved from input as a quoted form keeps its quotes.
+//   - A scalar value containing `,`, `#`, `"` or surrounding whitespace is
+//     double-quoted on write so configobj parses it back as a scalar.
+//   - `=` is allowed bare; configobj splits on the first `=` and never quotes
+//     for it.
+func formatValue(v string) string {
 	if v == "" {
 		return v
 	}
-	// configobj treats a trailing comma as the list-mode marker
-	// (`domains = a,b,c,`). For those we leave the commas alone —
-	// quoting would defeat the list form. For *other* commas in
-	// scalar values (hook commands, user-agent strings) we have to
-	// quote, or configobj parses the value back as a list.
-	endsInListComma := strings.HasSuffix(v, ",")
+	// Already-quoted scalar (round-tripped through input): keep as-is.
+	if len(v) >= 2 {
+		first, last := v[0], v[len(v)-1]
+		if (first == '"' && last == '"') || (first == '\'' && last == '\'') {
+			return v
+		}
+	}
+	// List form: configobj treats any unquoted comma-bearing value as a list.
+	if strings.Contains(v, ",") {
+		parts := strings.Split(v, ",")
+		items := make([]string, 0, len(parts))
+		for _, p := range parts {
+			p = strings.TrimSpace(p)
+			if p == "" {
+				continue
+			}
+			items = append(items, p)
+		}
+		if len(items) == 1 {
+			// Single-element list keeps the trailing-comma marker so the
+			// reader still sees a list on the next round-trip.
+			return items[0] + ","
+		}
+		return strings.Join(items, ", ")
+	}
+	// Scalar without commas: quote only if configobj would otherwise mis-parse.
 	needs := false
 	for i := 0; i < len(v); i++ {
 		c := v[i]
-		if c == '"' || c == '#' || c == '=' || c == '\n' {
-			needs = true
-			break
-		}
-		if c == ',' && !endsInListComma {
+		if c == '"' || c == '#' || c == '\n' {
 			needs = true
 			break
 		}
@@ -265,9 +291,6 @@ func quoteIfNeeded(v string) string {
 	if !needs && v == strings.TrimSpace(v) {
 		return v
 	}
-	// Use the form configobj prefers: triple-double-quoted unchanged content
-	// only when content has its own double quotes; otherwise plain double-
-	// quoted. Backslash isn't an escape in configobj; embedded `"` is rare.
 	if !strings.Contains(v, `"`) {
 		return `"` + v + `"`
 	}

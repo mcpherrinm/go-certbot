@@ -128,10 +128,10 @@ func TestAddRedirectSkipsHTTPSServer(t *testing.T) {
 
 func TestSplitListenAddr(t *testing.T) {
 	cases := []struct {
-		in            string
-		wantHost      string
-		wantPort      string
-		wantOK        bool
+		in       string
+		wantHost string
+		wantPort string
+		wantOK   bool
 	}{
 		{"80", "", "80", true},
 		{"127.0.0.1:80", "127.0.0.1", "80", true},

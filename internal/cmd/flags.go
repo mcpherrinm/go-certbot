@@ -1,14 +1,27 @@
 package cmd
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/spf13/pflag"
 
 	"github.com/letsencrypt/go-certbot/internal/config"
 )
+
+// REVOCATION_REASONS mirrors Certbot constants.REVOCATION_REASONS. argparse
+// translates the keyword via _EncodeReasonAction (cli/subparsers.py:42-49)
+// before storing in config.reason.
+var revocationReasons = map[string]int{
+	"unspecified":          0,
+	"keycompromise":        1,
+	"affiliationchanged":   3,
+	"superseded":           4,
+	"cessationofoperation": 5,
+}
 
 // registerFlags wires CLI flags onto the given FlagSet, pointing them at the
 // supplied Config. Names match Certbot exactly so cli.ini files and shell
@@ -69,10 +82,44 @@ func registerFlags(fs *pflag.FlagSet, c *config.Config) {
 	})
 	fs.BoolVar(&c.NewKey, "new-key", c.NewKey, "Generate a fresh private key on renewal.")
 	fs.BoolVar(&c.AllowSubsetOfNames, "allow-subset-of-names", c.AllowSubsetOfNames, "Continue if a subset of names authorize.")
-	fs.StringVar(&c.CSR, "csr", c.CSR, "Path to a CSR (DER or PEM); --csr-driven issuance with certonly.")
+	// --csr loads the file at flag-set time so downstream code has both the
+	// path (for error messages) and the bytes (for ACME submission). Matches
+	// Certbot's argparse type=read_file (helpful.py:332-355) which stores a
+	// (path, contents) tuple in config.csr.
+	csrPath := ""
+	fs.StringVar(&csrPath, "csr", "",
+		"Path to a CSR (DER or PEM); --csr-driven issuance with certonly.")
+	c.PostParseHooks = append(c.PostParseHooks, func() {
+		if csrPath == "" {
+			return
+		}
+		abs, err := filepath.Abs(csrPath)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "go-certbot: --csr:", err)
+			os.Exit(2)
+		}
+		data, err := os.ReadFile(abs)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "go-certbot: --csr:", err)
+			os.Exit(2)
+		}
+		c.CSR = config.CSRArg{Path: abs, Contents: data}
+	})
 	fs.StringVar(&c.CertPath, "cert-path", c.CertPath, "Path to an existing fullchain PEM (revoke/install).")
 	fs.StringVar(&c.KeyPath, "key-path", c.KeyPath, "Path to an existing private key (install / revoke --key-path).")
-	fs.StringVar(&c.Reason, "reason", c.Reason, "Revocation reason: unspecified, keycompromise, affiliationchanged, superseded, cessationofoperation.")
+	reasonWord := ""
+	fs.StringVar(&reasonWord, "reason", "", "Revocation reason: unspecified, keycompromise, affiliationchanged, superseded, cessationofoperation.")
+	c.PostParseHooks = append(c.PostParseHooks, func() {
+		if !c.SetByUser("reason") || reasonWord == "" {
+			return
+		}
+		code, ok := revocationReasons[strings.ToLower(reasonWord)]
+		if !ok {
+			fmt.Fprintf(os.Stderr, "go-certbot: invalid --reason %q (expected one of: unspecified, keycompromise, affiliationchanged, superseded, cessationofoperation)\n", reasonWord)
+			os.Exit(2)
+		}
+		c.Reason = code
+	})
 	fs.BoolVar(&c.DeleteAfterRevoke, "delete-after-revoke", c.DeleteAfterRevoke, "Also delete lineage files after a successful revoke.")
 	noDeleteAfterRevoke := false
 	fs.BoolVar(&noDeleteAfterRevoke, "no-delete-after-revoke", false, "Don't delete lineage after a successful revoke.")
@@ -87,7 +134,6 @@ func registerFlags(fs *pflag.FlagSet, c *config.Config) {
 	fs.StringVarP(&c.Installer, "installer", "i", c.Installer, "Installer plugin name.")
 	fs.StringVar(&c.Configurator, "configurator", c.Configurator, "Plugin that is both authenticator and installer.")
 	fs.BoolVar(&c.Apache, "apache", c.Apache, "Use the apache plugin.")
-	fs.StringVar(&c.ApacheConfig, "apache-config", c.ApacheConfig, "Path to apache2.conf / httpd.conf (default /etc/apache2/apache2.conf).")
 	fs.StringVar(&c.ApacheServerRoot, "apache-server-root", c.ApacheServerRoot, "Apache server root (default /etc/apache2).")
 	fs.StringVar(&c.ApacheCtl, "apache-ctl", c.ApacheCtl, "Apache control binary (default apachectl).")
 	fs.StringVar(&c.ApacheBin, "apache-bin", c.ApacheBin, "Apache httpd binary (used for `-v`/`-M`; falls back to apache-ctl).")
@@ -130,8 +176,8 @@ func registerFlags(fs *pflag.FlagSet, c *config.Config) {
 
 	// Rollback
 	fs.IntVar(&c.RollbackCheckpoints, "checkpoints", c.RollbackCheckpoints, "Number of previous checkpoints to revert (rollback verb; default 1).")
+	fs.StringVar(&c.RenewBeforeExpiry, "renew-before-expiry", c.RenewBeforeExpiry, "Interval before expiry at which to renew (e.g. \"30 days\"). Persisted into renewal.conf via reconfigure.")
 	fs.BoolVar(&c.Nginx, "nginx", c.Nginx, "Use the nginx plugin.")
-	fs.StringVar(&c.NginxConfig, "nginx-config", c.NginxConfig, "Path to nginx.conf (default /etc/nginx/nginx.conf).")
 	fs.StringVar(&c.NginxServerRoot, "nginx-server-root", c.NginxServerRoot, "Nginx server root (default /etc/nginx).")
 	fs.StringVar(&c.NginxCtl, "nginx-ctl", c.NginxCtl, "Nginx control binary (default nginx).")
 	fs.IntVar(&c.NginxSleepSeconds, "nginx-sleep-seconds", 1, "Number of seconds to sleep after nginx reload (default 1).")
@@ -139,6 +185,29 @@ func registerFlags(fs *pflag.FlagSet, c *config.Config) {
 	fs.BoolVar(&c.Standalone, "standalone", c.Standalone, "Use the standalone plugin.")
 	fs.BoolVar(&c.Webroot, "webroot", c.Webroot, "Use the webroot plugin.")
 	fs.StringSliceVarP(&c.WebrootPath, "webroot-path", "w", c.WebrootPath, "Webroot directory (interleave with -d for per-domain map).")
+	// --webroot-map accepts a JSON dict mapping domain → webroot path.
+	// Certbot uses a custom _WebrootMapAction (plugins/webroot.py:77-85)
+	// that json-decodes the value; we mirror that and merge into cfg.WebrootMap
+	// (taking precedence over -w/-d interleaving so cli.ini users keep working).
+	webrootMapJSON := ""
+	fs.StringVar(&webrootMapJSON, "webroot-map", "",
+		"JSON dict mapping domains to webroot paths.")
+	c.PostParseHooks = append(c.PostParseHooks, func() {
+		if webrootMapJSON == "" {
+			return
+		}
+		m := map[string]string{}
+		if err := json.Unmarshal([]byte(webrootMapJSON), &m); err != nil {
+			fmt.Fprintln(os.Stderr, "go-certbot: --webroot-map must be a JSON object: ", err)
+			os.Exit(2)
+		}
+		if c.WebrootMap == nil {
+			c.WebrootMap = map[string]string{}
+		}
+		for k, v := range m {
+			c.WebrootMap[k] = v
+		}
+	})
 	fs.BoolVar(&c.Manual, "manual", c.Manual, "Use the manual plugin.")
 
 	// HTTP-01
@@ -195,20 +264,6 @@ func registerFlags(fs *pflag.FlagSet, c *config.Config) {
 	c.PostParseHooks = append(c.PostParseHooks, func() {
 		if c.SetByUser("must-staple") && c.MustStaple {
 			c.Staple = true
-		}
-	})
-	// Validate --reason against Certbot's accepted list (constants.py:142-147).
-	c.PostParseHooks = append(c.PostParseHooks, func() {
-		if !c.SetByUser("reason") || c.Reason == "" {
-			return
-		}
-		c.Reason = strings.ToLower(c.Reason)
-		switch c.Reason {
-		case "unspecified", "keycompromise", "affiliationchanged", "superseded", "cessationofoperation":
-			// ok
-		default:
-			fmt.Fprintf(os.Stderr, "go-certbot: invalid --reason %q (expected one of: unspecified, keycompromise, affiliationchanged, superseded, cessationofoperation)\n", c.Reason)
-			os.Exit(2)
 		}
 	})
 	// Validate --key-type (cli/__init__.py:320).
@@ -303,12 +358,45 @@ func registerFlags(fs *pflag.FlagSet, c *config.Config) {
 	fs.IntVar(&c.Num, "num", c.Num, "Numeric positional argument (used by `rollback --checkpoints`).")
 	fs.BoolVar(&c.PluginsInit, "init", c.PluginsInit, "(plugins verb) Initialize plugins.")
 	fs.BoolVar(&c.PluginsPrepare, "prepare", c.PluginsPrepare, "(plugins verb) Initialize and prepare plugins.")
-	fs.StringSliceVar(&c.PluginIfaces, "authenticators", c.PluginIfaces, "(plugins verb) Limit to authenticator plugins only.")
-	fs.StringSliceVar(&c.PluginIfaces, "installers", c.PluginIfaces, "(plugins verb) Limit to installer plugins only.")
+	// `plugins --authenticators` / `--installers` are zero-arg in Certbot
+	// (action=append_const in subparsers.py:67-73). Append the interface
+	// name to c.PluginIfaces on each occurrence.
+	authIface := false
+	instIface := false
+	fs.BoolVar(&authIface, "authenticators", false, "(plugins verb) Limit to authenticator plugins only.")
+	fs.BoolVar(&instIface, "installers", false, "(plugins verb) Limit to installer plugins only.")
+	c.PostParseHooks = append(c.PostParseHooks, func() {
+		if authIface {
+			c.PluginIfaces = append(c.PluginIfaces, "Authenticator")
+		}
+		if instIface {
+			c.PluginIfaces = append(c.PluginIfaces, "Installer")
+		}
+	})
+
+	// Hide flags Certbot marks help=argparse.SUPPRESS (cli/__init__.py:84-99,
+	// 188-190, 354, 363, 371, 432-437). They remain settable for compat but
+	// shouldn't clutter `--help`.
+	c.PostParseHooks = append(c.PostParseHooks, func() {})
+	for _, name := range []string{
+		"text",
+		"verbose-level",
+		"register-unsafely-without-email",
+		"preconfigured-renewal",
+		"no-random-sleep-on-renew",
+		"renew-hook",
+		"no-hsts",
+		"no-uir",
+		"no-staple-ocsp",
+		"no-self-upgrade",
+		"no-reuse-key",
+	} {
+		_ = fs.MarkHidden(name)
+	}
 
 	// Deprecated flags Certbot accepts but ignores. Registered so cli.ini and
 	// command-line invocations don't error.
-	registerDeprecated(fs, []string{
+	registerDeprecated(fs, c, []string{
 		"os-packages-only",
 		"no-self-upgrade",
 		"no-bootstrap",
@@ -328,7 +416,19 @@ func applyDryRunSideEffects(c *config.Config) {
 	if !c.DryRun {
 		return
 	}
-	// --dry-run implies --staging.
+	// --dry-run rewrites --server to the staging directory (only when the
+	// user didn't explicitly pick a custom server) and clears --account so
+	// the staging-side registration is used rather than a prod account.
+	// Certbot: cli_utils.py:set_test_server_options.
+	if !c.SetByUser("server") || c.Server == config.DefaultLetsEncryptDirectory {
+		c.Server = config.StagingDirectory
+		c.MarkSet("server", config.SourceRuntime)
+	}
+	if !c.SetByUser("account") {
+		c.Account = ""
+	}
+	// --dry-run still implies the --staging flag so downstream code
+	// (EffectiveServer, etc.) sees a consistent picture.
 	c.Staging = true
 	c.MarkSet("staging", config.SourceRuntime)
 	// --dry-run implies --break-my-certs so issuance against a non-default
@@ -384,7 +484,7 @@ func registerBoolDefaultTrue(fs *pflag.FlagSet, c *config.Config, dst *bool, nam
 	negate := false
 	fs.BoolVar(&negate, "no-"+name, false, "Disable --"+name+".")
 	c.PostParseHooks = append(c.PostParseHooks, func() {
-		if c.SetByUser("no-"+name) {
+		if c.SetByUser("no-" + name) {
 			*dst = false
 		}
 	})
@@ -392,11 +492,19 @@ func registerBoolDefaultTrue(fs *pflag.FlagSet, c *config.Config, dst *bool, nam
 
 // registerDeprecated registers each name as a hidden boolean no-op so old
 // cli.ini files and shell scripts don't error out. Matches Certbot's
-// DEPRECATED_OPTIONS handling.
-func registerDeprecated(fs *pflag.FlagSet, names []string) {
+// DEPRECATED_OPTIONS handling. A first use prints
+// "Use of --foo is deprecated." to stderr like Certbot's
+// DeprecatedArgumentAction (util.py:add_deprecated_argument).
+func registerDeprecated(fs *pflag.FlagSet, c *config.Config, names []string) {
 	for _, n := range names {
+		name := n // capture
 		dummy := false
-		fs.BoolVar(&dummy, n, false, "(deprecated, ignored)")
-		_ = fs.MarkHidden(n)
+		fs.BoolVar(&dummy, name, false, "(deprecated, ignored)")
+		_ = fs.MarkHidden(name)
+		c.PostParseHooks = append(c.PostParseHooks, func() {
+			if c.SetByUser(name) {
+				fmt.Fprintf(os.Stderr, "Use of %s is deprecated.\n", name)
+			}
+		})
 	}
 }

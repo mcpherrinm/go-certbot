@@ -14,11 +14,21 @@ type osOptions struct {
 	ConfigPath string // default apache2.conf / httpd.conf
 	ServerRoot string // /etc/apache2 / /etc/httpd
 	Ctl        string // apachectl / apache2ctl — must be apachectl-style (supports `configtest`/`graceful`)
-	A2EnMod    string // a2enmod (Debian); empty when the platform inserts LoadModule directly
+	// QueryBin is the binary used for `-v`/`-M`/`-D DUMP_*` queries. On
+	// RHEL 9+ and Fedora, `apachectl -v` rejects the flag, so the per-OS
+	// override points QueryBin at `httpd` directly. Falls back to Ctl
+	// when empty. Matches Certbot's override_centos/override_fedora
+	// version_cmd / get_includes_cmd split.
+	QueryBin string
+	A2EnMod  string // a2enmod (Debian); empty when the platform inserts LoadModule directly
 	// VHostRoot is the directory where SSL vhost clones (foo-le-ssl.conf)
 	// land. Falls back to dirname(ConfigPath) when empty. Mirrors Certbot's
 	// per-OS `vhost_root` (override_*.py).
 	VHostRoot string
+	// RestartCmdAlt is a fallback restart command tried when the primary
+	// (`<Ctl> graceful`) fails. Matches Certbot's restart_cmd_alt
+	// (centos/gentoo/fedora pass ['<ctl>', 'restart']).
+	RestartCmdAlt []string
 }
 
 var (
@@ -36,13 +46,22 @@ var (
 		ConfigPath: "/etc/httpd/conf/httpd.conf",
 		ServerRoot: "/etc/httpd",
 		Ctl:        "apachectl",
-		VHostRoot:  "/etc/httpd/conf.d",
+		// RHEL 9+: apachectl rejects `-v`/`-t -D DUMP_*`; queries must use
+		// `httpd` directly (override_centos.py:51-82).
+		QueryBin:      "httpd",
+		VHostRoot:     "/etc/httpd/conf.d",
+		RestartCmdAlt: []string{"apachectl", "restart"},
 	}
 	osFedora = osOptions{
 		ConfigPath: "/etc/httpd/conf/httpd.conf",
 		ServerRoot: "/etc/httpd",
-		Ctl:        "apachectl",
-		VHostRoot:  "/etc/httpd/conf.d",
+		// Fedora's override (override_fedora.py:15-26) uses `httpd` as the
+		// control binary; apachectl on RHEL 9+ rejects `-v`/`-t -D DUMP_*`
+		// and Fedora inherits the same packaging layout.
+		Ctl:           "httpd",
+		QueryBin:      "httpd",
+		VHostRoot:     "/etc/httpd/conf.d",
+		RestartCmdAlt: []string{"httpd", "restart"},
 	}
 	osAlpine = osOptions{
 		ConfigPath: "/etc/apache2/httpd.conf",
@@ -53,10 +72,11 @@ var (
 		VHostRoot: "/etc/apache2/conf.d",
 	}
 	osGentoo = osOptions{
-		ConfigPath: "/etc/apache2/httpd.conf",
-		ServerRoot: "/etc/apache2",
-		Ctl:        "apache2ctl",
-		VHostRoot:  "/etc/apache2/vhosts.d",
+		ConfigPath:    "/etc/apache2/httpd.conf",
+		ServerRoot:    "/etc/apache2",
+		Ctl:           "apache2ctl",
+		VHostRoot:     "/etc/apache2/vhosts.d",
+		RestartCmdAlt: []string{"apache2ctl", "restart"},
 	}
 	osArch = osOptions{
 		ConfigPath: "/etc/httpd/conf/httpd.conf",

@@ -92,14 +92,14 @@ func Certificates(_ context.Context, cfg *config.Config, _ *plugins.Registry) er
 }
 
 type certInfo struct {
-	Name      string
-	Serial    string
-	KeyType   string
-	SANs      []string
-	NotAfter  time.Time
-	Status    string // "VALID: N days" or "INVALID: REASON"
-	CertPath  string // top-level "fullchain"
-	KeyPath   string // top-level "privkey"
+	Name     string
+	Serial   string
+	KeyType  string
+	SANs     []string
+	NotAfter time.Time
+	Status   string // "VALID: N days" or "INVALID: REASON"
+	CertPath string // top-level "fullchain"
+	KeyPath  string // top-level "privkey"
 }
 
 func (c certInfo) String() string {
@@ -119,15 +119,22 @@ func (c certInfo) String() string {
 		c.CertPath, c.KeyPath)
 }
 
+// matches returns true when every filter name is present in c.SANs.
+// Mirrors cert_manager.py:259 which uses `config_sans.issubset(cert.sans())`.
 func (c certInfo) matches(filter []string) bool {
 	for _, want := range filter {
+		found := false
 		for _, s := range c.SANs {
 			if s == want {
-				return true
+				found = true
+				break
 			}
 		}
+		if !found {
+			return false
+		}
 	}
-	return false
+	return true
 }
 
 func describeCert(confPath, certName string) (*certInfo, error) {
@@ -162,20 +169,22 @@ func describeCert(confPath, certName string) (*certInfo, error) {
 		keyType = kp
 	}
 
-	// Mirrors certbot._internal.cert_manager.human_readable_cert_info:
-	// collect reasons (TEST_CERT, EXPIRED, REVOKED) and join with ", ".
+	// Mirrors certbot._internal.cert_manager.human_readable_cert_info
+	// (cert_manager.py:264-269): TEST_CERT, EXPIRED, REVOKED are independent
+	// labels — a staging cert that's also revoked says "TEST_CERT, REVOKED".
 	now := time.Now().UTC()
 	var reasons []string
 	if isTestCert(cert) {
 		reasons = append(reasons, "TEST_CERT")
 	}
-	if cert.NotAfter.Before(now) {
+	expired := cert.NotAfter.Before(now)
+	if expired {
 		reasons = append(reasons, "EXPIRED")
 	}
-	// OCSP revocation check is a per-cert HTTP roundtrip; only attempt when
-	// the cert is otherwise valid so the listing isn't slow for a wall of
-	// expired certs.
-	if len(reasons) == 0 && certIsRevoked(cert, conf.Top["chain"]) {
+	// OCSP revocation check is a per-cert HTTP roundtrip; skip for already-
+	// expired certs (Certbot does the same — the OCSP signer often refuses
+	// expired serials) but otherwise run independently of TEST_CERT.
+	if !expired && certIsRevoked(cert, conf.Top["chain"]) {
 		reasons = append(reasons, "REVOKED")
 	}
 	var status string

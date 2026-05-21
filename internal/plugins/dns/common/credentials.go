@@ -135,12 +135,16 @@ func PropagationEnv(envPrefix string, seconds int) {
 }
 
 // PropagationFor returns the Certbot CLI propagation-seconds value for a
-// plugin, looking up cfg.DNSPropagationSeconds[name].
-func PropagationFor(cfg *config.Config, name string) int {
+// plugin, looking up cfg.DNSPropagationSeconds[name]. If the user did not set
+// the flag, returns def — the upstream Certbot default for the plugin.
+func PropagationFor(cfg *config.Config, name string, def int) int {
 	if cfg.DNSPropagationSeconds == nil {
-		return 0
+		return def
 	}
-	return cfg.DNSPropagationSeconds[name]
+	if v, ok := cfg.DNSPropagationSeconds[name]; ok {
+		return v
+	}
+	return def
 }
 
 // CredentialsFor returns cfg.DNSCredentials[name].

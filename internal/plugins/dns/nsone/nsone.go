@@ -18,10 +18,12 @@ import (
 
 type Authenticator struct{}
 
-func New() *Authenticator                                 { return &Authenticator{} }
-func (a *Authenticator) Name() string                     { return "dns-nsone" }
-func (a *Authenticator) Description() string              { return "Obtain certificates using a DNS TXT record via the NS1 API." }
-func (a *Authenticator) Cleanup(_ context.Context) error  { return nil }
+func New() *Authenticator             { return &Authenticator{} }
+func (a *Authenticator) Name() string { return "dns-nsone" }
+func (a *Authenticator) Description() string {
+	return "Obtain certificates using a DNS TXT record via the NS1 API."
+}
+func (a *Authenticator) Cleanup(_ context.Context) error { return nil }
 
 func (a *Authenticator) Prepare(_ context.Context, cfg *config.Config, _ []string) (plugins.ChallengeKind, challenge.Provider, error) {
 	cred, err := common.LoadCredentials(common.CredentialsFor(cfg, "nsone"), "dns_nsone")
@@ -32,7 +34,7 @@ func (a *Authenticator) Prepare(_ context.Context, cfg *config.Config, _ []strin
 		return 0, nil, err
 	}
 	_ = cred.SetEnv("api_key", "NS1_API_KEY")
-	common.PropagationEnv("NS1_", common.PropagationFor(cfg, "nsone"))
+	common.PropagationEnv("NS1_", common.PropagationFor(cfg, "nsone", 30))
 	p, err := ns1.NewDNSProvider()
 	if err != nil {
 		return 0, nil, fmt.Errorf("dns-nsone: %w", err)

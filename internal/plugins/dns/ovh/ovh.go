@@ -21,10 +21,12 @@ import (
 
 type Authenticator struct{}
 
-func New() *Authenticator                                 { return &Authenticator{} }
-func (a *Authenticator) Name() string                     { return "dns-ovh" }
-func (a *Authenticator) Description() string              { return "Obtain certificates using a DNS TXT record via the OVH API." }
-func (a *Authenticator) Cleanup(_ context.Context) error  { return nil }
+func New() *Authenticator             { return &Authenticator{} }
+func (a *Authenticator) Name() string { return "dns-ovh" }
+func (a *Authenticator) Description() string {
+	return "Obtain certificates using a DNS TXT record via the OVH API."
+}
+func (a *Authenticator) Cleanup(_ context.Context) error { return nil }
 
 func (a *Authenticator) Prepare(_ context.Context, cfg *config.Config, _ []string) (plugins.ChallengeKind, challenge.Provider, error) {
 	cred, err := common.LoadCredentials(common.CredentialsFor(cfg, "ovh"), "dns_ovh")
@@ -38,7 +40,7 @@ func (a *Authenticator) Prepare(_ context.Context, cfg *config.Config, _ []strin
 	_ = cred.SetEnv("application_key", "OVH_APPLICATION_KEY")
 	_ = cred.SetEnv("application_secret", "OVH_APPLICATION_SECRET")
 	_ = cred.SetEnv("consumer_key", "OVH_CONSUMER_KEY")
-	common.PropagationEnv("OVH_", common.PropagationFor(cfg, "ovh"))
+	common.PropagationEnv("OVH_", common.PropagationFor(cfg, "ovh", 120))
 	p, err := ovh.NewDNSProvider()
 	if err != nil {
 		return 0, nil, fmt.Errorf("ovh: %w", err)

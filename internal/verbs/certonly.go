@@ -3,26 +3,31 @@ package verbs
 
 import (
 	"context"
+	"crypto/x509"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/letsencrypt/go-certbot/internal/account"
 	"github.com/letsencrypt/go-certbot/internal/client"
 	"github.com/letsencrypt/go-certbot/internal/config"
+	"github.com/letsencrypt/go-certbot/internal/display"
 	"github.com/letsencrypt/go-certbot/internal/eff"
 	"github.com/letsencrypt/go-certbot/internal/hooks"
 	"github.com/letsencrypt/go-certbot/internal/plugins"
+	"github.com/letsencrypt/go-certbot/internal/storage/renewalconf"
 )
 
 // Certonly obtains a new certificate (no installation).
 func Certonly(ctx context.Context, cfg *config.Config, reg *plugins.Registry) error {
-	if len(cfg.Domains) == 0 && cfg.CSR == "" {
+	if len(cfg.Domains) == 0 && cfg.CSR.Path == "" {
 		return errors.New("certonly: at least one -d/--domain is required")
 	}
-	if cfg.CSR != "" {
+	if cfg.CSR.Path != "" {
 		return errors.New("certonly: --csr issuance is not yet implemented")
 	}
 	if cfg.Apache || cfg.Nginx {
@@ -49,6 +54,27 @@ func Certonly(ctx context.Context, cfg *config.Config, reg *plugins.Registry) er
 	certName := cfg.CertName
 	if certName == "" {
 		certName = cfg.Domains[0]
+	}
+
+	// _find_cert dispatch: before issuing, look for an existing lineage
+	// that already covers the requested SANs and decide whether to reissue,
+	// renew, or skip with a "you already have this cert" notice. Mirrors
+	// main.py:_find_cert (and main.py:1590-1598 / storage.find_duplicative_certs).
+	if reuse, err := findCertDispatch(cfg, certName); err != nil {
+		return err
+	} else if reuse != "" {
+		switch reuse {
+		case "skip":
+			fmt.Println("Certificate not yet due for renewal; the existing certificate covers the requested domains.")
+			return nil
+		case "renew":
+			cfg.ForceRenewal = true
+		case "expand":
+			// proceed to issuance, but record cert-name to existing lineage
+		case "newcert":
+			// proceed to issuance under a fresh cert-name suffix
+			certName = nextDuplicateCertName(cfg, certName)
+		}
 	}
 
 	// pre_hook runs before challenge work; post_hook always runs after.
@@ -169,6 +195,142 @@ func resolveAuthenticatorName(cfg *config.Config) (string, error) {
 		return "", errors.New("certonly: an authenticator is required (--standalone / --webroot / --manual / --dns-* / --authenticator)")
 	}
 	return picked, nil
+}
+
+// findCertDispatch looks for an existing lineage that overlaps with the
+// requested cert-name/SAN set and returns a directive:
+//
+//   - "skip":   existing cert covers all requested names and isn't near
+//     expiry — Certbot's _ask_user_to_confirm_new_names + _avoid_reissuing
+//     short-circuit (cert_manager._find_lineage_for_sans_and_certname,
+//     storage.find_duplicative_certs).
+//   - "renew":  user passed --force-renewal or --keep-until-expiring on a
+//     cert that's now near expiry.
+//   - "expand": user passed --expand and an existing lineage matches the
+//     cert-name but the SANs differ.
+//   - "newcert": user passed --duplicate; suffix the cert-name.
+//   - "":       no overlap; issue fresh.
+//
+// The default (no --duplicate/--expand/--keep) prompts only in interactive
+// mode; in non-interactive mode it falls through to "renew" if the request
+// matches exactly, else errors out so the user must pick an action.
+func findCertDispatch(cfg *config.Config, certName string) (string, error) {
+	confPath := filepath.Join(cfg.RenewalConfigsDir(), certName+".conf")
+	if _, err := os.Stat(confPath); os.IsNotExist(err) {
+		return "", nil
+	} else if err != nil {
+		return "", err
+	}
+	conf, err := renewalconf.Load(confPath)
+	if err != nil {
+		return "", err
+	}
+	leafPath := conf.Top["cert"]
+	if leafPath == "" {
+		return "", nil
+	}
+	existingSANs := sansFromCertOrEmpty(leafPath)
+	want := append([]string(nil), cfg.Domains...)
+	for _, ip := range cfg.IPAddresses {
+		want = append(want, ip)
+	}
+
+	identical := sameSANSet(existingSANs, want)
+	expansion := isSuperset(existingSANs, want)
+
+	switch {
+	case cfg.ForceRenewal:
+		return "renew", nil
+	case cfg.Duplicate:
+		return "newcert", nil
+	case cfg.Expand && !identical:
+		return "expand", nil
+	case cfg.ReinstallExisting && identical:
+		// --keep-until-expiring / --reinstall: only re-use if not near
+		// expiry. Otherwise renew.
+		if needs, _, err := needsRenewal(leafPath, conf); err == nil && needs {
+			return "renew", nil
+		}
+		return "skip", nil
+	case identical:
+		if cfg.NonInteractive {
+			return "renew", nil
+		}
+		ans := display.YesNoDefault(
+			"You have an existing certificate that has exactly the same domains or certificate name you requested. Renew & replace the certificate?",
+			true)
+		if ans {
+			return "renew", nil
+		}
+		return "skip", nil
+	case expansion:
+		if cfg.NonInteractive {
+			return "", errors.New("certonly: existing lineage covers a superset of the requested domains; use --expand to broaden, --duplicate to issue a separate cert, or change --cert-name")
+		}
+		ans := display.YesNoDefault(
+			"You have an existing certificate that contains a portion of the domains you requested. Expand and renew with the new domains?",
+			true)
+		if ans {
+			return "expand", nil
+		}
+		return "newcert", nil
+	default:
+		// Disjoint SANs — non-fatal; issue under a duplicate cert-name suffix.
+		return "newcert", nil
+	}
+}
+
+func sansFromCertOrEmpty(path string) []string {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	block, _ := pem.Decode(b)
+	if block == nil {
+		return nil
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return nil
+	}
+	out := append([]string(nil), cert.DNSNames...)
+	for _, ip := range cert.IPAddresses {
+		out = append(out, ip.String())
+	}
+	return out
+}
+
+func sameSANSet(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	return isSuperset(a, b) && isSuperset(b, a)
+}
+
+func isSuperset(haystack, needles []string) bool {
+	set := map[string]bool{}
+	for _, h := range haystack {
+		set[h] = true
+	}
+	for _, n := range needles {
+		if !set[n] {
+			return false
+		}
+	}
+	return true
+}
+
+func nextDuplicateCertName(cfg *config.Config, base string) string {
+	for i := 0; i < 1000; i++ {
+		candidate := base
+		if i > 0 {
+			candidate = fmt.Sprintf("%s-%04d", base, i)
+		}
+		if _, err := os.Stat(filepath.Join(cfg.RenewalConfigsDir(), candidate+".conf")); os.IsNotExist(err) {
+			return candidate
+		}
+	}
+	return base + "-" + strings.Repeat("d", 4)
 }
 
 func loadOrCreateAccount(cfg *config.Config, storage *account.FileStorage) (*account.Account, error) {

@@ -16,10 +16,12 @@ import (
 
 type Authenticator struct{}
 
-func New() *Authenticator                                 { return &Authenticator{} }
-func (a *Authenticator) Name() string                     { return "dns-linode" }
-func (a *Authenticator) Description() string              { return "Obtain certificates using a DNS TXT record via the Linode API." }
-func (a *Authenticator) Cleanup(_ context.Context) error  { return nil }
+func New() *Authenticator             { return &Authenticator{} }
+func (a *Authenticator) Name() string { return "dns-linode" }
+func (a *Authenticator) Description() string {
+	return "Obtain certificates using a DNS TXT record via the Linode API."
+}
+func (a *Authenticator) Cleanup(_ context.Context) error { return nil }
 
 func (a *Authenticator) Prepare(_ context.Context, cfg *config.Config, _ []string) (plugins.ChallengeKind, challenge.Provider, error) {
 	cred, err := common.LoadCredentials(common.CredentialsFor(cfg, "linode"), "dns_linode")
@@ -30,7 +32,7 @@ func (a *Authenticator) Prepare(_ context.Context, cfg *config.Config, _ []strin
 		return 0, nil, err
 	}
 	_ = cred.SetEnv("key", "LINODE_TOKEN")
-	common.PropagationEnv("LINODE_", common.PropagationFor(cfg, "linode"))
+	common.PropagationEnv("LINODE_", common.PropagationFor(cfg, "linode", 120))
 	p, err := linode.NewDNSProvider()
 	if err != nil {
 		return 0, nil, fmt.Errorf("linode: %w", err)

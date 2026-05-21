@@ -9,8 +9,14 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"regexp"
 	"strings"
 )
+
+// emailPattern is Certbot's safe_email validator (util.py:522-530): an at
+// sign separates a non-empty local part from a non-empty domain; neither
+// side may contain whitespace.
+var emailPattern = regexp.MustCompile(`^[^@\s]+@[^@\s]+\.[^@\s]+$`)
 
 // Input controls where prompts read from and write to. Defaults to os.Stdin/
 // os.Stderr; tests override.
@@ -19,8 +25,11 @@ type Input struct {
 	Out io.Writer
 }
 
-// Default reads from os.Stdin and writes to os.Stderr.
-var Default = &Input{In: os.Stdin, Out: os.Stderr}
+// Default reads from os.Stdin and writes to os.Stdout — Certbot's
+// display_util.notify defaults to stdout (obj.py:424-435 with
+// outfile=sys.stdout), so script pipelines piping `certbot ... | tee log`
+// still capture the success lines.
+var Default = &Input{In: os.Stdin, Out: os.Stdout}
 
 // YesNo prompts with a y/N question. Returns false on EOF or any non-"y"
 // reply. Matches `display_util.yesno(prompt, default=False)` semantics.
@@ -55,27 +64,29 @@ func (i *Input) Notify(msg string) {
 }
 
 // Email prompts for an email address. Matches Certbot's
-// `display_ops.get_email`: a blank reply is returned to the caller so
-// register can decide whether to switch to unsafely-without-email mode.
-// A single retry on a blank line is permitted (the first blank prints a
-// hint, the second blank returns "").
+// `display_ops.get_email` (ops.py:33-46):
+//
+//   - A blank line returns "" immediately (caller switches to
+//     unsafely-without-email mode).
+//   - A non-empty value is validated against util.safe_email; on failure
+//     the user is re-prompted with the "There is a problem with your email
+//     address. " prefix.
 func (i *Input) Email(prompt string) string {
 	scanner := bufio.NewScanner(i.In)
-	blanks := 0
+	invalidPrefix := ""
 	for {
-		fmt.Fprint(i.Out, prompt+" ")
+		fmt.Fprint(i.Out, invalidPrefix+prompt+" ")
 		if !scanner.Scan() {
 			return ""
 		}
 		s := strings.TrimSpace(scanner.Text())
-		if s != "" {
-			return s
-		}
-		blanks++
-		if blanks >= 1 {
+		if s == "" {
 			return ""
 		}
-		fmt.Fprintln(i.Out, "(blank skips email; press Enter again to confirm)")
+		if emailPattern.MatchString(s) {
+			return s
+		}
+		invalidPrefix = "There is a problem with your email address. "
 	}
 }
 
@@ -141,6 +152,9 @@ func (i *Input) Checklist(prompt string, items []string) []int {
 		if s == "" {
 			return nil
 		}
+		// configobj's checklist treats a blank line as "select all"
+		// — but blank already returned nil above (kept for parity with
+		// non-interactive contexts). `all` is also explicit.
 		if strings.EqualFold(s, "all") {
 			out := make([]int, len(items))
 			for n := range items {

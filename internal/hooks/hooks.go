@@ -36,39 +36,37 @@ type Env struct {
 	RenewedDomains string
 }
 
-// Run executes `command` via the system shell, streaming stdout/stderr to the
-// caller's process. Extra env entries are passed as "KEY=VAL". Returns a
-// non-nil error if the command exits non-zero.
+// Run executes `command` via the system shell. Buffers stdout/stderr and
+// emits them with Certbot's "Hook 'X' ran with output:\n  <indented>"
+// wrapper (hooks.py:248-263 via ops.py:256-271 report_executed_command).
+// Returns a non-nil error if the command exits non-zero.
 func Run(ctx context.Context, command string, extraEnv []string) error {
 	if command == "" {
 		return nil
 	}
 	cmd := shellCommand(ctx, command)
-	cmd.Env = append(os.Environ(), extraEnv...)
-	var stderr bytes.Buffer
-	cmd.Stdout = os.Stdout
+	cmd.Env = append(hookBaseEnv(), extraEnv...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		// Certbot's contract: hook stderr is surfaced verbatim.
-		if stderr.Len() > 0 {
-			fmt.Fprint(os.Stderr, stderr.String())
-		}
-		return fmt.Errorf("hook %q: %w", command, err)
-	}
-	if stderr.Len() > 0 {
-		fmt.Fprint(os.Stderr, stderr.String())
+	runErr := cmd.Run()
+	reportHookOutput(command, stdout.String(), stderr.String())
+	if runErr != nil {
+		return fmt.Errorf("hook %q: %w", command, runErr)
 	}
 	return nil
 }
 
 // RunCapture runs the command and returns its trimmed stdout.
 // Used by the manual plugin to surface auth-script output as $CERTBOT_AUTH_OUTPUT.
+// Unlike Run, RunCapture does NOT print the captured stdout — the caller
+// (manual.Present) consumes it for the next env var.
 func RunCapture(ctx context.Context, command string, extraEnv []string) (string, error) {
 	if command == "" {
 		return "", nil
 	}
 	cmd := shellCommand(ctx, command)
-	cmd.Env = append(os.Environ(), extraEnv...)
+	cmd.Env = append(hookBaseEnv(), extraEnv...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -82,6 +80,55 @@ func RunCapture(ctx context.Context, command string, extraEnv []string) (string,
 		fmt.Fprint(os.Stderr, stderr.String())
 	}
 	return strings.TrimRight(stdout.String(), "\r\n"), nil
+}
+
+// reportHookOutput emits Certbot's "Hook 'X' ran with output:" wrapper.
+// Stdout and stderr each get their own indented block. If both are empty
+// nothing is printed (Certbot suppresses empty outputs).
+func reportHookOutput(command, stdout, stderr string) {
+	if stdout == "" && stderr == "" {
+		return
+	}
+	if stdout != "" {
+		fmt.Fprintf(os.Stderr, "Hook '%s' ran with output:\n%s\n", command, indent(stdout, "  "))
+	}
+	if stderr != "" {
+		fmt.Fprintf(os.Stderr, "Hook '%s' ran with error output:\n%s\n", command, indent(stderr, "  "))
+	}
+}
+
+func indent(s, prefix string) string {
+	var b strings.Builder
+	for _, line := range strings.Split(strings.TrimRight(s, "\n"), "\n") {
+		b.WriteString(prefix)
+		b.WriteString(line)
+		b.WriteByte('\n')
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+// hookBaseEnv strips SNAP* / LD_PRELOAD / PYTHONPATH from os.Environ()
+// before passing to a hook subprocess. Mirrors Certbot's
+// util.env_no_snap_for_external_calls — without it, snap-installed
+// Certbot leaks SNAP-rooted paths into a user's hook script and breaks
+// any system tools the hook invokes (e.g. `systemctl reload nginx`).
+func hookBaseEnv() []string {
+	src := os.Environ()
+	out := make([]string, 0, len(src))
+	for _, e := range src {
+		i := strings.IndexByte(e, '=')
+		if i <= 0 {
+			out = append(out, e)
+			continue
+		}
+		switch k := e[:i]; {
+		case strings.HasPrefix(k, "SNAP"):
+		case k == "LD_PRELOAD", k == "LD_LIBRARY_PATH", k == "PYTHONPATH":
+		default:
+			out = append(out, e)
+		}
+	}
+	return out
 }
 
 // RunDir executes every executable file under dir, in lexicographic order.
@@ -147,11 +194,14 @@ func RunDir(ctx context.Context, dir string, extraEnv []string, dedupAgainst ...
 		}
 		slog.Info("running hook", "path", full)
 		cmd := exec.CommandContext(ctx, full)
-		cmd.Env = append(os.Environ(), extraEnv...)
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		if err := cmd.Run(); err != nil {
-			return fmt.Errorf("hooks: %s: %w", full, err)
+		cmd.Env = append(hookBaseEnv(), extraEnv...)
+		var stdout, stderr bytes.Buffer
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
+		runErr := cmd.Run()
+		reportHookOutput(full, stdout.String(), stderr.String())
+		if runErr != nil {
+			return fmt.Errorf("hooks: %s: %w", full, runErr)
 		}
 	}
 	return nil
@@ -232,7 +282,9 @@ func truncatedJoin(items []string, maxBytes int, name string) string {
 
 // PreRunner deduplicates pre-hook commands so identical pre-hooks (e.g. one
 // per lineage from a multi-cert renew) only fire once per process. Mirrors
-// certbot/_internal/hooks.py:executed_pre_hooks.
+// certbot/_internal/hooks.py:executed_pre_hooks. The set is shared with
+// RunDirShared so a script that's listed BOTH as --pre-hook /path/to/foo
+// AND as renewal-hooks/pre/foo runs exactly once.
 type PreRunner struct {
 	ran map[string]bool
 }
@@ -248,6 +300,20 @@ func (p *PreRunner) Run(ctx context.Context, cmd string) error {
 	}
 	p.ran[cmd] = true
 	return Run(ctx, cmd, nil)
+}
+
+// RunDirShared is RunDirIf but threaded through PreRunner.ran so the
+// directory-hook execution dedups against any argv pre-hooks that already
+// fired in this run.
+func (p *PreRunner) RunDirShared(ctx context.Context, enabled bool, dir string, env []string, dedup ...string) error {
+	if !enabled {
+		return nil
+	}
+	dedupAgainst := append([]string(nil), dedup...)
+	for cmd := range p.ran {
+		dedupAgainst = append(dedupAgainst, cmd)
+	}
+	return RunDir(ctx, dir, env, dedupAgainst...)
 }
 
 // RunDirIf is RunDir gated by enabled. The shorter syntax centralizes the

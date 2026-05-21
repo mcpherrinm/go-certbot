@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 
@@ -62,22 +61,50 @@ func listCertNames(cfg *config.Config) ([]string, error) {
 	return out, nil
 }
 
-// confirmDelete asks the user to confirm a delete. Returns true if the user
-// agreed (or non-interactive without --no-delete-after-revoke).
-func confirmDelete(cfg *config.Config, certName string) bool {
+// chooseCertNames returns one or more lineage names to act on. If
+// --cert-name was set, returns just that. Otherwise prompts the user with
+// a multi-select checklist (Certbot's get_certnames with allow_multiple=True).
+func chooseCertNames(cfg *config.Config, verb string) ([]string, error) {
+	if cfg.CertName != "" {
+		return []string{cfg.CertName}, nil
+	}
+	names, err := listCertNames(cfg)
+	if err != nil {
+		return nil, err
+	}
+	if len(names) == 0 {
+		return nil, fmt.Errorf("%s: no certificates found in %s", verb, cfg.RenewalConfigsDir())
+	}
+	if cfg.NonInteractive {
+		return nil, fmt.Errorf("%s: --cert-name is required in non-interactive mode (available: %s)", verb, strings.Join(names, ", "))
+	}
+	picks := display.Checklist(fmt.Sprintf("Which certificate(s) would you like to %s?", verb), names)
+	if len(picks) == 0 {
+		return nil, errors.New("no certificate selected")
+	}
+	out := make([]string, 0, len(picks))
+	for _, i := range picks {
+		if i >= 0 && i < len(names) {
+			out = append(out, names[i])
+		}
+	}
+	return out, nil
+}
+
+// confirmDeleteAll asks the user to confirm a delete. Returns true if the
+// user agreed. Wording mirrors Certbot's cert_manager.py:56-66 so user-
+// facing scripts grepping for stable text keep working.
+func confirmDeleteAll(cfg *config.Config, names []string) bool {
 	if cfg.NonInteractive {
 		return true
 	}
-	// Match Certbot's wording (cert_manager.py:56-66) for grep-compat with
-	// existing user-facing scripts.
-	fmt.Fprintf(os.Stderr,
-		"WARNING: Before continuing, ensure that the listed certificates are not being used by any installed server software (e.g. Apache, nginx, mail servers).\n"+
-			"This will delete:\n"+
-			"  %s\n"+
-			"  %s\n"+
-			"  %s\n",
-		filepath.Join(cfg.LiveDir(), certName),
-		filepath.Join(cfg.ArchiveDir(), certName),
-		filepath.Join(cfg.RenewalConfigsDir(), certName+".conf"))
+	var sb strings.Builder
+	sb.WriteString("The following certificate(s) are selected for deletion:\n")
+	for _, name := range names {
+		fmt.Fprintf(&sb, "  * %s\n", name)
+	}
+	sb.WriteString("WARNING: Before continuing, ensure that the listed certificates are not being used by any installed server software (e.g. Apache, nginx, mail servers).\n")
+	sb.WriteString("Additional details about deleting certificates are available at https://certbot.eff.org/docs/using.html#deleting-certificates\n")
+	fmt.Fprint(os.Stderr, sb.String())
 	return display.YesNoDefault("Are you sure you want to delete the above certificate(s)?", true)
 }

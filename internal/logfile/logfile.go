@@ -1,7 +1,7 @@
 // Package logfile writes /var/log/letsencrypt/letsencrypt.log alongside any
 // stderr output, matching certbot/_internal/log.py's
-// setup_log_file_handler. The log rotates at 1 MiB with backup count
-// max_log_backups (default 1000).
+// setup_log_file_handler. The log rotates on every Setup call (Certbot does
+// the same — log.py:173 calls handler.doRollover() unconditionally).
 package logfile
 
 import (
@@ -11,19 +11,41 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strconv"
+	"strings"
+	"sync"
+	"time"
 )
+
+// lastPath holds the most recently opened log file path so the panic
+// handler in cmd/main.go can write a stack trace alongside it.
+var (
+	lastMu   sync.Mutex
+	lastFile string
+	preBuf   []string // messages emitted before Setup ran
+)
+
+// LastPath returns the path Setup opened most recently, or "" if Setup
+// never ran successfully.
+func LastPath() string {
+	lastMu.Lock()
+	defer lastMu.Unlock()
+	return lastFile
+}
 
 // Setup opens <logsDir>/letsencrypt.log (creating logsDir if missing) and
 // attaches a slog handler that writes to both stderr and the file. Returns a
-// close func that flushes and closes the file. If logsDir is empty or the
-// file can't be opened, falls back to stderr-only (matching Certbot's
-// behavior on permission errors — log to stderr and warn once).
+// close func that flushes and closes the file.
 //
-// Mirrors certbot._internal.log.setup_log_file_handler. Format:
-//   <RFC3339 timestamp>:<LEVEL>:<source>:<message>
+// Mirrors certbot._internal.log.setup_log_file_handler:
 //
-// File mode is 0o640 (Certbot uses 0o640 for the log file via os.umask).
+//   - Rotate on every invocation (not size).
+//   - Custom format "RFC3339:LEVEL:logger:message" matching
+//     log.FILE_FMT = '%(asctime)s:%(levelname)s:%(name)s:%(message)s'.
+//   - File mode 0o600 (Certbot safe_open with chmod 0o600).
+//   - ANSI red on WARNING+ for stderr when TTY + NO_COLOR unset.
+//   - Buffered pre-Setup messages flushed in after handler is set up.
 func Setup(logsDir string, level slog.Level, maxBackups int) (io.Closer, error) {
 	if logsDir == "" {
 		return noopCloser{}, nil
@@ -32,48 +54,70 @@ func Setup(logsDir string, level slog.Level, maxBackups int) (io.Closer, error) 
 		return noopCloser{}, fmt.Errorf("logfile: mkdir %s: %w", logsDir, err)
 	}
 	path := filepath.Join(logsDir, "letsencrypt.log")
-	if err := maybeRotate(path, maxBackups); err != nil {
-		// Continue; rotation failure is non-fatal.
+	if err := rotate(path, maxBackups); err != nil {
 		fmt.Fprintf(os.Stderr, "logfile: rotate %s: %v\n", path, err)
 	}
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o640)
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600)
 	if err != nil {
 		return noopCloser{}, fmt.Errorf("logfile: open %s: %w", path, err)
 	}
-	// Tee stderr and file. Certbot prints to stderr by default at WARNING+
-	// and writes EVERYTHING to the file; we model the same here by giving
-	// the file handler DEBUG.
-	stderrH := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})
-	fileH := slog.NewTextHandler(f, &slog.HandlerOptions{Level: slog.LevelDebug})
+	lastMu.Lock()
+	lastFile = path
+	lastMu.Unlock()
+
+	stderrH := newCertbotHandler(os.Stderr, level, isatty(os.Stderr))
+	fileH := newCertbotHandler(f, slog.LevelDebug, false)
 	slog.SetDefault(slog.New(multiHandler{stderrH, fileH}))
-	// Certbot's startup banner: print where to find the debug log so users
-	// know to attach it on bug reports (log.py:140).
-	if level > slog.LevelInfo {
-		// quiet — skip the banner
-	} else {
-		fmt.Fprintf(os.Stderr, "Saving debug log to %s\n", path)
+
+	// Flush any messages buffered before Setup opened the file.
+	lastMu.Lock()
+	pending := preBuf
+	preBuf = nil
+	lastMu.Unlock()
+	for _, msg := range pending {
+		_, _ = io.WriteString(f, msg)
 	}
+
 	return f, nil
 }
 
-// maybeRotate moves letsencrypt.log → letsencrypt.log.1 (cascading the
-// existing backups) once the file exceeds maxBytes. Matches Certbot's
-// RotatingFileHandler with maxBytes=2**20.
-const maxBytes = 1 << 20
+// PreSetup buffers a message in memory so messages logged before the file
+// handler exists still end up on disk after Setup runs.
+func PreSetup(msg string) {
+	lastMu.Lock()
+	defer lastMu.Unlock()
+	preBuf = append(preBuf, msg)
+}
 
-func maybeRotate(path string, maxBackups int) error {
-	info, err := os.Stat(path)
+// WriteCrashTrace dumps the runtime stack to a crash file alongside the
+// active log. Returns silently if no log path has been opened yet (best
+// effort, called from a panic context).
+func WriteCrashTrace(panicMsg string) {
+	lastMu.Lock()
+	path := lastFile
+	lastMu.Unlock()
+	if path == "" {
+		return
+	}
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o600)
 	if err != nil {
+		return
+	}
+	defer f.Close()
+	fmt.Fprintf(f, "\n----- PANIC %s -----\n%s\n%s\n",
+		time.Now().UTC().Format(time.RFC3339), panicMsg, string(debug.Stack()))
+}
+
+// rotate moves letsencrypt.log → letsencrypt.log.1 (cascading the existing
+// backups) unconditionally on each Setup. Matches Certbot's log.py:173.
+func rotate(path string, maxBackups int) error {
+	if _, err := os.Stat(path); err != nil {
 		if os.IsNotExist(err) {
 			return nil
 		}
 		return err
 	}
-	if info.Size() < maxBytes {
-		return nil
-	}
 	if maxBackups <= 0 {
-		// Truncate in place rather than backup.
 		return os.Truncate(path, 0)
 	}
 	// Cascade existing backups: .N-1 → .N
@@ -85,6 +129,60 @@ func maybeRotate(path string, maxBackups int) error {
 		}
 	}
 	return os.Rename(path, path+".1")
+}
+
+// certbotHandler emits "RFC3339:LEVEL:logger:message" lines matching
+// Certbot's log.FILE_FMT. When color=true, WARNING+ levels are wrapped in
+// ANSI red — but only if NO_COLOR is unset.
+type certbotHandler struct {
+	mu    sync.Mutex
+	w     io.Writer
+	level slog.Level
+	color bool
+}
+
+func newCertbotHandler(w io.Writer, level slog.Level, color bool) *certbotHandler {
+	if os.Getenv("NO_COLOR") != "" {
+		color = false
+	}
+	return &certbotHandler{w: w, level: level, color: color}
+}
+
+func (h *certbotHandler) Enabled(_ context.Context, l slog.Level) bool { return l >= h.level }
+func (h *certbotHandler) Handle(_ context.Context, r slog.Record) error {
+	ts := r.Time.UTC().Format(time.RFC3339)
+	lvl := levelName(r.Level)
+	logger := "certbot"
+	msg := r.Message
+	// Append slog attrs as key=value pairs to keep parity with Python's
+	// logger.info("...", extra={"key": val}).
+	r.Attrs(func(a slog.Attr) bool {
+		msg += " " + a.Key + "=" + a.Value.String()
+		return true
+	})
+	line := fmt.Sprintf("%s:%s:%s:%s\n", ts, lvl, logger, msg)
+	if h.color && r.Level >= slog.LevelWarn {
+		line = "\x1b[31m" + strings.TrimRight(line, "\n") + "\x1b[0m\n"
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	_, err := io.WriteString(h.w, line)
+	return err
+}
+func (h *certbotHandler) WithAttrs(attrs []slog.Attr) slog.Handler { return h }
+func (h *certbotHandler) WithGroup(name string) slog.Handler       { return h }
+
+func levelName(l slog.Level) string {
+	switch {
+	case l >= slog.LevelError:
+		return "ERROR"
+	case l >= slog.LevelWarn:
+		return "WARNING"
+	case l >= slog.LevelInfo:
+		return "INFO"
+	default:
+		return "DEBUG"
+	}
 }
 
 type multiHandler [2]slog.Handler
