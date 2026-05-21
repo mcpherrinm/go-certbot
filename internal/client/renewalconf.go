@@ -84,6 +84,28 @@ func writeRenewalConf(cfg *config.Config, certName, accountID string, domains []
 	}
 	// `domains = a,b,c,` — configobj treats trailing-comma values as lists.
 	f.SetParam("domains", strings.Join(domains, ",")+",")
+	// IP-address SANs (RFC 8738). Persist alongside domains so a renew
+	// regenerates the same SANs.
+	if len(cfg.IPAddresses) > 0 {
+		f.SetParam("ip_addresses", strings.Join(cfg.IPAddresses, ",")+",")
+	}
+	// DNS-plugin credentials + propagation-seconds. Each --dns-<plugin>
+	// authenticator stores its credentials file path and propagation timer
+	// flat under [renewalparams] (dns_common stores arguments under the
+	// plugin's own namespace). Persist so unattended renews don't need the
+	// user to re-pass the credentials flag.
+	for plugin, creds := range cfg.DNSCredentials {
+		if creds == "" {
+			continue
+		}
+		f.SetParam("dns_"+plugin+"_credentials", creds)
+	}
+	for plugin, sec := range cfg.DNSPropagationSeconds {
+		if sec == 0 {
+			continue
+		}
+		f.SetParam("dns_"+plugin+"_propagation_seconds", strconv.Itoa(sec))
+	}
 
 	// Persist webroot_map as a nested section under [renewalparams] so
 	// `certbot renew` (and `go-certbot renew`) can restore the per-domain

@@ -23,12 +23,13 @@ import (
 
 	"github.com/letsencrypt/go-certbot/internal/account"
 	"github.com/letsencrypt/go-certbot/internal/config"
+	"github.com/letsencrypt/go-certbot/internal/display"
 	"github.com/letsencrypt/go-certbot/internal/plugins"
 	"github.com/letsencrypt/go-certbot/internal/storage"
 )
 
 // version is the go-certbot version string; used in the User-Agent.
-const version = "0.7.0-phase7"
+const version = "1.2.0"
 
 // Client bundles a lego Client with the loaded account.
 type Client struct {
@@ -63,15 +64,34 @@ func New(cfg *config.Config, acc *account.Account) (*Client, error) {
 
 // EnsureRegistered registers the account with the CA if it has no Location
 // URL. On success, c.account.Registration is updated and written to disk.
+//
+// Mirrors certbot._internal.main._determine_account: if --agree-tos isn't
+// set and we're interactive, prompt before failing. Non-interactive without
+// --agree-tos errors out (same wording as Certbot's _tos_cb).
 func (c *Client) EnsureRegistered(ctx context.Context, accountStorage *account.FileStorage) error {
 	if c.account.Registration.URI != "" {
 		return nil
 	}
 	if !c.cfg.TOS {
-		return errors.New("client: --agree-tos is required to register a new ACME account")
+		if c.cfg.NonInteractive {
+			return errors.New("client: --agree-tos is required to register a new ACME account (and you passed --non-interactive, so I can't prompt)")
+		}
+		prompt := fmt.Sprintf(
+			"Please read the Terms of Service at %s. You must agree in order to register with the ACME server. Do you agree?",
+			"https://letsencrypt.org/repository/")
+		if !display.YesNoDefault(prompt, true) {
+			return errors.New("client: TOS not accepted; aborting registration")
+		}
+		c.cfg.TOS = true
 	}
 	if c.cfg.Email == "" && !c.cfg.RegisterUnsafelyWithoutEmail {
-		return errors.New("client: --email is required (or pass --register-unsafely-without-email)")
+		if c.cfg.NonInteractive {
+			return errors.New("client: --email is required (or pass --register-unsafely-without-email)")
+		}
+		c.cfg.Email = display.Email("Enter email address (used for urgent renewal and security notices):")
+		if c.cfg.Email == "" {
+			return errors.New("client: --email is required (or pass --register-unsafely-without-email)")
+		}
 	}
 
 	var (
@@ -249,13 +269,63 @@ func certKeyType(cfg *config.Config) (certcrypto.KeyType, error) {
 	return "", fmt.Errorf("client: unsupported key_type %q", cfg.KeyType)
 }
 
+// userAgent composes the User-Agent string Certbot sends to the ACME server.
+// Format mirrors certbot.client.determine_user_agent's template:
+//
+//	CertbotACMEClient/<ver> (<cmd>; <os>) Authenticator/<auth> Installer/<inst> (<verb>; flags: <flags>) Go/<ver>
+//
+// The flag-derived suffix encodes --duplicate (dup), --force-renewal (frn),
+// --allow-subset-of-names (asn), -n / --non-interactive (n), and the
+// presence of any hook (hook). The CA uses this for telemetry.
 func userAgent(cfg *config.Config) string {
 	if cfg.UserAgent != "" {
 		return cfg.UserAgent
 	}
-	base := fmt.Sprintf("go-certbot/%s (%s; %s)", version, runtime.GOOS, runtime.GOARCH)
-	if cfg.UserAgentComment != "" {
-		base += " " + cfg.UserAgentComment
+	authn := cfg.Authenticator
+	if authn == "" {
+		authn = "none"
 	}
-	return base
+	inst := cfg.Installer
+	if inst == "" {
+		inst = "none"
+	}
+	verb := cfg.Verb
+	if verb == "" {
+		verb = "run"
+	}
+	ua := fmt.Sprintf("CertbotACMEClient/%s (go-certbot; %s/%s) Authenticator/%s Installer/%s (%s; flags: %s) Go/%s",
+		version, runtime.GOOS, runtime.GOARCH, authn, inst, verb, uaFlags(cfg), runtime.Version())
+	if cfg.UserAgentComment != "" {
+		ua += " " + cfg.UserAgentComment
+	}
+	return ua
+}
+
+// uaFlags encodes the same flag bits Certbot's ua_flags emits.
+func uaFlags(cfg *config.Config) string {
+	var flags []string
+	if cfg.Duplicate {
+		flags = append(flags, "dup")
+	}
+	if cfg.ForceRenewal {
+		flags = append(flags, "frn")
+	}
+	if cfg.AllowSubsetOfNames {
+		flags = append(flags, "asn")
+	}
+	if cfg.NonInteractive {
+		flags = append(flags, "n")
+	}
+	if cfg.PreHook != "" || cfg.PostHook != "" || cfg.DeployHook != "" ||
+		cfg.ManualAuthHook != "" || cfg.ManualCleanupHook != "" {
+		flags = append(flags, "hook")
+	}
+	if len(flags) == 0 {
+		return ""
+	}
+	out := flags[0]
+	for _, f := range flags[1:] {
+		out += " " + f
+	}
+	return out
 }

@@ -1,6 +1,10 @@
 package cmd
 
 import (
+	"fmt"
+	"os"
+	"strings"
+
 	"github.com/spf13/pflag"
 
 	"github.com/letsencrypt/go-certbot/internal/config"
@@ -57,20 +61,53 @@ func registerFlags(fs *pflag.FlagSet, c *config.Config) {
 	fs.StringVar(&c.KeyPath, "key-path", c.KeyPath, "Path to an existing private key (install / revoke --key-path).")
 	fs.StringVar(&c.Reason, "reason", c.Reason, "Revocation reason: unspecified, keycompromise, affiliationchanged, superseded, cessationofoperation.")
 	fs.BoolVar(&c.DeleteAfterRevoke, "delete-after-revoke", c.DeleteAfterRevoke, "Also delete lineage files after a successful revoke.")
+	noDeleteAfterRevoke := false
+	fs.BoolVar(&noDeleteAfterRevoke, "no-delete-after-revoke", false, "Don't delete lineage after a successful revoke.")
+	c.PostParseHooks = append(c.PostParseHooks, func() {
+		if c.SetByUser("no-delete-after-revoke") {
+			c.DeleteAfterRevoke = false
+		}
+	})
 
 	// Plugin selection
-	fs.StringVar(&c.Authenticator, "authenticator", c.Authenticator, "Authenticator plugin name.")
-	fs.StringVar(&c.Installer, "installer", c.Installer, "Installer plugin name.")
+	fs.StringVarP(&c.Authenticator, "authenticator", "a", c.Authenticator, "Authenticator plugin name.")
+	fs.StringVarP(&c.Installer, "installer", "i", c.Installer, "Installer plugin name.")
 	fs.StringVar(&c.Configurator, "configurator", c.Configurator, "Plugin that is both authenticator and installer.")
 	fs.BoolVar(&c.Apache, "apache", c.Apache, "Use the apache plugin.")
 	fs.StringVar(&c.ApacheConfig, "apache-config", c.ApacheConfig, "Path to apache2.conf / httpd.conf (default /etc/apache2/apache2.conf).")
 	fs.StringVar(&c.ApacheServerRoot, "apache-server-root", c.ApacheServerRoot, "Apache server root (default /etc/apache2).")
 	fs.StringVar(&c.ApacheCtl, "apache-ctl", c.ApacheCtl, "Apache control binary (default apachectl).")
 
-	// Enhancements
+	// Enhancements — tri-state via paired --X / --no-X flags. Certbot lets
+	// users opt out of an enhancement that was previously applied; we
+	// honor that by flipping the bool back to false in a post-parse hook.
 	fs.BoolVar(&c.HSTS, "hsts", c.HSTS, "Add a Strict-Transport-Security header (enhance verb).")
+	noHSTS := false
+	fs.BoolVar(&noHSTS, "no-hsts", false, "Remove the Strict-Transport-Security header.")
+	c.PostParseHooks = append(c.PostParseHooks, func() {
+		if c.SetByUser("no-hsts") {
+			c.HSTS = false
+		}
+	})
 	fs.BoolVar(&c.UIR, "uir", c.UIR, "Add a Content-Security-Policy: upgrade-insecure-requests header (enhance verb).")
+	noUIR := false
+	fs.BoolVar(&noUIR, "no-uir", false, "Remove the upgrade-insecure-requests header.")
+	c.PostParseHooks = append(c.PostParseHooks, func() {
+		if c.SetByUser("no-uir") {
+			c.UIR = false
+		}
+	})
 	fs.BoolVar(&c.Staple, "staple-ocsp", c.Staple, "Enable OCSP stapling (enhance verb).")
+	noStaple := false
+	fs.BoolVar(&noStaple, "no-staple-ocsp", false, "Disable OCSP stapling.")
+	c.PostParseHooks = append(c.PostParseHooks, func() {
+		if c.SetByUser("no-staple-ocsp") {
+			c.Staple = false
+		}
+	})
+
+	// Rollback
+	fs.IntVar(&c.RollbackCheckpoints, "checkpoints", c.RollbackCheckpoints, "Number of previous checkpoints to revert (rollback verb; default 1).")
 	fs.BoolVar(&c.Nginx, "nginx", c.Nginx, "Use the nginx plugin.")
 	fs.StringVar(&c.NginxConfig, "nginx-config", c.NginxConfig, "Path to nginx.conf (default /etc/nginx/nginx.conf).")
 	fs.StringVar(&c.NginxServerRoot, "nginx-server-root", c.NginxServerRoot, "Nginx server root (default /etc/nginx).")
@@ -92,7 +129,7 @@ func registerFlags(fs *pflag.FlagSet, c *config.Config) {
 	fs.BoolVar(&c.Staging, "test-cert", c.Staging, "Alias for --staging.")
 	fs.BoolVar(&c.Debug, "debug", c.Debug, "Show tracebacks on errors. (Use --verbose for log-level changes.)")
 	fs.BoolVar(&c.NoVerifySSL, "no-verify-ssl", c.NoVerifySSL, "Skip TLS verification when talking to the ACME server.")
-	fs.BoolVar(&c.Quiet, "quiet", c.Quiet, "Quiet mode. Implies --non-interactive.")
+	fs.BoolVarP(&c.Quiet, "quiet", "q", c.Quiet, "Quiet mode. Implies --non-interactive.")
 	fs.BoolVarP(&c.NonInteractive, "non-interactive", "n", c.NonInteractive, "Run without prompts.")
 	fs.BoolVar(&c.NonInteractive, "noninteractive", c.NonInteractive, "Alias for --non-interactive.")
 	fs.BoolVar(&c.ForceInteractive, "force-interactive", c.ForceInteractive, "Force interactive mode.")
@@ -116,6 +153,41 @@ func registerFlags(fs *pflag.FlagSet, c *config.Config) {
 	fs.BoolVar(&c.RenewWithNewDomains, "renew-with-new-domains", c.RenewWithNewDomains, "On renewal, expand cert with new SANs given on cmd line.")
 	fs.IntVar(&c.IssuanceTimeout, "issuance-timeout", c.IssuanceTimeout, "Per-domain timeout (seconds).")
 	fs.StringSliceVar(&c.PreferredChallenges, "preferred-challenges", c.PreferredChallenges, "Preferred challenge types, comma-separated.")
+	// Normalize aliases (`http`/`http_01` → `http-01`, `dns`/`dns_01` →
+	// `dns-01`) so downstream comparisons can match the canonical name.
+	// Mirrors Certbot's _PrefChallAction (cli_utils.py:185-221).
+	c.PostParseHooks = append(c.PostParseHooks, func() {
+		for i, ch := range c.PreferredChallenges {
+			switch ch {
+			case "http", "http_01":
+				c.PreferredChallenges[i] = "http-01"
+			case "dns", "dns_01":
+				c.PreferredChallenges[i] = "dns-01"
+			case "tls-alpn", "tls_alpn_01":
+				c.PreferredChallenges[i] = "tls-alpn-01"
+			}
+		}
+	})
+	// --must-staple implies --staple-ocsp (helpful.py:295-296).
+	c.PostParseHooks = append(c.PostParseHooks, func() {
+		if c.SetByUser("must-staple") && c.MustStaple {
+			c.Staple = true
+		}
+	})
+	// Validate --reason against Certbot's accepted list (constants.py:142-147).
+	c.PostParseHooks = append(c.PostParseHooks, func() {
+		if !c.SetByUser("reason") || c.Reason == "" {
+			return
+		}
+		c.Reason = strings.ToLower(c.Reason)
+		switch c.Reason {
+		case "unspecified", "keycompromise", "affiliationchanged", "superseded", "cessationofoperation":
+			// ok
+		default:
+			fmt.Fprintf(os.Stderr, "go-certbot: invalid --reason %q (expected one of: unspecified, keycompromise, affiliationchanged, superseded, cessationofoperation)\n", c.Reason)
+			os.Exit(2)
+		}
+	})
 	fs.BoolVar(&c.RunDeployHooks, "run-deploy-hooks", c.RunDeployHooks, "Always run deploy hooks on `reconfigure`.")
 
 	// Path overrides for certonly --csr. Note: --cert-path itself is also
@@ -130,6 +202,14 @@ func registerFlags(fs *pflag.FlagSet, c *config.Config) {
 	fs.StringVar(&c.DeployHook, "deploy-hook", c.DeployHook, "Command to run after a successful issuance.")
 	fs.StringVar(&c.DeployHook, "renew-hook", c.DeployHook, "Alias for --deploy-hook (legacy name).")
 	fs.BoolVar(&c.DisableHookValidation, "disable-hook-validation", c.DisableHookValidation, "Skip the check that hook commands are executable.")
+	// In Certbot, --disable-hook-validation is `store_false dest=validate_hooks`
+	// (cli/__init__.py:453). Mirror so a single source of truth (ValidateHooks)
+	// governs the check.
+	c.PostParseHooks = append(c.PostParseHooks, func() {
+		if c.SetByUser("disable-hook-validation") {
+			c.ValidateHooks = false
+		}
+	})
 	fs.StringVar(&c.ManualAuthHook, "manual-auth-hook", c.ManualAuthHook, "Path to a script that publishes challenge data (manual plugin).")
 	fs.StringVar(&c.ManualCleanupHook, "manual-cleanup-hook", c.ManualCleanupHook, "Path to a script that removes challenge data (manual plugin).")
 
@@ -169,8 +249,11 @@ func registerFlags(fs *pflag.FlagSet, c *config.Config) {
 		"no-self-upgrade",
 		"no-bootstrap",
 		"no-permissions-check",
-		"dns-route53-propagation-seconds",
 		"manual-public-ip-logging-ok",
+		// `dns-route53-propagation-seconds` is in Certbot's
+		// DEPRECATED_OPTIONS list but is also the real flag name we use
+		// for the per-plugin propagation timeout, so we don't register
+		// it as deprecated to avoid a pflag duplicate-flag panic.
 	})
 }
 

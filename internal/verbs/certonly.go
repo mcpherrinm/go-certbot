@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"path/filepath"
 
 	"github.com/letsencrypt/go-certbot/internal/account"
@@ -54,12 +55,14 @@ func Certonly(ctx context.Context, cfg *config.Config, reg *plugins.Registry) er
 	if err := hooks.Run(ctx, cfg.PreHook, nil); err != nil {
 		return err
 	}
-	if err := hooks.RunDir(ctx, cfg.HookDir("pre"), nil); err != nil {
+	if err := hooks.RunDirIf(ctx, cfg.DirectoryHooks, cfg.HookDir("pre"), nil, cfg.PreHook); err != nil {
 		return err
 	}
+	var renewedDomains []string
 	defer func() {
-		_ = hooks.Run(ctx, cfg.PostHook, nil)
-		_ = hooks.RunDir(ctx, cfg.HookDir("post"), nil)
+		env := hooks.PostEnv(renewedDomains, nil)
+		_ = hooks.Run(ctx, cfg.PostHook, env)
+		_ = hooks.RunDirIf(ctx, cfg.DirectoryHooks, cfg.HookDir("post"), env, cfg.PostHook)
 	}()
 
 	// Load or create an account.
@@ -98,19 +101,32 @@ func Certonly(ctx context.Context, cfg *config.Config, reg *plugins.Registry) er
 	if err != nil {
 		return err
 	}
+	renewedDomains = append([]string(nil), cfg.Domains...)
 
-	fmt.Printf("Successfully obtained certificate for %v\n", cfg.Domains)
-	fmt.Printf("  cert:      %s\n", lineage.Live.Cert)
-	fmt.Printf("  privkey:   %s\n", lineage.Live.Privkey)
-	fmt.Printf("  chain:     %s\n", lineage.Live.Chain)
-	fmt.Printf("  fullchain: %s\n", lineage.Live.Fullchain)
+	// Certbot's _report_new_cert (main.py:_report_new_cert) format:
+	// "Successfully received certificate.\nCertificate is saved at:
+	// <fullchain>\nKey is saved at:         <privkey>\nThis certificate
+	// expires on <not_after>."
+	expiry := ""
+	if data, err := os.ReadFile(lineage.Live.Fullchain); err == nil {
+		if t, lerr := client.LeafExpiry(data); lerr == nil {
+			expiry = t.Format("2006-01-02")
+		}
+	}
+	fmt.Println()
+	fmt.Println("Successfully received certificate.")
+	fmt.Printf("Certificate is saved at: %s\n", lineage.Live.Fullchain)
+	fmt.Printf("Key is saved at:         %s\n", lineage.Live.Privkey)
+	if expiry != "" {
+		fmt.Printf("This certificate expires on %s.\n", expiry)
+	}
 
 	// deploy_hook runs only on success, with RENEWED_LINEAGE / RENEWED_DOMAINS.
 	env := hooks.DeployEnv(filepath.Dir(lineage.Live.Cert), cfg.Domains)
 	if err := hooks.Run(ctx, cfg.DeployHook, env); err != nil {
 		slog.Warn("deploy_hook failed", "err", err)
 	}
-	if err := hooks.RunDir(ctx, cfg.HookDir("deploy"), env); err != nil {
+	if err := hooks.RunDirIf(ctx, cfg.DirectoryHooks, cfg.HookDir("deploy"), env, cfg.DeployHook); err != nil {
 		slog.Warn("deploy-hook directory failed", "err", err)
 	}
 

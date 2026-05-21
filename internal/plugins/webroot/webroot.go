@@ -40,48 +40,75 @@ func (a *Authenticator) Description() string {
 }
 
 // Prepare resolves the domain→webroot map. Uses cfg.WebrootMap when set (the
-// CLI builds it from -w/-d interleaving) and falls back to a single
-// --webroot-path applied to every domain. Multi-path without a map is
-// rejected (interleave with -d instead).
+// CLI builds it from -w/-d interleaving) and falls back to --webroot-path
+// applied to every domain. When a map is set but some domains are unmapped,
+// the LAST --webroot-path entry is used as the fallback (matches Certbot's
+// webroot.py:_set_webroot — `self.conf("path")[-1]`).
 func (a *Authenticator) Prepare(_ context.Context, cfg *config.Config, domains []string) (plugins.ChallengeKind, challenge.Provider, error) {
+	// fallback path for unmapped domains. Certbot uses the last `-w` from the
+	// command line (webroot.py:_set_webroot 117-122).
+	var fallback string
+	if n := len(cfg.WebrootPath); n > 0 {
+		fallback = cfg.WebrootPath[n-1]
+	}
+
 	if len(cfg.WebrootMap) > 0 {
 		a.domainPaths = map[string]string{}
 		for d, p := range cfg.WebrootMap {
-			if _, err := os.Stat(p); err != nil {
-				return 0, nil, fmt.Errorf("webroot: %s: %w", p, err)
+			abs, err := absPath(p)
+			if err != nil {
+				return 0, nil, err
 			}
-			a.domainPaths[d] = p
-		}
-		// Ensure every requested domain has an entry. If not, fall back to
-		// the first webroot path for unmapped domains (matches Certbot's
-		// _set_webroot_for_unmapped behavior).
-		var fallback string
-		for _, p := range a.domainPaths {
-			fallback = p
-			break
+			a.domainPaths[d] = abs
+			if fallback == "" {
+				fallback = abs
+			}
 		}
 		for _, d := range domains {
 			if _, ok := a.domainPaths[d]; !ok {
-				a.domainPaths[d] = fallback
+				if fallback == "" {
+					return 0, nil, fmt.Errorf("webroot: no webroot configured for domain %q", d)
+				}
+				if abs, err := absPath(fallback); err == nil {
+					a.domainPaths[d] = abs
+				} else {
+					return 0, nil, err
+				}
 			}
 		}
 		return plugins.HTTP01, a, nil
 	}
-	if len(cfg.WebrootPath) == 0 {
+
+	if fallback == "" {
 		return 0, nil, errors.New("webroot: at least one --webroot-path is required")
 	}
-	if len(cfg.WebrootPath) != 1 {
-		return 0, nil, errors.New("webroot: multiple --webroot-path values require interleaving with -d to form a per-domain map")
-	}
-	path := cfg.WebrootPath[0]
-	if _, err := os.Stat(path); err != nil {
-		return 0, nil, fmt.Errorf("webroot: %s: %w", path, err)
+	abs, err := absPath(fallback)
+	if err != nil {
+		return 0, nil, err
 	}
 	a.domainPaths = map[string]string{}
 	for _, d := range domains {
-		a.domainPaths[d] = path
+		a.domainPaths[d] = abs
 	}
 	return plugins.HTTP01, a, nil
+}
+
+// absPath resolves p to an absolute path and verifies it's an existing dir.
+// Certbot's _validate_webroot stores the abspath so renewal.conf survives a
+// working-directory change (webroot.py:_validate_webroot).
+func absPath(p string) (string, error) {
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return "", fmt.Errorf("webroot: abspath %s: %w", p, err)
+	}
+	info, err := os.Stat(abs)
+	if err != nil {
+		return "", fmt.Errorf("webroot: %s: %w", abs, err)
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("webroot: %s is not a directory", abs)
+	}
+	return abs, nil
 }
 
 func (a *Authenticator) Cleanup(_ context.Context) error {
@@ -109,25 +136,28 @@ func (a *Authenticator) Present(_ context.Context, domain, token, keyAuth string
 		return fmt.Errorf("webroot: no webroot configured for domain %q", domain)
 	}
 	challengePath := filepath.Join(path, http01.ChallengePath(token))
-	a.mu.Lock()
-	// Track each directory we have to create so Cleanup can rmdir them.
-	for _, dir := range []string{
-		filepath.Join(path, ".well-known"),
-		filepath.Join(path, ".well-known", "acme-challenge"),
-	} {
+	challengeDir := filepath.Dir(challengePath)
+
+	// Determine which prefix dirs we'll need to create so Cleanup can rmdir
+	// them later. Walks every prefix between `path` (exclusive) and
+	// `challengeDir` (inclusive), recording those that don't yet exist.
+	// Matches Certbot's webroot.py:_create_challenge_dirs which uses
+	// util.get_prefixes(full_root)[:-1].
+	var toCreate []string
+	for dir := challengeDir; dir != path && dir != "/" && dir != "."; dir = filepath.Dir(dir) {
 		if _, err := os.Stat(dir); os.IsNotExist(err) {
-			a.createdDirs = append(a.createdDirs, dir)
+			toCreate = append([]string{dir}, toCreate...)
 		}
 	}
-	a.mu.Unlock()
-	if err := os.MkdirAll(filepath.Dir(challengePath), 0o755); err != nil {
-		return fmt.Errorf("webroot: mkdir %s: %w", challengePath, err)
+	if err := os.MkdirAll(challengeDir, 0o755); err != nil {
+		return fmt.Errorf("webroot: mkdir %s: %w", challengeDir, err)
 	}
 	if err := os.WriteFile(challengePath, []byte(keyAuth), 0o644); err != nil {
 		return fmt.Errorf("webroot: write %s: %w", challengePath, err)
 	}
 	a.mu.Lock()
 	a.writtenFiles = append(a.writtenFiles, challengePath)
+	a.createdDirs = append(a.createdDirs, toCreate...)
 	a.mu.Unlock()
 	return nil
 }

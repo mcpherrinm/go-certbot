@@ -11,6 +11,7 @@ import (
 	"github.com/letsencrypt/go-certbot/internal/account"
 	"github.com/letsencrypt/go-certbot/internal/client"
 	"github.com/letsencrypt/go-certbot/internal/config"
+	"github.com/letsencrypt/go-certbot/internal/display"
 	"github.com/letsencrypt/go-certbot/internal/plugins"
 	"github.com/letsencrypt/go-certbot/internal/storage/renewalconf"
 )
@@ -31,11 +32,13 @@ var revocationReasons = map[string]uint{
 // look up the lineage's fullchain; with --cert-path the user supplies the PEM
 // directly.
 func Revoke(ctx context.Context, cfg *config.Config, reg *plugins.Registry) error {
-	if cfg.CertName == "" && cfg.CertPath == "" {
-		return errors.New("revoke: --cert-name or --cert-path is required")
-	}
 	if cfg.CertName != "" && cfg.CertPath != "" {
-		return errors.New("revoke: exactly one of --cert-name or --cert-path must be specified")
+		// Match Certbot's exact wording (main.py:1366) so user-facing
+		// error grep tooling keeps working.
+		return errors.New("Error! Exactly one of --cert-path or --cert-name must be specified!")
+	}
+	if cfg.CertName == "" && cfg.CertPath == "" {
+		return errors.New("Error! Exactly one of --cert-path or --cert-name must be specified!")
 	}
 	certPath := cfg.CertPath
 	if certPath == "" {
@@ -92,9 +95,19 @@ func Revoke(ctx context.Context, cfg *config.Config, reg *plugins.Registry) erro
 	}
 	fmt.Printf("Congratulations! You have successfully revoked the certificate that was located at %s.\n", certPath)
 
-	if cfg.CertName != "" && cfg.DeleteAfterRevoke {
-		// Reuse Delete logic to also remove on-disk state.
-		return Delete(ctx, cfg, reg)
+	// Mirrors Certbot's main.revoke 786-794: prompt the user to also
+	// delete the lineage (default Yes) unless --no-delete-after-revoke
+	// was passed or there's no lineage to delete.
+	if cfg.CertName != "" {
+		delete := cfg.DeleteAfterRevoke
+		if !cfg.NonInteractive && !cfg.SetByUser("delete-after-revoke") && !cfg.SetByUser("no-delete-after-revoke") {
+			delete = display.YesNoDefault(
+				"Would you like to delete the certificate(s) you just revoked, along with all earlier and later versions of the certificate?",
+				true)
+		}
+		if delete {
+			return Delete(ctx, cfg, reg)
+		}
 	}
 	return nil
 }

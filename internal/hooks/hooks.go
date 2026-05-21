@@ -85,8 +85,11 @@ func RunCapture(ctx context.Context, command string, extraEnv []string) (string,
 }
 
 // RunDir executes every executable file under dir, in lexicographic order.
-// Missing dir is not an error.
-func RunDir(ctx context.Context, dir string, extraEnv []string) error {
+// Missing dir is not an error. dedupAgainst is the flag-hook command (if
+// any) — if a directory hook resolves to the same path (e.g. via symlink)
+// it's skipped so users who symlink their --deploy-hook into
+// renewal-hooks/deploy/ don't see it run twice.
+func RunDir(ctx context.Context, dir string, extraEnv []string, dedupAgainst ...string) error {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
@@ -94,9 +97,29 @@ func RunDir(ctx context.Context, dir string, extraEnv []string) error {
 		}
 		return fmt.Errorf("hooks: read %s: %w", dir, err)
 	}
+	skip := map[string]bool{}
+	for _, h := range dedupAgainst {
+		if h == "" {
+			continue
+		}
+		// dedup on absolute path of the command's first word.
+		first := strings.Fields(h)[0]
+		if abs, err := filepath.Abs(first); err == nil {
+			if real, err := filepath.EvalSymlinks(abs); err == nil {
+				skip[real] = true
+			} else {
+				skip[abs] = true
+			}
+		}
+	}
 	names := make([]string, 0, len(entries))
 	for _, e := range entries {
 		if e.IsDir() {
+			continue
+		}
+		// Skip editor backup files. Matches Certbot's list_hooks
+		// (hooks.py:276) `not path.endswith('~')`.
+		if strings.HasSuffix(e.Name(), "~") {
 			continue
 		}
 		names = append(names, e.Name())
@@ -110,6 +133,16 @@ func RunDir(ctx context.Context, dir string, extraEnv []string) error {
 		}
 		if !isExecutable(info) {
 			slog.Warn("skipping non-executable hook", "path", full)
+			continue
+		}
+		// Check dedup match against the resolved target (the entry may be a
+		// symlink into ../../<somewhere-else>/<hook>).
+		resolved := full
+		if r, err := filepath.EvalSymlinks(full); err == nil {
+			resolved = r
+		}
+		if skip[resolved] {
+			slog.Info("skipping directory hook duplicating flag hook", "path", full)
 			continue
 		}
 		slog.Info("running hook", "path", full)
@@ -164,4 +197,47 @@ func DeployEnv(lineagePath string, domains []string) []string {
 		"RENEWED_LINEAGE=" + lineagePath,
 		"RENEWED_DOMAINS=" + strings.Join(domains, " "),
 	}
+}
+
+// PostEnv builds the env slice for a post-hook invocation:
+//
+//	RENEWED_DOMAINS=<space-separated SANs of newly renewed certs>
+//	FAILED_DOMAINS=<space-separated SANs of certs that failed>
+//
+// Matches certbot/_internal/hooks.py:run_saved_post_hooks. Per Certbot,
+// non-renew verbs (run/certonly) pass FAILED_DOMAINS="".
+func PostEnv(renewed, failed []string) []string {
+	return []string{
+		"RENEWED_DOMAINS=" + strings.Join(renewed, " "),
+		"FAILED_DOMAINS=" + strings.Join(failed, " "),
+	}
+}
+
+// PreRunner deduplicates pre-hook commands so identical pre-hooks (e.g. one
+// per lineage from a multi-cert renew) only fire once per process. Mirrors
+// certbot/_internal/hooks.py:executed_pre_hooks.
+type PreRunner struct {
+	ran map[string]bool
+}
+
+// NewPreRunner returns a fresh PreRunner.
+func NewPreRunner() *PreRunner { return &PreRunner{ran: map[string]bool{}} }
+
+// Run executes cmd once. Subsequent calls with the same command string are
+// no-ops.
+func (p *PreRunner) Run(ctx context.Context, cmd string) error {
+	if cmd == "" || p.ran[cmd] {
+		return nil
+	}
+	p.ran[cmd] = true
+	return Run(ctx, cmd, nil)
+}
+
+// RunDirIf is RunDir gated by enabled. The shorter syntax centralizes the
+// --directory-hooks/--no-directory-hooks toggle at call sites.
+func RunDirIf(ctx context.Context, enabled bool, dir string, env []string, dedup ...string) error {
+	if !enabled {
+		return nil
+	}
+	return RunDir(ctx, dir, env, dedup...)
 }

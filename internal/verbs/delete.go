@@ -1,13 +1,10 @@
 package verbs
 
 import (
-	"bufio"
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"github.com/letsencrypt/go-certbot/internal/config"
 	"github.com/letsencrypt/go-certbot/internal/plugins"
@@ -23,17 +20,13 @@ import (
 // renewal conf to .deleted first so a crash leaves the lineage marked as
 // gone, then remove the directories.
 func Delete(_ context.Context, cfg *config.Config, _ *plugins.Registry) error {
-	if cfg.CertName == "" {
-		return errors.New("delete: --cert-name is required")
+	name, err := chooseCertName(cfg, "delete")
+	if err != nil {
+		return err
 	}
+	cfg.CertName = name
 	if !cfg.NonInteractive {
-		fmt.Fprintf(os.Stderr,
-			"You are about to delete certificate %q. This will remove\n"+
-				"  live/%s/        (web servers using these symlinks will break)\n"+
-				"  archive/%s/     (all historical versions of the cert)\n"+
-				"  renewal/%s.conf (configuration; auto-renewal stops)\n",
-			cfg.CertName, cfg.CertName, cfg.CertName, cfg.CertName)
-		if !confirmYesNo("Continue?") {
+		if !confirmDelete(cfg, cfg.CertName) {
 			fmt.Println("delete: aborted by user.")
 			return nil
 		}
@@ -69,16 +62,4 @@ func Delete(_ context.Context, cfg *config.Config, _ *plugins.Registry) error {
 	}
 	fmt.Printf("Deleted all files relating to certificate %s.\n", cfg.CertName)
 	return nil
-}
-
-// confirmYesNo prompts on stderr and reads a y/n answer from stdin.
-// Returns false on any non-"y" reply (including EOF).
-func confirmYesNo(prompt string) bool {
-	fmt.Fprintf(os.Stderr, "%s [y/N]: ", prompt)
-	scanner := bufio.NewScanner(os.Stdin)
-	if !scanner.Scan() {
-		return false
-	}
-	ans := strings.ToLower(strings.TrimSpace(scanner.Text()))
-	return ans == "y" || ans == "yes"
 }

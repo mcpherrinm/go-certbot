@@ -168,8 +168,28 @@ func (s *FileStorage) findAllUnder(dir string) ([]*Account, error) {
 	return out, nil
 }
 
-// Load reads a single account by id.
+// Load reads a single account by id. If the account isn't under the current
+// server's accounts dir, falls back to a LE_REUSE_SERVERS predecessor (e.g.
+// `acme-v01...` for an `acme-v02...` lookup) and creates a per-account
+// symlink so subsequent calls don't have to walk the chain. Matches
+// AccountFileStorage._load_for_server_path (account.py:200-214).
 func (s *FileStorage) Load(id string) (*Account, error) {
+	if acc, err := s.loadFrom(s.AccountsDir, id); err == nil {
+		return acc, nil
+	}
+	if prev := reuseFallbackDir(s.AccountsDir); prev != "" {
+		if acc, err := s.loadFrom(prev, id); err == nil {
+			// Link the predecessor's account dir into the current
+			// accounts dir so future loads are O(1).
+			_ = os.MkdirAll(s.AccountsDir, 0o700)
+			link := filepath.Join(s.AccountsDir, id)
+			if _, lerr := os.Lstat(link); lerr != nil {
+				_ = os.Symlink(filepath.Join(prev, id), link)
+			}
+			return acc, nil
+		}
+	}
+	// Fall through with the original error.
 	return s.loadFrom(s.AccountsDir, id)
 }
 
@@ -225,16 +245,18 @@ func (s *FileStorage) Save(a *Account) error {
 
 	keyPath := filepath.Join(dir, "private_key.json")
 	if _, err := os.Stat(keyPath); err == nil {
-		// Refuse to clobber an existing key (Certbot's _create uses O_EXCL).
-		// Save() should only be used to create *new* account dirs.
-	} else {
-		keyBytes, err := MarshalJWK(a.Key)
-		if err != nil {
-			return err
-		}
-		if err := writeFileExcl(keyPath, keyBytes, keyMode); err != nil {
-			return err
-		}
+		// Certbot's _create uses safe_open with O_CREAT|O_EXCL and lets the
+		// error propagate. Mirror that — silently skipping the write here
+		// would leave regr.json paired with a *different* key than the
+		// caller passed in.
+		return fmt.Errorf("account: refusing to overwrite existing key at %s", keyPath)
+	}
+	keyBytes, err := MarshalJWK(a.Key)
+	if err != nil {
+		return err
+	}
+	if err := writeFileExcl(keyPath, keyBytes, keyMode); err != nil {
+		return err
 	}
 	// Minimal regr.json: Certbot writes `{"body": {}, "uri": "..."}` and
 	// nothing else (account.py _update_regr).

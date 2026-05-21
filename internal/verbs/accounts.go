@@ -12,6 +12,7 @@ import (
 	"github.com/letsencrypt/go-certbot/internal/account"
 	"github.com/letsencrypt/go-certbot/internal/client"
 	"github.com/letsencrypt/go-certbot/internal/config"
+	"github.com/letsencrypt/go-certbot/internal/display"
 	"github.com/letsencrypt/go-certbot/internal/plugins"
 )
 
@@ -23,7 +24,13 @@ func Register(ctx context.Context, cfg *config.Config, _ *plugins.Registry) erro
 		return errors.New("register: --agree-tos is required")
 	}
 	if cfg.Email == "" && !cfg.RegisterUnsafelyWithoutEmail {
-		return errors.New("register: --email is required (or --register-unsafely-without-email)")
+		if cfg.NonInteractive {
+			return errors.New("register: --email is required (or --register-unsafely-without-email)")
+		}
+		cfg.Email = display.Email("Enter email address (used for urgent renewal and security notices):")
+		if cfg.Email == "" {
+			return errors.New("register: --email is required")
+		}
 	}
 
 	accountsDir, err := cfg.AccountsDir()
@@ -115,9 +122,16 @@ func accountThumbprint(acc *account.Account) (string, error) {
 }
 
 // UpdateAccount updates the contact email for the current account.
+// Prompts interactively for --email when missing (unless --non-interactive).
 func UpdateAccount(ctx context.Context, cfg *config.Config, _ *plugins.Registry) error {
 	if cfg.Email == "" && !cfg.RegisterUnsafelyWithoutEmail {
-		return errors.New("update_account: --email is required (or --register-unsafely-without-email to clear)")
+		if cfg.NonInteractive {
+			return errors.New("update_account: --email is required (or --register-unsafely-without-email to clear)")
+		}
+		cfg.Email = display.Email("Enter the new contact email:")
+		if cfg.Email == "" {
+			return errors.New("update_account: --email is required")
+		}
 	}
 	store, acc, err := loadAccountOrFail(cfg)
 	if err != nil {
@@ -130,9 +144,16 @@ func UpdateAccount(ctx context.Context, cfg *config.Config, _ *plugins.Registry)
 	if err := c.UpdateAccount(ctx, cfg.Email); err != nil {
 		return err
 	}
-	// Update on-disk contact.
+	// Update on-disk contact. Certbot splits comma-separated emails into
+	// one mailto: each (main.py:960).
 	if cfg.Email != "" {
-		acc.Contact = []string{"mailto:" + cfg.Email}
+		acc.Contact = nil
+		for _, e := range strings.Split(cfg.Email, ",") {
+			e = strings.TrimSpace(e)
+			if e != "" {
+				acc.Contact = append(acc.Contact, "mailto:"+e)
+			}
+		}
 	} else {
 		acc.Contact = nil
 	}
@@ -160,7 +181,8 @@ func Unregister(ctx context.Context, cfg *config.Config, _ *plugins.Registry) er
 				"account key can no longer be used for new orders and the account is\n"+
 				"effectively destroyed.\n",
 			acc.ID, cfg.EffectiveServer())
-		if !confirmYesNo("Continue?") {
+		// Certbot defaults Yes on this prompt (main.py:872-892).
+		if !display.YesNoDefault("Are you sure you would like to deactivate this account?", true) {
 			fmt.Println("unregister: aborted by user.")
 			return nil
 		}
@@ -176,7 +198,11 @@ func Unregister(ctx context.Context, cfg *config.Config, _ *plugins.Registry) er
 	if err := os.RemoveAll(store.AccountsDir + string(os.PathSeparator) + acc.ID); err != nil {
 		return fmt.Errorf("unregister: remove %s: %w", acc.ID, err)
 	}
-	fmt.Printf("Unregistered account %s\n", acc.ID)
+	// Best-effort: rmdir the empty server parent dir so a re-registered
+	// account against a different server doesn't see a stale empty tree.
+	// Matches account.py:_delete_links_and_find_target_dir 280-294.
+	_ = os.Remove(store.AccountsDir)
+	fmt.Printf("Account deactivated.\n")
 	return nil
 }
 

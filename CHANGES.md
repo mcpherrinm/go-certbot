@@ -5,7 +5,171 @@ This file tracks every behavior in **go-certbot** that differs from upstream
 drop-in compatibility, so this file should stay short. Anything not listed
 here should behave identically to Certbot.
 
-## Phase 7 (current)
+## Phase 10 (current) — go-certbot 1.2.0 — drop-in parity sweep
+
+Second comprehensive code review surfaced ~150 functional differences. This
+release ports the highest-impact fixes across every surface.
+
+### Renewal/config compatibility
+
+- **DNS plugin keys persisted and restored**: `dns_<plugin>_credentials`
+  and `dns_<plugin>_propagation_seconds` round-trip through
+  `renewal.conf`, so DNS-plugin lineages renew non-interactively.
+- **`ip_addresses` SAN preserved across renewals** (RFC 8738).
+- **VAR_MODIFIERS honored**: `--server` invalidates the conf-recorded
+  account; `--staging`/`--dry-run`→`--server`; `--webroot-path`→
+  `--webroot-map`.
+- **Short-lived-cert renewal math**: certs with lifetime ≤ 10 days renew
+  at NotBefore + lifetime/2 (matches `_default_renewal_time`).
+- **Hook commands with commas** are now correctly quoted so configobj
+  re-parses them as strings, not lists.
+- **`reconfigure` rejects `--server`/`--account`/`--domain` changes**
+  and writes deploy-hook under the historic `renew_hook` key.
+
+### Hooks & manual plugin
+
+- **post-hook env**: `RENEWED_DOMAINS`/`FAILED_DOMAINS` now exported.
+- **pre-hook deduplicated** across lineages in one `renew` run.
+- **Directory hooks gated by `--directory-hooks`/`--no-directory-hooks`**.
+- **`~`-suffix backup files** skipped in directory-hook dispatch.
+- **Manual plugin**: `CERTBOT_ALL_DOMAINS`/`_ALL_IDENTIFIERS` now
+  **comma**-separated. `CERTBOT_REMAINING_CHALLENGES` computed
+  per-Present. `CERTBOT_TOKEN` omitted on DNS-01. `CERTBOT_VALIDATION`
+  contains base64url(sha256(keyAuth)) for DNS-01 (was raw keyAuth).
+  `CERTBOT_AUTH_OUTPUT` stripped.
+
+### Webroot plugin
+
+- Multi-`-w` without an explicit map accepted; last `-w` is the
+  fallback for unmapped domains.
+- All prefix dirs we created are tracked for cleanup.
+- `-w` values are abspath'd before storing.
+
+### Verbs
+
+- **TOS interactive prompt** when `--agree-tos` not set and interactive.
+- **`revoke` prompts to delete the lineage** (default Yes).
+- **`delete`/`install`/`enhance`/`reconfigure` prompt for `--cert-name`**.
+- **`renew` report**: side-frame banner + Congratulations / N renew
+  failure(s) summary; `Processing <conf>` per lineage; expiry date on
+  not-yet-due lineages.
+- **`unregister` prompt defaults to Yes**; removes empty server-parent.
+- **`certonly` success block matches Certbot's `_report_new_cert`**.
+- **`update_account`** splits comma-separated emails.
+- **`plugins`** verb no longer prints the Phase 5/6 placeholder.
+
+### Account storage
+
+- **`Load(id)` falls back to LE_REUSE_SERVERS predecessor** dir +
+  per-account symlinks for v01→v02 migrations.
+- **`Save()` fails loudly** if `private_key.json` exists (was silent
+  no-op).
+
+### CLI flags
+
+- Negators: `--no-hsts`, `--no-uir`, `--no-staple-ocsp`,
+  `--no-delete-after-revoke`.
+- `--disable-hook-validation` properly flips `validate_hooks`.
+- Short aliases: `-a`, `-i`, `-q`.
+- Verb aliases: `auth` (= `certonly`), `everything` (= `run`).
+- `--preferred-challenges` normalizes `http`/`http_01`→`http-01`,
+  `dns`/`dns_01`→`dns-01`.
+- `--must-staple` implies `--staple-ocsp`.
+- `--reason` validated against Certbot's accepted set.
+- `--quiet` implies `--non-interactive`.
+
+### Apache plugin
+
+- **`options-ssl-apache.conf` snippet installed** and `Include`d from
+  every SSL vhost — brings SSLProtocol/SSLCipherSuite/SSLHonorCipherOrder
+  to Mozilla-intermediate (vs Apache defaults).
+- **Marker text** fixed to `# DO NOT REMOVE - Managed by Certbot` for
+  mixed-tool interop.
+- **RHEL/Fedora `Ctl` is `apachectl`** (was `httpd`), so `configtest`/
+  `graceful` work.
+- **`mod_socache_shmcb` enabled** (required by `SSLStaplingCache`).
+- **Per-OS coverage extended**: Fedora, Arch/Manjaro, openSUSE with
+  `VHostRoot` recorded.
+
+### Nginx plugin
+
+- **server_name matching** supports regex (`~^…`), trailing wildcards
+  (`mail.*`), leading-dot (`.example.com`), leading wildcards
+  (`*.example.com`).
+- **Post-reload 1s sleep** to avoid challenge-verification races.
+- **macOS/BSD default config root** honored.
+
+### Infrastructure
+
+- **Log file** at `<logs_dir>/letsencrypt.log` with 1 MiB rotation +
+  `--max-log-backups`. Stderr default threshold WARNING (matches
+  Certbot); file handler captures DEBUG. `Saving debug log to …`
+  banner.
+- **Process lock**: advisory file lock (`.certbot.lock`) on
+  config/work/logs dirs so concurrent invocations don't race.
+
+### Display
+
+- `YesNoDefault(prompt, def)` for default-Yes prompts (TOS, revoke,
+  unregister).
+- `Notify(msg)` for status messages.
+
+## Phase 8 — go-certbot 1.0.0
+
+### Implemented
+
+- **`rollback` verb**: reverts the most recent N config-file changes
+  go-certbot made (defaults to 1; configurable with `--checkpoints
+  N`). Reads checkpoints from `work_dir/backups/<timestamp>-<label>/`,
+  restores each file to the recorded content, removes the consumed
+  checkpoint dirs, and reloads nginx/apache if their control binary
+  is on PATH.
+- **`internal/checkpoint` package**: simple file-snapshot mechanism.
+  `Save(workDir, label, paths)` content-addresses the files under
+  `backups/<timestamp>-<label>/files/<sha>` plus a `manifest.json`.
+  `Restore(workDir, n)` replays the most recent N in reverse,
+  consuming them. Missing files are skipped (nothing to revert to).
+- **Checkpointing wired into nginx and apache** at every install /
+  enhance write so `rollback` has something to undo.
+- **End-to-end Pebble harness** in `tests/e2e/`. Tests start
+  `pebble` + `pebble-challtestsrv` (skipping if either binary isn't
+  on PATH), then exercise `cmd.Main` directly:
+  - `TestE2EStandaloneIssuance` issues a cert against Pebble and
+    verifies `accounts/<server>/<id>/{regr,private_key,meta}.json`,
+    `live/<domain>/*.pem` symlinks, and `renewal/<domain>.conf`
+    contents all match Certbot's layout.
+  - `TestE2ECertificatesListsIssuedCert` follows up with the
+    `certificates` verb and confirms the lineage shows up in its
+    output.
+  To run locally:
+  ```
+  go install github.com/letsencrypt/pebble/v2/cmd/pebble@latest
+  go install github.com/letsencrypt/pebble/v2/cmd/pebble-challtestsrv@latest
+  go test ./tests/e2e -v
+  ```
+
+### Status
+
+Every Certbot 5.x verb and bundled plugin now has an implementation;
+go-certbot is feature-complete vs. the upstream surface area. Tagged
+as **1.0.0**.
+
+| Verb | Status |
+| --- | --- |
+| `run`, `certonly`, `renew`, `certificates`, `delete`, `revoke`, `register`, `unregister`, `update_account`, `show_account`, `install`, `enhance`, `rollback`, `reconfigure`, `plugins` | ✅ |
+
+| Plugin | Status |
+| --- | --- |
+| `standalone`, `webroot`, `manual`, `nginx`, `apache`, 13 DNS plugins | ✅ |
+
+The original intentional breaking changes (single static binary, no
+third-party Python plugin loading, `dns-google` Application Default
+Credentials fallback) remain. Smaller scope limits documented in
+earlier phases (Apache `Include` resolution, per-OS overrides,
+auto-creating server blocks, Augeas-level fidelity) are tracked in
+GitHub issues against this repo as enhancements rather than bugs.
+
+## Phase 7
 
 ### Implemented
 
@@ -239,7 +403,6 @@ small behavioral difference.
 
 | Verb | Planned phase |
 | --- | --- |
-| `rollback` | Phase 8 |
 
 Plugins not yet implemented (using them returns a clear error):
 

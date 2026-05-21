@@ -15,16 +15,23 @@ rewritten in Go on top of [lego v5](https://github.com/go-acme/lego).
 
 ## Status
 
-**Phase 7.** Builds on Phase 6 with the **`enhance` verb** (HSTS,
-upgrade-insecure-requests, OCSP stapling — implemented for both nginx
-and apache via a new `Enhancer` interface), the **`install` verb**
-(install an existing cert into a web server without re-issuing),
-**`--ip-address` SAN support** (lego v5 auto-detects IP literals in
-the identifier list), and **ACME Renewal Info (RFC 9773)** integration
-into `renew` so the ACME server's suggested renewal window is
-respected when supported. Only `rollback` remains stubbed (Phase 8,
-which also brings the comprehensive Pebble-driven integration
-harness). See [`CHANGES.md`](CHANGES.md) for the rollout plan.
+**1.0.0 — feature-complete.** Every Certbot 5.x verb and bundled
+plugin now has a working implementation, end-to-end issuance is
+verified against [Pebble](https://github.com/letsencrypt/pebble) in
+`tests/e2e/`, and a `rollback` verb plus a file-snapshot checkpoint
+system reverts the most recent config changes. See
+[`CHANGES.md`](CHANGES.md) for the full list, including the small,
+documented breaking changes vs upstream Certbot (single static
+binary; no third-party Python plugin loading; a few minor scope
+limits in the nginx/apache configurators).
+
+To run the end-to-end suite locally:
+
+```
+go install github.com/letsencrypt/pebble/v2/cmd/pebble@latest
+go install github.com/letsencrypt/pebble/v2/cmd/pebble-challtestsrv@latest
+go test ./tests/e2e -v
+```
 
 The upstream Certbot source tree is vendored as a git submodule under
 `reference/certbot/` for cross-reference. (We avoid the Go-reserved

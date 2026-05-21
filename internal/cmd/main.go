@@ -14,7 +14,9 @@ import (
 	"github.com/spf13/pflag"
 
 	"github.com/letsencrypt/go-certbot/internal/config"
+	"github.com/letsencrypt/go-certbot/internal/logfile"
 	"github.com/letsencrypt/go-certbot/internal/plugins"
+	"github.com/letsencrypt/go-certbot/internal/processlock"
 	dnscloudflare "github.com/letsencrypt/go-certbot/internal/plugins/dns/cloudflare"
 	dnsdigitalocean "github.com/letsencrypt/go-certbot/internal/plugins/dns/digitalocean"
 	dnsdnsimple "github.com/letsencrypt/go-certbot/internal/plugins/dns/dnsimple"
@@ -42,7 +44,7 @@ func Main(args []string) int {
 	// `--version` always prints and exits.
 	for _, a := range args {
 		if a == "--version" {
-			fmt.Println("go-certbot 0.7.0-phase7")
+			fmt.Println("go-certbot 1.2.0")
 			return 0
 		}
 	}
@@ -74,8 +76,9 @@ func Main(args []string) int {
 	registerFlags(fs, cfg)
 
 	// pflag returns ErrHelp on --help/-h; we catch and reprint our help.
-	var configPath string
-	fs.StringVar(&configPath, "config", "", "Path to an additional cli.ini.")
+	// `--config` and `-c` are accepted, can repeat (matches Certbot).
+	var configPaths []string
+	fs.StringArrayVarP(&configPaths, "config", "c", nil, "Path to an additional cli.ini (repeatable).")
 
 	if err := fs.Parse(rest); err != nil {
 		if errors.Is(err, pflag.ErrHelp) {
@@ -95,8 +98,8 @@ func Main(args []string) int {
 			return 2
 		}
 	}
-	if configPath != "" {
-		if err := loadIni(configPath, fs, cfg); err != nil {
+	for _, p := range configPaths {
+		if err := loadIni(p, fs, cfg); err != nil {
 			fmt.Fprintln(os.Stderr, "go-certbot:", err)
 			return 2
 		}
@@ -113,6 +116,20 @@ func Main(args []string) int {
 	}
 
 	configureLogging(cfg)
+	// Open the rotating log file at <logs_dir>/letsencrypt.log so a debug
+	// log survives the process. Mirrors certbot._internal.log.
+	if closer, err := logfile.Setup(cfg.LogsDir, logLevel(cfg), cfg.MaxLogBackups); err == nil {
+		defer closer.Close()
+	}
+	// Acquire process locks on config/work/logs dirs so concurrent
+	// invocations don't trample shared state. Mirrors
+	// certbot._internal.lock.lock_dir_until_exit.
+	locks, err := processlock.AcquireDirs(cfg.ConfigDir, cfg.WorkDir, cfg.LogsDir)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "go-certbot:", err)
+		return 2
+	}
+	defer locks.Release()
 
 	reg := plugins.NewRegistry()
 	reg.RegisterAuthenticator(standalone.New())
@@ -156,9 +173,9 @@ func Main(args []string) int {
 
 func dispatch(verb string) func(context.Context, *config.Config, *plugins.Registry) error {
 	switch verb {
-	case "", "run":
+	case "", "run", "everything":
 		return verbs.Run
-	case "certonly":
+	case "certonly", "auth":
 		return verbs.Certonly
 	case "renew":
 		return verbs.Renew
@@ -208,18 +225,18 @@ func printHelp(out io.Writer, topic string) {
 	printHelpTopic(out, topic)
 }
 
-// configureLogging maps Certbot's --verbose / --quiet / --verbose-level onto
-// slog. Note that Certbot's --debug controls TRACEBACK display (not log
-// level); we honor that by leaving log level alone when only --debug is set.
-func configureLogging(cfg *config.Config) {
-	level := slog.LevelInfo
+// logLevel maps Certbot's --verbose / --quiet / --verbose-level onto slog.
+// Certbot's default stderr level is WARNING (lowered by 10 per -v;
+// log.py:130-145). --debug controls traceback display, not the level.
+func logLevel(cfg *config.Config) slog.Level {
+	level := slog.LevelWarn
 	switch {
 	case cfg.Quiet:
 		level = slog.LevelError
 	case cfg.Verbose >= 2:
 		level = slog.LevelDebug
 	case cfg.Verbose == 1:
-		level = slog.LevelInfo // already default
+		level = slog.LevelInfo
 	}
 	switch cfg.VerboseLevel {
 	case "debug":
@@ -231,6 +248,17 @@ func configureLogging(cfg *config.Config) {
 	case "error":
 		level = slog.LevelError
 	}
-	h := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})
+	return level
+}
+
+// configureLogging seeds slog with a stderr-only handler at the right level.
+// logfile.Setup will replace it with a tee handler if the logs dir is
+// writable.
+func configureLogging(cfg *config.Config) {
+	h := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: logLevel(cfg)})
 	slog.SetDefault(slog.New(h))
+	// --quiet implies --non-interactive (log.py:140-141).
+	if cfg.Quiet {
+		cfg.NonInteractive = true
+	}
 }

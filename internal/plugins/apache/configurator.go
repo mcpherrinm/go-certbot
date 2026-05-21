@@ -128,20 +128,42 @@ func (p *Plugin) Install(ctx context.Context, cfg *config.Config, domains []stri
 		return fmt.Errorf("apache: no <VirtualHost> matched any of %v in %s (or its includes)", domains, configPath)
 	}
 
+	// Install the Mozilla-intermediate SSL snippet once. The Include
+	// directive is added to every SSL vhost so the recommended
+	// SSLProtocol/SSLCipherSuite/SSLHonorCipherOrder triple takes effect.
+	sslSnippet, err := installOptionsSSLApacheConf(cfg.ConfigDir)
+	if err != nil {
+		return err
+	}
+
 	// Track new -le-ssl.conf files so we write them too.
 	type extraFile struct{ path, body string }
 	var extras []extraFile
 
 	if len(hits443) > 0 {
 		for _, h := range hits443 {
-			applySSLDirectives(h.Sec, fullchainPath, privkeyPath)
+			applySSLDirectives(h.Sec, fullchainPath, privkeyPath, sslSnippet)
 		}
 	} else {
 		// Clone each :80 vhost as a :443 vhost in a separate <basename>-le-ssl.conf.
+		// Skip if the destination file already exists with our managed-by
+		// marker — second runs of `--apache` would otherwise accumulate
+		// duplicate vhosts when ServerName changes between runs.
 		for _, h := range hits80 {
-			clone := cloneAsSSLVHost(h.Sec, fullchainPath, privkeyPath)
 			leSSLPath := strings.TrimSuffix(h.File.Path, filepath.Ext(h.File.Path)) + "-le-ssl.conf"
-			body := wrapInIfModuleSSL(clone)
+			if existing, err := os.ReadFile(leSSLPath); err == nil && strings.Contains(string(existing), managedByMarker) {
+				// Update the existing -le-ssl.conf in place: parse it,
+				// rewrite SSLCertificateFile / SSLCertificateKeyFile, write
+				// it back so the cert path stays current.
+				cfg2, err := parser.Parse(string(existing))
+				if err == nil {
+					updateExistingSSLVHost(cfg2, fullchainPath, privkeyPath, sslSnippet)
+					extras = append(extras, extraFile{path: leSSLPath, body: cfg2.String()})
+					continue
+				}
+			}
+			clone := cloneAsSSLVHost(h.Sec, fullchainPath, privkeyPath, sslSnippet)
+			body := managedByMarker + "\n" + wrapInIfModuleSSL(clone)
 			extras = append(extras, extraFile{path: leSSLPath, body: body})
 		}
 	}
@@ -170,6 +192,13 @@ func (p *Plugin) Install(ctx context.Context, cfg *config.Config, domains []stri
 		if err := os.WriteFile(e.path, []byte(e.body), 0o644); err != nil {
 			return fmt.Errorf("apache: write %s: %w", e.path, err)
 		}
+	}
+	// Make sure mod_ssl / mod_headers / mod_rewrite / mod_socache_shmcb
+	// are loaded. socache_shmcb is required by SSLStaplingCache (added
+	// during enhance --staple-ocsp); enabling it eagerly keeps configtest
+	// green even if the user enhances later.
+	if err := ensureModules(ctx, cfg, []string{"ssl", "headers", "rewrite", "socache_shmcb"}); err != nil {
+		return err
 	}
 	return testAndReload(ctx, cfg)
 }
@@ -212,15 +241,27 @@ func addRewriteRedirect(sec *parser.Section) {
 	)
 }
 
-// apacheConfigPath returns where to read/write.
+// apacheConfigPath returns where to read/write, honoring explicit overrides
+// then falling back to the per-OS default (Debian vs RHEL vs Alpine vs Gentoo
+// — see detectOSOptions).
 func apacheConfigPath(cfg *config.Config) string {
 	if cfg.ApacheConfig != "" {
 		return cfg.ApacheConfig
 	}
+	opts := detectOSOptions()
 	if cfg.ApacheServerRoot != "" {
-		return filepath.Join(cfg.ApacheServerRoot, "apache2.conf")
+		return filepath.Join(cfg.ApacheServerRoot, filepath.Base(opts.ConfigPath))
 	}
-	return "/etc/apache2/apache2.conf"
+	return opts.ConfigPath
+}
+
+// apacheCtl returns the control binary, honoring --apache-ctl then falling
+// back to the per-OS default ("apachectl" / "httpd" / "apache2ctl").
+func apacheCtl(cfg *config.Config) string {
+	if cfg.ApacheCtl != "" {
+		return cfg.ApacheCtl
+	}
+	return detectOSOptions().Ctl
 }
 
 // findMatchingVHosts walks the AST and returns every <VirtualHost> whose
@@ -298,18 +339,51 @@ func vhostMatchesAny(sec *parser.Section, want map[string]bool) bool {
 }
 
 // applySSLDirectives writes (or updates) SSLEngine on, SSLCertificateFile,
-// SSLCertificateKeyFile inside an existing :443 vhost.
-func applySSLDirectives(sec *parser.Section, fullchain, privkey string) {
+// SSLCertificateKeyFile, and `Include options-ssl-apache.conf` inside an
+// existing :443 vhost. The Include pulls in the Mozilla-intermediate
+// SSLProtocol / SSLCipherSuite / SSLHonorCipherOrder triple from
+// installOptionsSSLApacheConf so the vhost doesn't fall back to Apache
+// defaults (= weak ciphers, no protocol pinning).
+func applySSLDirectives(sec *parser.Section, fullchain, privkey, sslSnippet string) {
 	indent := childIndent(sec)
 	setOrAppend(sec, indent, "SSLEngine", "on")
 	setOrAppend(sec, indent, "SSLCertificateFile", fullchain)
 	setOrAppend(sec, indent, "SSLCertificateKeyFile", privkey)
+	if sslSnippet != "" {
+		setOrAppend(sec, indent, "Include", sslSnippet)
+	}
+}
+
+// managedByMarker matches Certbot's exact marker text
+// (certbot-apache/_internal/constants.py:83 — "DO NOT REMOVE - Managed by
+// Certbot") so a mixed-tool deployment (Certbot then go-certbot, or
+// vice-versa) detects the existing cloned vhost and updates in place
+// instead of duplicating it.
+const managedByMarker = "# DO NOT REMOVE - Managed by Certbot"
+
+// updateExistingSSLVHost walks an already-cloned -le-ssl.conf parse tree and
+// refreshes its SSLCertificateFile / SSLCertificateKeyFile to the current
+// fullchain/privkey paths. Used on re-run to keep the path in sync without
+// duplicating the vhost.
+func updateExistingSSLVHost(cfg *parser.Config, fullchain, privkey, sslSnippet string) {
+	var visit func(nodes []parser.Node)
+	visit = func(nodes []parser.Node) {
+		for _, n := range nodes {
+			if sec, ok := n.(*parser.Section); ok {
+				if strings.EqualFold(sec.Name, "VirtualHost") {
+					applySSLDirectives(sec, fullchain, privkey, sslSnippet)
+				}
+				visit(sec.Body)
+			}
+		}
+	}
+	visit(cfg.Nodes)
 }
 
 // cloneAsSSLVHost duplicates a :80 vhost as a new :443 vhost with SSL
 // directives appended. The clone keeps ServerName/ServerAlias/DocumentRoot/
 // other arbitrary directives so the new vhost behaves the same.
-func cloneAsSSLVHost(src *parser.Section, fullchain, privkey string) *parser.Section {
+func cloneAsSSLVHost(src *parser.Section, fullchain, privkey, sslSnippet string) *parser.Section {
 	dst := &parser.Section{
 		OpenIndent:   src.OpenIndent,
 		Name:         "VirtualHost",
@@ -334,6 +408,11 @@ func cloneAsSSLVHost(src *parser.Section, fullchain, privkey string) *parser.Sec
 	dst.Body = append(dst.Body, &parser.Directive{
 		Indent: indent, Name: "SSLCertificateKeyFile", Args: []string{privkey}, Newline: "\n",
 	})
+	if sslSnippet != "" {
+		dst.Body = append(dst.Body, &parser.Directive{
+			Indent: indent, Name: "Include", Args: []string{sslSnippet}, Newline: "\n",
+		})
+	}
 	return dst
 }
 
@@ -357,11 +436,12 @@ func rewritePortIn(v, oldPort, newPort string) string {
 	}
 	rewrite := func(in string) string {
 		// Find the trailing :<port> sequence; for bracketed IPv6 it's after `]:`.
+		// idx points at the character right after the colon — so in[:idx]
+		// includes the colon and we splice newPort in place of oldPort.
 		idx := -1
 		if strings.HasSuffix(in, "]:"+oldPort) {
-			idx = len(in) - len(oldPort) - 1
+			idx = len(in) - len(oldPort)
 		} else if !strings.HasPrefix(in, "[") {
-			// Not bracketed: scan for last ':'.
 			if j := strings.LastIndex(in, ":"); j >= 0 && in[j+1:] == oldPort {
 				idx = j + 1
 			}
@@ -511,17 +591,23 @@ func stripChallengeMarkers(nodes []parser.Node) {
 	}
 }
 
-// testAndReload runs `apachectl configtest` then `apachectl graceful`. Uses
-// cfg.ApacheCtl if set.
+// testAndReload runs configtest then graceful via the per-OS control binary
+// (apachectl on Debian, httpd on RHEL/Alpine, apache2ctl on Gentoo).
+// Honors cfg.ApacheCtl if set.
 func testAndReload(ctx context.Context, cfg *config.Config) error {
-	ctl := cfg.ApacheCtl
-	if ctl == "" {
-		ctl = "apachectl"
-	}
+	ctl := apacheCtl(cfg)
 	if out, err := exec.CommandContext(ctx, ctl, "configtest").CombinedOutput(); err != nil {
 		return fmt.Errorf("apache: `%s configtest` failed: %w\n%s", ctl, err, string(out))
 	}
-	if out, err := exec.CommandContext(ctx, ctl, "graceful").CombinedOutput(); err != nil {
+	// `apachectl graceful` is Debian; `httpd -k graceful` is RHEL.
+	// apachectl accepts `graceful` directly. httpd needs `-k graceful`.
+	var reload *exec.Cmd
+	if strings.Contains(filepath.Base(ctl), "httpd") {
+		reload = exec.CommandContext(ctx, ctl, "-k", "graceful")
+	} else {
+		reload = exec.CommandContext(ctx, ctl, "graceful")
+	}
+	if out, err := reload.CombinedOutput(); err != nil {
 		return fmt.Errorf("apache: `%s graceful` failed: %w\n%s", ctl, err, string(out))
 	}
 	return nil

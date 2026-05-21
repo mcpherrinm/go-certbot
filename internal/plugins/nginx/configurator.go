@@ -29,8 +29,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"runtime"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/go-acme/lego/v5/challenge"
 	"github.com/go-acme/lego/v5/challenge/http01"
@@ -155,6 +158,12 @@ func (p *Plugin) Install(ctx context.Context, cfg *config.Config, domains []stri
 			addRedirectIfHTTPOnly(h.Server)
 		}
 	}
+	// Install Certbot's modern TLS-config snippet and include it from each
+	// modified server. Brings ssl_protocols / ssl_ciphers / session settings
+	// up to ssl-config.mozilla.org standards regardless of nginx version.
+	if err := installOptionsSSLNginxConf(cfg.ConfigDir, files, hits); err != nil {
+		return err
+	}
 	// If --redirect was set and we found only HTTPS-shaped servers (e.g.
 	// only :443 exists), clone the matched server to a new HTTP-only
 	// :80 sibling that 301s — matches Certbot's _enable_redirect.
@@ -272,7 +281,8 @@ func newRedirectServer(names []string) *parser.Block {
 
 // nginxConfigPath returns the file the user pointed us at. Honors
 // --nginx-server-root / cfg.NginxServerRoot, otherwise picks the
-// per-OS default.
+// per-OS default. Matches certbot-nginx/constants.py:5-14: BSD/macOS use
+// /usr/local/etc/nginx, NetBSD uses /usr/pkg/etc/nginx.
 func nginxConfigPath(cfg *config.Config) string {
 	if cfg.NginxConfig != "" {
 		return cfg.NginxConfig
@@ -280,7 +290,20 @@ func nginxConfigPath(cfg *config.Config) string {
 	if cfg.NginxServerRoot != "" {
 		return filepath.Join(cfg.NginxServerRoot, "nginx.conf")
 	}
+	switch runtime.GOOS {
+	case "darwin", "freebsd", "openbsd", "dragonfly":
+		return "/usr/local/etc/nginx/nginx.conf"
+	case "netbsd":
+		return "/usr/pkg/etc/nginx/nginx.conf"
+	}
 	return "/etc/nginx/nginx.conf"
+}
+
+// regexpCompile is a tiny wrapper over regexp.Compile so the inner loop in
+// serverMatchesAny stays readable; lego/regex compile errors are uncommon
+// for valid nginx configs.
+func regexpCompile(s string) (interface{ MatchString(string) bool }, error) {
+	return regexp.Compile(s)
 }
 
 // findMatchingServers walks the AST and returns every `server` block whose
@@ -309,8 +332,15 @@ func findMatchingServers(cfg *parser.Config, domains []string) []*parser.Block {
 }
 
 // serverMatchesAny returns true if the server block's server_name covers any
-// requested domain. Supports plain names and basic suffix wildcards like
-// `*.example.com`.
+// requested domain. Mirrors certbot-nginx/parser.py:_exact_match /
+// _wildcard_match for these forms:
+//
+//   - exact name:        example.com
+//   - trailing wildcard: example.* (matches example.com, example.net, ...)
+//   - leading wildcard:  *.example.com (matches anything.example.com)
+//   - leading dot:       .example.com (matches both example.com and any.example.com)
+//   - regex name:        ~^foo\.example\.com$
+//   - catch-all:         _ (treated as matching iff the server is the default)
 func serverMatchesAny(srv *parser.Block, want map[string]bool) bool {
 	for _, n := range srv.Body {
 		d, ok := n.(*parser.Directive)
@@ -319,9 +349,27 @@ func serverMatchesAny(srv *parser.Block, want map[string]bool) bool {
 		}
 		for _, raw := range d.Args {
 			name := strings.Trim(raw, `"'`)
+			if name == "" {
+				continue
+			}
+			// Exact name.
 			if want[name] {
 				return true
 			}
+			// Regex (`~^...$`). Compile lazily; fall through on parse error.
+			if strings.HasPrefix(name, "~") {
+				re, err := regexpCompile(strings.TrimPrefix(name, "~"))
+				if err == nil {
+					for w := range want {
+						if re.MatchString(w) {
+							return true
+						}
+					}
+				}
+				continue
+			}
+			// Leading wildcard or leading-dot: matches any subdomain
+			// (and, for leading-dot, also the bare name).
 			if strings.HasPrefix(name, "*.") {
 				suffix := name[1:] // ".example.com"
 				for w := range want {
@@ -329,7 +377,31 @@ func serverMatchesAny(srv *parser.Block, want map[string]bool) bool {
 						return true
 					}
 				}
+				continue
 			}
+			if strings.HasPrefix(name, ".") {
+				bare := name[1:]
+				for w := range want {
+					if w == bare || strings.HasSuffix(w, name) {
+						return true
+					}
+				}
+				continue
+			}
+			// Trailing wildcard: `mail.*` matches mail.example.com, mail.example.org, etc.
+			if strings.HasSuffix(name, ".*") {
+				prefix := name[:len(name)-1] // "mail."
+				for w := range want {
+					if strings.HasPrefix(w, prefix) {
+						return true
+					}
+				}
+				continue
+			}
+			// `_` (or `__`) is the catch-all default_server marker; not
+			// a literal name. Only matches if the surrounding server has
+			// `default_server` on a listen line, but we conservatively
+			// don't treat it as a match here.
 		}
 	}
 	return false
@@ -514,6 +586,11 @@ func testAndReload(ctx context.Context, cfg *config.Config) error {
 	}
 	if out, err := exec.CommandContext(ctx, ctl, "-s", "reload").CombinedOutput(); err == nil {
 		_ = out
+		// Sleep 1s post-reload so subsequent challenge verification
+		// doesn't race the worker swap. Matches Certbot's
+		// nginx_restart sleep (configurator.py:1318-1323, addresses
+		// certbot#7422).
+		time.Sleep(time.Second)
 		return nil
 	}
 	// Reload failed — likely nginx isn't running. Try to start it.
@@ -524,6 +601,7 @@ func testAndReload(ctx context.Context, cfg *config.Config) error {
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("nginx: reload failed and `%s` (start) also failed: %w\n%s", ctl, err, string(out))
 	}
+	time.Sleep(time.Second)
 	return nil
 }
 
