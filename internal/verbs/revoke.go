@@ -113,7 +113,11 @@ func Revoke(ctx context.Context, cfg *config.Config, reg *plugins.Registry) erro
 
 	// Mirrors Certbot's main.revoke 786-794: prompt the user to also
 	// delete the lineage (default Yes) unless --no-delete-after-revoke
-	// was passed.
+	// was passed. In non-interactive mode the prompt's default is
+	// returned, so the default behavior is to DELETE — matches
+	// certbot integration test_revoke_simple which expects
+	// `revoke --cert-path X --delete-after-revoke` AND
+	// `revoke --cert-path X` (no flag) to both delete by default.
 	if cfg.CertName != "" {
 		var doDelete bool
 		switch {
@@ -122,9 +126,9 @@ func Revoke(ctx context.Context, cfg *config.Config, reg *plugins.Registry) erro
 		case cfg.SetByUser("no-delete-after-revoke"):
 			doDelete = false
 		case cfg.NonInteractive:
-			// Certbot errors out in non-interactive mode if neither flag
-			// was passed (main.py:788-791 uses force_interactive=True).
-			return errors.New("revoke: --delete-after-revoke or --no-delete-after-revoke must be set in non-interactive mode")
+			// certbot's display_util.yesno returns the default (True)
+			// in non-interactive mode; mirror by defaulting to delete.
+			doDelete = true
 		default:
 			doDelete = display.YesNoDefault(
 				"Would you like to delete the certificate(s) you just revoked, along with all earlier and later versions of the certificate?",
