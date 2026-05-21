@@ -954,3 +954,29 @@ the following additional fixes:
   renewal conf shares the archive_dir.
 - **certonly preserves existing key_type** when --key-type
   unspecified on reissue.
+
+### Phase 14 round-5 continuation
+
+After landing the initial round-5 sweep, additional bugs surfaced through direct
+review of certbot integration tests and `cli_test.py`:
+
+- **revoke: cert-path → lineage resolution.** `revoke --cert-path X` without
+  --cert-name now scans renewal confs to find the owning lineage so the
+  post-revoke delete prompt fires correctly. Server + account pinned from
+  the resolved lineage. (test_revoke_simple.)
+- **revoke: overlap check.** Don't delete when another renewal conf shares
+  the archive_dir.
+- **revoke: non-interactive default-to-delete.** Mirrors certbot's
+  display_util.yesno-returns-default behavior.
+- **certonly: require --cert-name to change key_type on existing lineage.**
+  Mirrors certbot _handle_key_type_change wording.
+- **--reuse-key actually reuses the key** via lego ObtainRequest.PrivateKey.
+  --new-key forces fresh for one run while keeping the flag in renewal.conf.
+  --reuse-key with changed key params errors unless --new-key set.
+- **multi-email --email** support: comma-separated emails saved as one
+  mailto: each (lego limits remote-side to first email).
+- **--force-interactive with renew** rejected (certbot helpful.py).
+- **--preferred-challenges trim** around comma-separated entries.
+- **install paths abspath**: --cert-path / --key-path / --chain-path /
+  --fullchain-path resolved to absolute paths at parse time.
+- **--cert-path routes to AuthCertPath for certonly --csr.**
