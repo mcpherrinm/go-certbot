@@ -136,33 +136,44 @@ func (p *Plugin) Install(ctx context.Context, cfg *config.Config, domains []stri
 		return err
 	}
 
-	// Track new -le-ssl.conf files so we write them too.
+	// On Apache < 2.4.8 the chain must be in a separate
+	// SSLCertificateChainFile; on 2.4.8+ the chain lives inside fullchain
+	// and SSLCertificateChainFile is deprecated. Compute the chain path
+	// from the fullchain path (Certbot's layout ships chain.pem alongside).
+	chainPath := ""
+	if !apacheVersion(ctx, cfg).ge(2, 4, 8) {
+		// Replace fullchain.pem -> chain.pem in the live symlink path.
+		chainPath = deriveChainPath(fullchainPath)
+	}
+
+	// Track new -le-ssl.conf files so we write them too. Each `dest`
+	// records both source path (for clone-from semantics) and final
+	// destination (vhost_root + sites-enabled symlink on Debian).
 	type extraFile struct{ path, body string }
 	var extras []extraFile
 
 	if len(hits443) > 0 {
 		for _, h := range hits443 {
-			applySSLDirectives(h.Sec, fullchainPath, privkeyPath, sslSnippet)
+			applySSLDirectives(h.Sec, fullchainPath, privkeyPath, chainPath, sslSnippet)
 		}
 	} else {
-		// Clone each :80 vhost as a :443 vhost in a separate <basename>-le-ssl.conf.
-		// Skip if the destination file already exists with our managed-by
-		// marker — second runs of `--apache` would otherwise accumulate
-		// duplicate vhosts when ServerName changes between runs.
+		// Clone each :80 vhost as a :443 vhost in a separate -le-ssl.conf
+		// file. The clone lands in cfg.VHostRoot (= <basename>-le-ssl.conf
+		// inside the per-OS vhost_root) rather than next to the source —
+		// matches Certbot's _get_ssl_vhost_path. Skip if the destination
+		// already exists with our managed-by marker; in that case we
+		// update in place.
 		for _, h := range hits80 {
-			leSSLPath := strings.TrimSuffix(h.File.Path, filepath.Ext(h.File.Path)) + "-le-ssl.conf"
+			leSSLPath := sslVHostDestination(cfg, h.File.Path)
 			if existing, err := os.ReadFile(leSSLPath); err == nil && strings.Contains(string(existing), managedByMarker) {
-				// Update the existing -le-ssl.conf in place: parse it,
-				// rewrite SSLCertificateFile / SSLCertificateKeyFile, write
-				// it back so the cert path stays current.
-				cfg2, err := parser.Parse(string(existing))
-				if err == nil {
-					updateExistingSSLVHost(cfg2, fullchainPath, privkeyPath, sslSnippet)
+				cfg2, perr := parser.Parse(string(existing))
+				if perr == nil {
+					updateExistingSSLVHost(cfg2, fullchainPath, privkeyPath, chainPath, sslSnippet)
 					extras = append(extras, extraFile{path: leSSLPath, body: cfg2.String()})
 					continue
 				}
 			}
-			clone := cloneAsSSLVHost(h.Sec, fullchainPath, privkeyPath, sslSnippet)
+			clone := cloneAsSSLVHost(h.Sec, fullchainPath, privkeyPath, chainPath, sslSnippet)
 			body := managedByMarker + "\n" + wrapInIfModuleSSL(clone)
 			extras = append(extras, extraFile{path: leSSLPath, body: body})
 		}
@@ -192,6 +203,15 @@ func (p *Plugin) Install(ctx context.Context, cfg *config.Config, domains []stri
 		if err := os.WriteFile(e.path, []byte(e.body), 0o644); err != nil {
 			return fmt.Errorf("apache: write %s: %w", e.path, err)
 		}
+		// Debian-style layouts: also symlink the new vhost into
+		// sites-enabled/ so Apache actually loads it. Matches
+		// override_debian.enable_site (a2ensite). For non-Debian
+		// layouts vhost_root == conf.d (already auto-included via
+		// IncludeOptional in httpd.conf), so the symlink isn't
+		// needed.
+		if err := ensureDebianSiteEnabled(cfg, e.path); err != nil {
+			return err
+		}
 	}
 	// Make sure mod_ssl / mod_headers / mod_rewrite / mod_socache_shmcb
 	// are loaded. socache_shmcb is required by SSLStaplingCache (added
@@ -200,7 +220,13 @@ func (p *Plugin) Install(ctx context.Context, cfg *config.Config, domains []stri
 	if err := ensureModules(ctx, cfg, []string{"ssl", "headers", "rewrite", "socache_shmcb"}); err != nil {
 		return err
 	}
-	return testAndReload(ctx, cfg)
+	if err := testAndReload(ctx, cfg); err != nil {
+		return err
+	}
+	// Reload succeeded — mark the checkpoint clean so a later SIGINT
+	// doesn't roll back our (already-deployed) change.
+	checkpoint.MarkClean()
+	return nil
 }
 
 // wrapInIfModuleSSL returns the section serialized inside an <IfModule
@@ -255,6 +281,75 @@ func apacheConfigPath(cfg *config.Config) string {
 	return opts.ConfigPath
 }
 
+// deriveChainPath returns the chain.pem path next to fullchain.pem (the
+// Certbot live/<name>/ layout). Returns "" if fullchainPath doesn't end
+// in "fullchain.pem" so we don't emit a bogus SSLCertificateChainFile.
+func deriveChainPath(fullchainPath string) string {
+	base := filepath.Base(fullchainPath)
+	if base != "fullchain.pem" {
+		return ""
+	}
+	return filepath.Join(filepath.Dir(fullchainPath), "chain.pem")
+}
+
+// sslVHostDestination returns the path where the SSL clone of srcPath
+// should land. Matches Certbot's _get_ssl_vhost_path: place the clone
+// under the per-OS vhost_root with a `-le-ssl.conf` suffix on the
+// basename. Falls back to placing the clone next to the source when no
+// vhost_root is configured (matches the original Phase 6 behavior).
+func sslVHostDestination(cfg *config.Config, srcPath string) string {
+	dir := vhostRoot(cfg)
+	base := filepath.Base(srcPath)
+	// Strip the existing extension (Debian: foo.conf; RHEL: foo.conf)
+	// and append `-le-ssl.conf`.
+	name := strings.TrimSuffix(base, filepath.Ext(base)) + "-le-ssl.conf"
+	if dir == "" {
+		return filepath.Join(filepath.Dir(srcPath), name)
+	}
+	return filepath.Join(dir, name)
+}
+
+// ensureDebianSiteEnabled is the in-process analogue of `a2ensite`: for
+// Debian layouts where vhostPath sits under sites-available/, symlink it
+// into sites-enabled/<basename>. No-op for other layouts and for paths
+// already enabled. Returns nil silently if the symlink target's parent
+// directory doesn't exist (i.e. not Debian).
+func ensureDebianSiteEnabled(cfg *config.Config, vhostPath string) error {
+	dir := filepath.Dir(vhostPath)
+	if filepath.Base(dir) != "sites-available" {
+		return nil
+	}
+	parent := filepath.Dir(dir)
+	sitesEnabled := filepath.Join(parent, "sites-enabled")
+	if _, err := os.Stat(sitesEnabled); err != nil {
+		return nil
+	}
+	link := filepath.Join(sitesEnabled, filepath.Base(vhostPath))
+	if _, err := os.Lstat(link); err == nil {
+		return nil // already enabled
+	}
+	// Use a relative symlink (../sites-available/foo.conf) so the link
+	// survives the parent dir being moved.
+	rel := filepath.Join("..", "sites-available", filepath.Base(vhostPath))
+	if err := os.Symlink(rel, link); err != nil {
+		return fmt.Errorf("apache: enable site %s: %w", link, err)
+	}
+	return nil
+}
+
+// vhostRoot returns the directory in which to write -le-ssl.conf clones.
+// Honors --apache-server-root + per-OS VHostRoot; falls back to "" so the
+// caller writes next to the source file.
+func vhostRoot(cfg *config.Config) string {
+	if cfg.ApacheServerRoot != "" {
+		// User explicitly pointed at a server root; assume the standard
+		// Debian layout under it. RHEL users with non-standard layouts
+		// can pass --apache-config directly.
+		return filepath.Join(cfg.ApacheServerRoot, "sites-available")
+	}
+	return detectOSOptions().VHostRoot
+}
+
 // apacheCtl returns the control binary, honoring --apache-ctl then falling
 // back to the per-OS default ("apachectl" / "httpd" / "apache2ctl").
 func apacheCtl(cfg *config.Config) string {
@@ -262,6 +357,80 @@ func apacheCtl(cfg *config.Config) string {
 		return cfg.ApacheCtl
 	}
 	return detectOSOptions().Ctl
+}
+
+// apacheVersion runs `<ctl> -v` and parses the "Server version: Apache/2.4.X"
+// line. Returns (2, 4, 0) when parsing fails so we conservatively assume the
+// older codepath (split chain) and won't write directives unsupported on
+// older Apache.
+//
+// Cached so multiple Install/Enhance calls in the same process don't fork
+// apachectl repeatedly.
+type apacheVer struct{ Major, Minor, Patch int }
+
+var (
+	apacheVerCache    apacheVer
+	apacheVerCacheOK  bool
+)
+
+func apacheVersion(ctx context.Context, cfg *config.Config) apacheVer {
+	if apacheVerCacheOK {
+		return apacheVerCache
+	}
+	ctl := apacheCtl(cfg)
+	out, err := exec.CommandContext(ctx, ctl, "-v").CombinedOutput()
+	if err != nil {
+		// Try the non-wrapper binary as a fallback (e.g. Fedora's
+		// apachectl can't take -v in some configs; httpd directly works).
+		out, err = exec.CommandContext(ctx, "httpd", "-v").CombinedOutput()
+		if err != nil {
+			apacheVerCacheOK = true
+			apacheVerCache = apacheVer{2, 4, 0}
+			return apacheVerCache
+		}
+	}
+	v := parseApacheVersion(string(out))
+	apacheVerCacheOK = true
+	apacheVerCache = v
+	return v
+}
+
+// parseApacheVersion extracts (major, minor, patch) from `apachectl -v` text:
+//
+//	Server version: Apache/2.4.58 (Unix)
+//	Server built:   ...
+//
+// Returns the all-zeros version on parse failure.
+func parseApacheVersion(s string) apacheVer {
+	for _, line := range strings.Split(s, "\n") {
+		_, after, ok := strings.Cut(line, "Apache/")
+		if !ok {
+			continue
+		}
+		parts := strings.SplitN(strings.Fields(after)[0], ".", 3)
+		if len(parts) < 2 {
+			continue
+		}
+		var v apacheVer
+		fmt.Sscanf(parts[0], "%d", &v.Major)
+		fmt.Sscanf(parts[1], "%d", &v.Minor)
+		if len(parts) == 3 {
+			fmt.Sscanf(parts[2], "%d", &v.Patch)
+		}
+		return v
+	}
+	return apacheVer{}
+}
+
+// ge returns true if v >= (M, m, p).
+func (v apacheVer) ge(M, m, p int) bool {
+	if v.Major != M {
+		return v.Major > M
+	}
+	if v.Minor != m {
+		return v.Minor > m
+	}
+	return v.Patch >= p
 }
 
 // findMatchingVHosts walks the AST and returns every <VirtualHost> whose
@@ -344,14 +513,40 @@ func vhostMatchesAny(sec *parser.Section, want map[string]bool) bool {
 // SSLProtocol / SSLCipherSuite / SSLHonorCipherOrder triple from
 // installOptionsSSLApacheConf so the vhost doesn't fall back to Apache
 // defaults (= weak ciphers, no protocol pinning).
-func applySSLDirectives(sec *parser.Section, fullchain, privkey, sslSnippet string) {
+//
+// On Apache < 2.4.8 (when chainPath != ""), SSLCertificateChainFile is also
+// emitted because Apache 2.4.7 and earlier don't accept the chain as part of
+// SSLCertificateFile. Callers pass chainPath = "" for newer Apache.
+func applySSLDirectives(sec *parser.Section, fullchain, privkey, chainPath, sslSnippet string) {
 	indent := childIndent(sec)
 	setOrAppend(sec, indent, "SSLEngine", "on")
 	setOrAppend(sec, indent, "SSLCertificateFile", fullchain)
 	setOrAppend(sec, indent, "SSLCertificateKeyFile", privkey)
+	if chainPath != "" {
+		setOrAppend(sec, indent, "SSLCertificateChainFile", chainPath)
+	} else {
+		// On newer Apache the chain is inside fullchain; remove any
+		// stale SSLCertificateChainFile we (or an older Certbot run)
+		// may have left behind so the vhost doesn't reference a wrong
+		// file after an upgrade.
+		removeDirective(sec, "SSLCertificateChainFile")
+	}
 	if sslSnippet != "" {
 		setOrAppend(sec, indent, "Include", sslSnippet)
 	}
+}
+
+// removeDirective drops every `name` directive from a section's direct
+// children. Matches Certbot's `_clean_vhost` behavior for stale chain refs.
+func removeDirective(sec *parser.Section, name string) {
+	out := sec.Body[:0]
+	for _, n := range sec.Body {
+		if d, ok := n.(*parser.Directive); ok && strings.EqualFold(d.Name, name) {
+			continue
+		}
+		out = append(out, n)
+	}
+	sec.Body = out
 }
 
 // managedByMarker matches Certbot's exact marker text
@@ -365,13 +560,13 @@ const managedByMarker = "# DO NOT REMOVE - Managed by Certbot"
 // refreshes its SSLCertificateFile / SSLCertificateKeyFile to the current
 // fullchain/privkey paths. Used on re-run to keep the path in sync without
 // duplicating the vhost.
-func updateExistingSSLVHost(cfg *parser.Config, fullchain, privkey, sslSnippet string) {
+func updateExistingSSLVHost(cfg *parser.Config, fullchain, privkey, chainPath, sslSnippet string) {
 	var visit func(nodes []parser.Node)
 	visit = func(nodes []parser.Node) {
 		for _, n := range nodes {
 			if sec, ok := n.(*parser.Section); ok {
 				if strings.EqualFold(sec.Name, "VirtualHost") {
-					applySSLDirectives(sec, fullchain, privkey, sslSnippet)
+					applySSLDirectives(sec, fullchain, privkey, chainPath, sslSnippet)
 				}
 				visit(sec.Body)
 			}
@@ -383,7 +578,7 @@ func updateExistingSSLVHost(cfg *parser.Config, fullchain, privkey, sslSnippet s
 // cloneAsSSLVHost duplicates a :80 vhost as a new :443 vhost with SSL
 // directives appended. The clone keeps ServerName/ServerAlias/DocumentRoot/
 // other arbitrary directives so the new vhost behaves the same.
-func cloneAsSSLVHost(src *parser.Section, fullchain, privkey, sslSnippet string) *parser.Section {
+func cloneAsSSLVHost(src *parser.Section, fullchain, privkey, chainPath, sslSnippet string) *parser.Section {
 	dst := &parser.Section{
 		OpenIndent:   src.OpenIndent,
 		Name:         "VirtualHost",
@@ -408,6 +603,11 @@ func cloneAsSSLVHost(src *parser.Section, fullchain, privkey, sslSnippet string)
 	dst.Body = append(dst.Body, &parser.Directive{
 		Indent: indent, Name: "SSLCertificateKeyFile", Args: []string{privkey}, Newline: "\n",
 	})
+	if chainPath != "" {
+		dst.Body = append(dst.Body, &parser.Directive{
+			Indent: indent, Name: "SSLCertificateChainFile", Args: []string{chainPath}, Newline: "\n",
+		})
+	}
 	if sslSnippet != "" {
 		dst.Body = append(dst.Body, &parser.Directive{
 			Indent: indent, Name: "Include", Args: []string{sslSnippet}, Newline: "\n",

@@ -6,7 +6,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 
 	"github.com/letsencrypt/go-certbot/internal/config"
@@ -31,26 +30,11 @@ func chooseCertName(cfg *config.Config, verb string) (string, error) {
 	if cfg.NonInteractive {
 		return "", fmt.Errorf("%s: --cert-name is required in non-interactive mode (available: %s)", verb, strings.Join(names, ", "))
 	}
-	fmt.Fprintf(os.Stderr, "Which certificate would you like to %s?\n", verb)
-	for i, n := range names {
-		fmt.Fprintf(os.Stderr, "  %d. %s\n", i+1, n)
-	}
-	fmt.Fprint(os.Stderr, "Enter a number (or name): ")
-	var buf [256]byte
-	n, _ := os.Stdin.Read(buf[:])
-	pick := strings.TrimSpace(string(buf[:n]))
-	if pick == "" {
+	idx := display.Menu(fmt.Sprintf("Which certificate would you like to %s?", verb), names, 0)
+	if idx < 0 || idx >= len(names) {
 		return "", errors.New("no certificate selected")
 	}
-	if idx, err := strconv.Atoi(pick); err == nil && idx >= 1 && idx <= len(names) {
-		return names[idx-1], nil
-	}
-	for _, n := range names {
-		if n == pick {
-			return n, nil
-		}
-	}
-	return "", fmt.Errorf("%s: %q is not a known certificate name", verb, pick)
+	return names[idx], nil
 }
 
 // listCertNames returns the lineage names found under renewal/ in sorted

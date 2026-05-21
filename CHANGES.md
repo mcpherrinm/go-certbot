@@ -5,7 +5,71 @@ This file tracks every behavior in **go-certbot** that differs from upstream
 drop-in compatibility, so this file should stay short. Anything not listed
 here should behave identically to Certbot.
 
-## Phase 10 (current) — go-certbot 1.2.0 — drop-in parity sweep
+## Phase 11 (current) — go-certbot 1.3.0 — deep parity
+
+Picks up the architectural items deferred from phase 10. Every change here
+brings go-certbot closer to byte-equivalent on-disk state with Certbot.
+
+### Apache
+
+- **Version detection** via `apachectl -v`; forks chain handling at 2.4.8:
+  emits `SSLCertificateChainFile` only on older Apache (where chain inside
+  fullchain isn't supported), strips stale `SSLCertificateChainFile`
+  directives on newer Apache when reinstalling.
+- **`vhost_root` honored** for SSL-clone destination. New `-le-ssl.conf`
+  files land in `/etc/apache2/sites-available/` (Debian),
+  `/etc/httpd/conf.d/` (RHEL/Fedora), `/etc/apache2/vhosts.d/` (Gentoo/
+  SUSE), etc., per the per-OS table.
+- **Debian `sites-enabled` symlink**: when the new vhost lands under
+  `sites-available/`, also symlink it into `sites-enabled/` so Apache
+  actually loads it (in-process equivalent of `a2ensite`).
+
+### Nginx
+
+- **HTTP-01 architecture rewritten to match Certbot**:
+  - Writes a dedicated `<work_dir>/le_http_01_cert_challenge.conf` with
+    one `server { … return 200 "<keyAuth>"; }` block per challenge.
+  - Adds a single `include` line to nginx.conf's `http {}` block plus
+    `server_names_hash_bucket_size 128` (matches `http_01.py:72-244`).
+  - Injects only a `rewrite ^(/.well-known/acme-challenge/.*) $1 break;`
+    at the TOP of each matched server (no more whole `location` block
+    inside user vhosts).
+  - Falls back to a default-server fallback when no `server_name` matches
+    (so IP-address-SAN issuance under RFC 8738 works).
+  - Cleanup undoes the rewrite, the include, the bucket-size, and
+    deletes the challenge conf.
+- **Redirect uses `if ($host = X) { return 301 ... }`** prepended to
+  existing HTTP vhosts (per-domain guard), matching
+  `configurator.py:898-953,1265-1278`. If no HTTP vhost serves the
+  domain, we log and skip — matches Certbot's "no matching insecure
+  server blocks" behavior. The previous whole-`:80`-server clone is
+  gone (could loop behind Cloudflare etc.).
+
+### Signal handling
+
+- **SIGINT/SIGTERM rollback**: `checkpoint.MarkClean()` is called by every
+  installer after a successful reload; on signal exit, the in-flight
+  checkpoint is restored automatically (`checkpoint.RestoreInFlight`).
+  Prints Certbot's `Exiting due to user request.` message. A 5-second
+  hard-deadline goroutine force-exits if the handler is hung.
+
+### Reverter layout
+
+- **Checkpoint dirs now byte-identical to Certbot's** so
+  `certbot rollback` reads go-certbot's checkpoints (and vice-versa):
+  - `<work_dir>/backups/<unix-timestamp>/`
+  - `FILEPATHS` — newline-separated original paths
+  - `CHANGES_SINCE` — label
+  - `NEW_FILES` — files we created (rollback deletes them)
+  - `<basename>_<idx>` — backed-up content, indexed by FILEPATHS line.
+
+### Display
+
+- **`Menu(prompt, items, default)`**, `Checklist(prompt, items)`,
+  `DirectorySelect(prompt, default)` added; used by interactive
+  `--cert-name` selection in delete/install/enhance/reconfigure.
+
+## Phase 10 — go-certbot 1.2.0 — drop-in parity sweep
 
 Second comprehensive code review surfaced ~150 functional differences. This
 release ports the highest-impact fixes across every surface.

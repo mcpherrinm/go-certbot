@@ -58,7 +58,11 @@ func (p *Plugin) Enhance(ctx context.Context, cfg *config.Config, domains []stri
 	if err := os.WriteFile(configPath, []byte(root.String()), 0o644); err != nil {
 		return fmt.Errorf("nginx: write %s: %w", configPath, err)
 	}
-	return testAndReload(ctx, cfg)
+	if err := testAndReload(ctx, cfg); err != nil {
+		return err
+	}
+	checkpoint.MarkClean()
+	return nil
 }
 
 func addHSTS(srv *parser.Block) {

@@ -53,8 +53,8 @@ func TestApplySSLDirectivesIdempotent(t *testing.T) {
 `
 	cfg := parseOrFatal(t, src)
 	sec := cfg.Nodes[0].(*parser.Section)
-	applySSLDirectives(sec, "/fc.pem", "/key.pem", "")
-	applySSLDirectives(sec, "/fc.pem", "/key.pem", "")
+	applySSLDirectives(sec, "/fc.pem", "/key.pem", "", "")
+	applySSLDirectives(sec, "/fc.pem", "/key.pem", "", "")
 	out := cfg.String()
 	if strings.Count(out, "SSLCertificateFile") != 1 {
 		t.Errorf("SSLCertificateFile appeared %d times:\n%s", strings.Count(out, "SSLCertificateFile"), out)
@@ -72,7 +72,7 @@ func TestCloneAsSSLVHostRewritesPort(t *testing.T) {
 `
 	cfg := parseOrFatal(t, src)
 	src80 := cfg.Nodes[0].(*parser.Section)
-	clone := cloneAsSSLVHost(src80, "/fc.pem", "/key.pem", "")
+	clone := cloneAsSSLVHost(src80, "/fc.pem", "/key.pem", "", "")
 	if len(clone.Args) == 0 || !strings.HasSuffix(clone.Args[0], ":443") {
 		t.Errorf("clone should listen on :443, got %v", clone.Args)
 	}

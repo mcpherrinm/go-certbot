@@ -58,7 +58,11 @@ func (p *Plugin) Enhance(ctx context.Context, cfg *config.Config, domains []stri
 	if err := writeAllFiles(files); err != nil {
 		return err
 	}
-	return testAndReload(ctx, cfg)
+	if err := testAndReload(ctx, cfg); err != nil {
+		return err
+	}
+	checkpoint.MarkClean()
+	return nil
 }
 
 // addHSTS adds `Header always set Strict-Transport-Security "max-age=31536000"`
