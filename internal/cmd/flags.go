@@ -407,6 +407,11 @@ func registerFlags(fs *pflag.FlagSet, c *config.Config) {
 		if c.AllowSubsetOfNames && c.CSR.Path != "" {
 			fail("--allow-subset-of-names cannot be used with --csr")
 		}
+		// --csr is only allowed with `certonly` (helpful.py:323-328).
+		// Pre-fix we silently ignored --csr with run/renew/etc.
+		if c.CSR.Path != "" && c.Verb != "" && c.Verb != "certonly" {
+			fail("Currently, a CSR file may only be specified when obtaining a new or replacement via the certonly command.")
+		}
 	})
 
 	// Hide flags Certbot marks help=argparse.SUPPRESS (cli/__init__.py:84-99,

@@ -192,8 +192,15 @@ func Write(configDir, certName string, fullchainPEM, chainPEM, privkeyPEM []byte
 	// 0600 | (prior_mode & (S_IRGRP|S_IWGRP|S_IXGRP|S_IROTH)) so a user
 	// who chmodded an earlier key to add group-read keeps that bit
 	// across renewals, and gid is propagated.
+	//
+	// Privkey writes use O_EXCL to refuse clobbering an existing file.
+	// archive/privkey<N>.pem is per-version unique by construction, so
+	// an existing file at that path indicates lineage corruption (or a
+	// concurrent writer) that we should fail loudly on, not silently
+	// overwrite. Mirrors certbot util.safe_open (storage.py:1073, :1188
+	// pass chmod=BASE_PRIVKEY_MODE + O_EXCL via safe_open's defaults).
 	privMode, copyFrom := computePrivkeyMode(configDir, certName, version)
-	if err := writeFile(arc.Privkey, privkeyPEM, privMode); err != nil {
+	if err := writeFileExclusive(arc.Privkey, privkeyPEM, privMode); err != nil {
 		return nil, err
 	}
 	if copyFrom != "" {
@@ -348,6 +355,26 @@ func computePrivkeyMode(configDir, certName string, newVersion int) (os.FileMode
 	const certbotMask os.FileMode = 0o074
 	_ = mask
 	return 0o600 | (info.Mode().Perm() & certbotMask), prior.Privkey
+}
+
+// writeFileExclusive writes data to path with O_CREAT|O_EXCL|O_WRONLY,
+// failing if the file already exists. Used for archive private-key writes
+// where an existing file indicates a lineage-corruption bug we should
+// surface, not silently overwrite.
+func writeFileExclusive(path string, data []byte, mode os.FileMode) error {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, mode)
+	if err != nil {
+		return fmt.Errorf("storage: create %s: %w", path, err)
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		_ = os.Remove(path)
+		return fmt.Errorf("storage: write %s: %w", path, err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("storage: close %s: %w", path, err)
+	}
+	return nil
 }
 
 func writeFile(path string, data []byte, mode os.FileMode) error {

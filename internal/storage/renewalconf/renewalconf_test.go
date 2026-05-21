@@ -126,6 +126,44 @@ func TestFormatValueListSemantics(t *testing.T) {
 	}
 }
 
+// TestStripInlineComment exercises the configobj-compatible inline-comment
+// stripping. Mirrors certbot/_internal/tests/storage_test.py:749-780 which
+// asserts `useful = value # A useful value` round-trips to a value of just
+// "value".
+func TestStripInlineComment(t *testing.T) {
+	for _, tc := range []struct {
+		in, want string
+	}{
+		{"foo", "foo"},
+		{"foo # bar", "foo"},
+		{"foo  # bar", "foo"},
+		{`"foo # bar"`, `"foo # bar"`},
+		{`'foo # bar'`, `'foo # bar'`},
+		{"# all-comment", ""},
+		{"value # configobj inline", "value"},
+	} {
+		if got := stripInlineComment(tc.in); got != tc.want {
+			t.Errorf("stripInlineComment(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// TestLoadStripsInlineComment is the end-to-end version: a conf line
+// `useful = value # comment` should parse with value == "value".
+func TestLoadStripsInlineComment(t *testing.T) {
+	src := `[renewalparams]
+authenticator = standalone # set by certbot
+key_type = ecdsa
+`
+	f, err := parse([]byte(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := f.RenewalParams["authenticator"]; got != "standalone" {
+		t.Errorf("authenticator = %q, want \"standalone\"", got)
+	}
+}
+
 // TestLoadPreservesUnknownSections asserts that a renewal conf with an
 // [acme_renewal_info] section can be loaded, mutated, and saved without
 // losing the section. Mirrors the ARI Retry-After persistence contract:
