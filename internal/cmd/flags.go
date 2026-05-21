@@ -61,6 +61,14 @@ func registerFlags(fs *pflag.FlagSet, c *config.Config) {
 	// Domains
 	fs.StringSliceVarP(&c.Domains, "domain", "d", c.Domains, "Domain name to include (repeatable).")
 	fs.StringSliceVar(&c.Domains, "domains", c.Domains, "Alias for --domain.")
+	// Mirrors certbot._internal.cli.cli_utils.DomainsAction: lowercase,
+	// strip trailing dot, dedupe preserving order. Without this, a user
+	// who passes `-d Example.COM.` issues against `example.com` but
+	// renewal config records the unnormalized form, causing the next
+	// renewal cycle to think it's a different SAN set.
+	c.PostParseHooks = append(c.PostParseHooks, func() {
+		c.Domains = normalizeDomains(c.Domains)
+	})
 	fs.StringSliceVar(&c.IPAddresses, "ip-address", c.IPAddresses, "IP address SAN (repeatable). Requires --preferred-profile shortlived for Let's Encrypt.")
 	fs.StringVar(&c.CertName, "cert-name", c.CertName, "Name (lineage) under which to track this cert.")
 
@@ -507,4 +515,29 @@ func registerDeprecated(fs *pflag.FlagSet, c *config.Config, names []string) {
 			}
 		})
 	}
+}
+
+
+// normalizeDomains lower-cases each entry, strips trailing dots, and dedupes
+// preserving first-seen order. Mirrors certbot.cli.cli_utils.DomainsAction
+// (cli_utils.py:_DomainsAction.__call__).
+func normalizeDomains(in []string) []string {
+	if len(in) == 0 {
+		return in
+	}
+	out := make([]string, 0, len(in))
+	seen := make(map[string]bool, len(in))
+	for _, raw := range in {
+		s := strings.TrimSpace(raw)
+		s = strings.ToLower(s)
+		// Strip a single trailing dot; an FQDN with `.` at the end
+		// (the root label) is equivalent to the same name without.
+		s = strings.TrimSuffix(s, ".")
+		if s == "" || seen[s] {
+			continue
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	return out
 }

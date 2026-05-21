@@ -35,6 +35,34 @@ func TestFindMatchingServersExact(t *testing.T) {
 	}
 }
 
+// TestFindMatchingServersCaseInsensitive mirrors certbot's
+// parser._exact_match / _wildcard_match which lowercase both sides
+// (parser.py:525-565). DNS names are case-insensitive per RFC 4343.
+func TestFindMatchingServersCaseInsensitive(t *testing.T) {
+	src := `http {
+    server {
+        listen 80;
+        server_name Example.COM www.Example.COM;
+    }
+    server {
+        listen 80;
+        server_name *.WILDCARD.example;
+    }
+}
+`
+	cfg := parseOrFatal(t, src)
+	for _, dom := range []string{"example.com", "EXAMPLE.com", "www.example.com"} {
+		got := findMatchingServers(cfg, []string{dom})
+		if len(got) == 0 {
+			t.Errorf("expected a match for %q (server_name Example.COM)", dom)
+		}
+	}
+	got := findMatchingServers(cfg, []string{"sub.wildcard.example"})
+	if len(got) == 0 {
+		t.Errorf("expected wildcard match for sub.wildcard.example")
+	}
+}
+
 func TestFindMatchingServersWildcard(t *testing.T) {
 	src := `http {
     server {

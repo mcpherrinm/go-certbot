@@ -517,25 +517,44 @@ func findMatchingServers(cfg *parser.Config, domains []string) []*parser.Block {
 //   - regex name:        ~^foo\.example\.com$
 //   - catch-all:         _ (treated as matching iff the server is the default)
 func serverMatchesAny(srv *parser.Block, want map[string]bool) bool {
+	// Build a lowercase view of the wanted names — DNS names are
+	// case-insensitive (RFC 4343) and Certbot's _exact_match /
+	// _wildcard_match lowercases both sides (parser.py:525-565). Without
+	// this, a vhost configured as `server_name Example.COM` wouldn't
+	// match a request for `example.com`.
+	lcWant := make(map[string]bool, len(want))
+	for w := range want {
+		lcWant[strings.ToLower(w)] = true
+	}
 	for _, n := range srv.Body {
 		d, ok := n.(*parser.Directive)
 		if !ok || d.Name != "server_name" {
 			continue
 		}
 		for _, raw := range d.Args {
-			name := strings.Trim(raw, `"'`)
+			name := strings.ToLower(strings.Trim(raw, `"'`))
 			if name == "" {
 				continue
 			}
 			// Exact name.
-			if want[name] {
+			if lcWant[name] {
 				return true
 			}
-			// Regex (`~^...$`). Compile lazily; fall through on parse error.
+			// Regex (`~^...$` or `~*^...$` for case-insensitive).
+			// Compile lazily; fall through on parse error.
 			if strings.HasPrefix(name, "~") {
-				re, err := regexpCompile(strings.TrimPrefix(name, "~"))
+				pat := strings.TrimPrefix(name, "~")
+				caseInsensitive := false
+				if strings.HasPrefix(pat, "*") {
+					pat = strings.TrimPrefix(pat, "*")
+					caseInsensitive = true
+				}
+				if caseInsensitive {
+					pat = "(?i)" + pat
+				}
+				re, err := regexpCompile(pat)
 				if err == nil {
-					for w := range want {
+					for w := range lcWant {
 						if re.MatchString(w) {
 							return true
 						}
@@ -547,7 +566,7 @@ func serverMatchesAny(srv *parser.Block, want map[string]bool) bool {
 			// (and, for leading-dot, also the bare name).
 			if strings.HasPrefix(name, "*.") {
 				suffix := name[1:] // ".example.com"
-				for w := range want {
+				for w := range lcWant {
 					if strings.HasSuffix(w, suffix) {
 						return true
 					}
@@ -556,7 +575,7 @@ func serverMatchesAny(srv *parser.Block, want map[string]bool) bool {
 			}
 			if strings.HasPrefix(name, ".") {
 				bare := name[1:]
-				for w := range want {
+				for w := range lcWant {
 					if w == bare || strings.HasSuffix(w, name) {
 						return true
 					}
@@ -566,7 +585,7 @@ func serverMatchesAny(srv *parser.Block, want map[string]bool) bool {
 			// Trailing wildcard: `mail.*` matches mail.example.com, mail.example.org, etc.
 			if strings.HasSuffix(name, ".*") {
 				prefix := name[:len(name)-1] // "mail."
-				for w := range want {
+				for w := range lcWant {
 					if strings.HasPrefix(w, prefix) {
 						return true
 					}

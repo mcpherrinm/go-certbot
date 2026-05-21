@@ -48,7 +48,8 @@ type Plugin struct {
 
 	mu             sync.Mutex
 	challengeDir   string
-	injectedConfig string // path we wrote to during Present
+	injectedConfig string   // legacy single-file path (compat with tests)
+	injectedFiles  []string // every conf file we mutated during Present (across include tree)
 }
 
 func New() *Plugin { return &Plugin{} }
@@ -85,7 +86,20 @@ func (p *Plugin) Prepare(ctx context.Context, cfg *config.Config, domains []stri
 func (p *Plugin) Cleanup(ctx context.Context) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.injectedConfig != "" {
+	// Strip from every file we touched during injection. On Debian the
+	// challenge Alias lands in sites-enabled/*.conf — the root apache2.conf
+	// usually has zero VirtualHost blocks of its own.
+	seen := map[string]bool{}
+	for _, fpath := range p.injectedFiles {
+		if seen[fpath] {
+			continue
+		}
+		seen[fpath] = true
+		if err := p.removeChallengeAliases(fpath); err != nil {
+			fmt.Fprintf(os.Stderr, "apache: cleanup remove %s: %v\n", fpath, err)
+		}
+	}
+	if p.injectedConfig != "" && !seen[p.injectedConfig] {
 		if err := p.removeChallengeAliases(p.injectedConfig); err != nil {
 			fmt.Fprintf(os.Stderr, "apache: cleanup remove: %v\n", err)
 		}
@@ -798,31 +812,32 @@ func childIndent(sec *parser.Section) string {
 	return strings.Repeat(" ", 4)
 }
 
-// injectChallengeAliases parses the config and inserts a temporary
-// `Alias /.well-known/acme-challenge/ <webroot>/.well-known/acme-challenge/`
+// injectChallengeAliases follows the full Include tree from configPath and
+// inserts a temporary `Alias /.well-known/acme-challenge/ <webroot>/...`
 // directive into every <VirtualHost *:80> that matches any requested domain.
 // A marker comment is added so cleanup can find what we put in.
+//
+// Pre-fix this read only the root apache2.conf, which on Debian/Ubuntu
+// holds zero vhost definitions (vhosts live in sites-enabled/*.conf via
+// IncludeOptional). The auth path then errored out with "no matching
+// VirtualHost" or wrote into the wrong file, breaking http-01 entirely.
 func (p *Plugin) injectChallengeAliases(configPath, webroot string) error {
-	src, err := os.ReadFile(configPath)
+	files, err := loadAll(configPath)
 	if err != nil {
 		return err
 	}
-	root, err := parser.Parse(string(src))
-	if err != nil {
-		return err
+	hits := findMatchingVHostsAcrossFiles(files, p.domains, "80")
+	if len(hits) == 0 {
+		hits = findMatchingVHostsAcrossFiles(files, p.domains, "")
 	}
-	matched := findMatchingVHosts(root, p.domains, "80")
-	if len(matched) == 0 {
-		// Fall back to any matching vhost.
-		matched = findMatchingVHosts(root, p.domains, "")
-	}
-	if len(matched) == 0 {
-		return fmt.Errorf("apache: no <VirtualHost> in %s matches any of %v", configPath, p.domains)
+	if len(hits) == 0 {
+		return fmt.Errorf("apache: no <VirtualHost> in %s (or its includes) matches any of %v", configPath, p.domains)
 	}
 	target := filepath.Join(webroot, ".well-known", "acme-challenge") + string(filepath.Separator)
-	for _, sec := range matched {
-		indent := childIndent(sec)
-		sec.Body = append(sec.Body,
+	touched := map[string]*parsedFile{}
+	for _, h := range hits {
+		indent := childIndent(h.Sec)
+		h.Sec.Body = append(h.Sec.Body,
 			&parser.CommentLine{Verbatim: indent + "# go-certbot acme-challenge (auto-cleaned)", Newline: "\n"},
 			&parser.Directive{Indent: indent, Name: "Alias", Args: []string{`/.well-known/acme-challenge/`, target}, Newline: "\n"},
 			&parser.Section{
@@ -834,11 +849,22 @@ func (p *Plugin) injectChallengeAliases(configPath, webroot string) error {
 				CloseIndent: indent, CloseNewline: "\n",
 			},
 		)
+		touched[h.File.Path] = h.File
 	}
+	// Write back every mutated file. Track which files we wrote so
+	// Cleanup can roll them back.
 	p.mu.Lock()
-	p.injectedConfig = configPath
+	p.injectedConfig = configPath // legacy compat
+	for path := range touched {
+		p.injectedFiles = append(p.injectedFiles, path)
+	}
 	p.mu.Unlock()
-	return os.WriteFile(configPath, []byte(root.String()), 0o644)
+	for path, f := range touched {
+		if err := os.WriteFile(path, []byte(f.AST.String()), 0o644); err != nil {
+			return fmt.Errorf("apache: write %s: %w", path, err)
+		}
+	}
+	return nil
 }
 
 // removeChallengeAliases strips everything we marked with the sentinel comment.
