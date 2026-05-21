@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestSaveAndRestoreRoundTrip(t *testing.T) {
@@ -15,6 +16,7 @@ func TestSaveAndRestoreRoundTrip(t *testing.T) {
 	if _, err := Save(work, "test-1", []string{target}); err != nil {
 		t.Fatal(err)
 	}
+	MarkClean()
 	// Mutate.
 	if err := os.WriteFile(target, []byte("server { listen 443 ssl; }\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -49,10 +51,15 @@ func TestRestoreUndoesCheckpoints(t *testing.T) {
 	if _, err := Save(work, "c1", []string{target}); err != nil {
 		t.Fatal(err)
 	}
+	MarkClean()
 	os.WriteFile(target, []byte("v2\n"), 0o644)
+	// Sleep briefly to ensure the next checkpoint gets a strictly-later
+	// timestamp (Certbot's monotonicity tiebreaker depends on this).
+	time.Sleep(2 * time.Millisecond)
 	if _, err := Save(work, "c2", []string{target}); err != nil {
 		t.Fatal(err)
 	}
+	MarkClean()
 	os.WriteFile(target, []byte("v3\n"), 0o644)
 
 	// Roll back 1 → should restore v2.

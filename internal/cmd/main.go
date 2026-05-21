@@ -145,6 +145,12 @@ func Main(args []string) int {
 	}
 	defer locks.Release()
 
+	// Roll back any in-progress checkpoint left over by a crashed earlier
+	// run. Matches Certbot's Reverter.recovery_routine (reverter.py:80-104).
+	if err := checkpoint.RecoverInterrupted(cfg.WorkDir); err != nil {
+		fmt.Fprintln(os.Stderr, "go-certbot: warning: failed to recover interrupted checkpoint:", err)
+	}
+
 	reg := plugins.NewRegistry()
 	reg.RegisterAuthenticator(standalone.New())
 	reg.RegisterAuthenticator(webroot.New())
