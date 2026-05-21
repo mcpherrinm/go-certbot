@@ -13,10 +13,12 @@ import (
 	"strings"
 )
 
-// emailPattern is Certbot's safe_email validator (util.py:522-530): an at
-// sign separates a non-empty local part from a non-empty domain; neither
-// side may contain whitespace.
-var emailPattern = regexp.MustCompile(`^[^@\s]+@[^@\s]+\.[^@\s]+$`)
+// emailPattern is Certbot's safe_email validator (util.py:522). The
+// local part is restricted to RFC-5322-ish friendly chars and the domain
+// part doesn't require a dot — `me@localhost` is accepted by certbot,
+// rejected by stricter "must have TLD" regexes. The leading-dot and
+// double-dot checks happen below in Email() to match util.py:528.
+var emailPattern = regexp.MustCompile(`^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+$`)
 
 // Input controls where prompts read from and write to. Defaults to os.Stdin/
 // os.Stderr; tests override.
@@ -83,7 +85,9 @@ func (i *Input) Email(prompt string) string {
 		if s == "" {
 			return ""
 		}
-		if emailPattern.MatchString(s) {
+		// Mirror certbot util.safe_email (util.py:525-528): regex match
+		// PLUS no leading dot AND no consecutive dots.
+		if emailPattern.MatchString(s) && !strings.HasPrefix(s, ".") && !strings.Contains(s, "..") {
 			return s
 		}
 		invalidPrefix = "There is a problem with your email address. "
