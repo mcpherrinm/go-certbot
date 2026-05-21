@@ -24,7 +24,9 @@ func chooseCertName(cfg *config.Config, verb string) (string, error) {
 		return "", err
 	}
 	if len(names) == 0 {
-		return "", fmt.Errorf("%s: no certificates found in %s", verb, cfg.RenewalConfigsDir())
+		// Match certbot get_certnames (cert_manager.py:304) so scripts
+		// grepping for the exact text keep working.
+		return "", errors.New("No existing certificates found.")
 	}
 	if cfg.NonInteractive {
 		return "", fmt.Errorf("%s: --cert-name is required in non-interactive mode (available: %s)", verb, strings.Join(names, ", "))
@@ -73,7 +75,7 @@ func chooseCertNames(cfg *config.Config, verb string) ([]string, error) {
 		return nil, err
 	}
 	if len(names) == 0 {
-		return nil, fmt.Errorf("%s: no certificates found in %s", verb, cfg.RenewalConfigsDir())
+		return nil, errors.New("No existing certificates found.")
 	}
 	if cfg.NonInteractive {
 		return nil, fmt.Errorf("%s: --cert-name is required in non-interactive mode (available: %s)", verb, strings.Join(names, ", "))
