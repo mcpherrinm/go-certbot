@@ -5,7 +5,48 @@ This file tracks every behavior in **go-certbot** that differs from upstream
 drop-in compatibility, so this file should stay short. Anything not listed
 here should behave identically to Certbot.
 
-## Phase 5 (current)
+## Phase 6 (current)
+
+### Implemented
+
+- **`apache` plugin** acting as both authenticator and installer.
+  - Hand-rolled Apache config parser in
+    `internal/plugins/apache/parser/`: tokenizer + AST + round-trip
+    emitter that preserves comments, blank lines, line continuations,
+    and quoted args. Line-oriented (Apache's syntax).
+  - http-01 authentication: inserts a temporary
+    `Alias /.well-known/acme-challenge/ <webroot>/.well-known/acme-challenge/`
+    plus `<Directory>` allow block into every matching
+    `<VirtualHost *:80>` (with a marker comment for clean-up).
+    Serves the challenge from a scratch dir; removes the inserted
+    block in `Cleanup`.
+  - Install: locates `<VirtualHost>` blocks by `ServerName` /
+    `ServerAlias` (exact + `*.example.com` suffix wildcard). If a
+    matching `:443` vhost exists, writes `SSLEngine on` /
+    `SSLCertificateFile` / `SSLCertificateKeyFile` into it. Otherwise
+    clones the matching `:80` vhost as a new `:443` vhost with SSL
+    directives appended. Runs `apachectl configtest` then
+    `apachectl graceful`; both binaries are configurable via
+    `--apache-ctl`.
+
+### Known scope limits (planned for follow-ups)
+
+- **`Include` / `IncludeOptional` resolution** is not implemented —
+  point the plugin at the file containing the matching vhost with
+  `--apache-config /path/to/file`.
+- **Per-OS overrides** (Certbot's `override_centos`, `override_suse`,
+  `override_alpine`, …) are not yet replicated. Phase 6 assumes the
+  Debian/Ubuntu layout (`/etc/apache2/apache2.conf`) but every path
+  and binary is flag-configurable, so adapting to RHEL/Alpine is a
+  matter of flags rather than code.
+- **Reduced Augeas fidelity**: Certbot uses python-augeas to parse
+  Apache. We hand-rolled a parser. Round-tripping is byte-identical
+  for simple configs, but tiny formatting differences are possible in
+  complex files (preserved indentation, line-continuation rewrap).
+- **`enhance` verb / HSTS / OCSP stapling / Must-Staple insertion**
+  come in Phase 7.
+
+## Phase 5
 
 ### Implemented
 
@@ -171,13 +212,12 @@ small behavioral difference.
 
 | Verb | Planned phase |
 | --- | --- |
-| `install`, `enhance`, `rollback` | Phase 6 (apache) / Phase 7 |
+| `install`, `enhance`, `rollback` | Phase 7 |
 
 Plugins not yet implemented (using them returns a clear error):
 
 | Plugin | Planned phase |
 | --- | --- |
-| `apache` | Phase 6 |
 
 ### Breaking changes (documented and intentional)
 

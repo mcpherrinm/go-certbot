@@ -81,6 +81,10 @@ type Config struct {
 	NginxServerRoot string // /etc/nginx default
 	NginxCtl        string // nginx binary (default "nginx")
 	Redirect        *bool  // tri-state: nil = ask/auto, true = add 301, false = skip
+	// Apache-specific
+	ApacheConfig     string // explicit apache2.conf path; overrides ApacheServerRoot
+	ApacheServerRoot string // /etc/apache2 default
+	ApacheCtl        string // apachectl binary (default "apachectl")
 	Standalone    bool
 	Webroot       bool
 	WebrootPath   []string
