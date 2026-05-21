@@ -112,18 +112,19 @@ func ShowAccount(_ context.Context, cfg *config.Config, _ *plugins.Registry) err
 	return nil
 }
 
-// accountThumbprint returns the RFC 7638 JWK thumbprint of the account
-// key — SHA-256 of the JSON containing only the REQUIRED public fields,
-// sorted lexically, with no whitespace between separators. Matches
-// josepy's JWK.thumbprint (interfaces.py:180-187) used by Certbot's
-// show_account (main.py:1013).
+// accountThumbprint returns the JWK thumbprint of the account key matching
+// certbot's show_account output. Certbot uses Python's `base64.b64encode`
+// (STANDARD base64, not RFC 7638's base64url) on the raw SHA-256 of the
+// canonical JSON form (main.py:1013). RFC 7638 says base64url, but certbot
+// historically doesn't follow that — we mirror certbot so byte-for-byte
+// show_account output stays identical across the two tools.
 func accountThumbprint(acc *account.Account) (string, error) {
 	canon, err := account.JWKThumbprintCanonical(acc.Key)
 	if err != nil {
 		return "", err
 	}
 	sum := sha256.Sum256(canon)
-	return base64.RawURLEncoding.EncodeToString(sum[:]), nil
+	return base64.StdEncoding.EncodeToString(sum[:]), nil
 }
 
 // UpdateAccount updates the contact email for the current account.
