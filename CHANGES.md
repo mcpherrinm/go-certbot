@@ -980,3 +980,68 @@ review of certbot integration tests and `cli_test.py`:
 - **install paths abspath**: --cert-path / --key-path / --chain-path /
   --fullchain-path resolved to absolute paths at parse time.
 - **--cert-path routes to AuthCertPath for certonly --csr.**
+
+### Phase 14 round-6 (May 2026 continuation)
+
+Another sweep through certbot upstream commits + integration tests
+surfaced ~15 more compatibility gaps:
+
+- **ARI strict lineage server.** When `[renewalparams] server` is empty,
+  skip ARI with certbot's exact "Skipping ARI check because X has no
+  'server' field" warning instead of silently falling back to --server.
+  Mirrors certbot 1f128b0e0.
+- **ARI fetch errors emit warning.** "An error occurred requesting ACME
+  Renewal Information (ARI)…" warning on stderr matches certbot wording
+  so users see the same diagnostic in both tools.
+- **renew rejects -d/--ip-address.** Match certbot post-#10225 wording
+  ("(-d, --domain, and --ip-address are not valid options for the renew
+  subcommand)"). The `--allow-subset-of-names` flag bypasses; cli.ini
+  domains are quietly cleared per certbot helpful.py
+  remove_config_file_domains_for_renewal.
+- **Webroot map keys normalized.** -w/-d interleaving, --webroot-map JSON,
+  and renewal conf [webroot_map] reads now lowercase + trim trailing dot
+  on the key so they match cfg.Domains.
+- **Archive history truncated** after each renewal: keep current + 5
+  prior generations. Mirrors RenewableCert.truncate (storage.py:1229).
+  Without this, daily-renewing setups leave thousands of stale PEMs.
+- **show_account thumbprint** uses standard base64 (b64encode), not
+  base64url. Matches main.py:1013 byte-for-byte.
+- **show_account empty contact** prints "none" not "(none)" per
+  main.py:1024.
+- **--renew-hook + --deploy-hook source tracking** cross-marks so either
+  spelling shows as user-set, preventing mergeFromRenewalConf from
+  overwriting a CLI-passed hook on the next renew.
+- **--webroot-path marks webroot-map user-set** so the conf's map doesn't
+  clobber the -w/-d interleaving on renew.
+- **--allow-subset-of-names + wildcard** rejected upfront with certbot's
+  helpful.py wording.
+- **ACMEv1 URL migration** on renewal conf read: the long-retired
+  acme-v01 directory URL is rewritten to v02 (renewal.py:338-341).
+- **'None' sentinel handled.** Renewal-conf values equal to the literal
+  string "None" (Python None serialized) are treated as absent on read,
+  so KeyType/Installer/etc. don't get the string "None" installed.
+- **Renewal conf mode preserved on Save.** A sysadmin chmod'd
+  renewal/X.conf no longer gets reset to 0o644 on renewal — matches
+  test_atomic_rewrite.
+- **--reuse-key syncs key params** from the loaded prior key. Without
+  this, RSA-4096 lineages renewed via just --reuse-key (no
+  --rsa-key-size) had the next conf write rsa_key_size=2048 (CLI
+  default). Mirrors _update_renewal_params_from_key (renewal.py:751).
+- **install pre-checks cert + key paths exist** with certbot's
+  "Error while reading certificate from path X" / "private key from
+  path X" wording. Mirrors _check_certificate_and_key (main.py:1166).
+- **install rejects --hsts/--uir/--staple/--redirect** without
+  --cert-name (only --cert-path/--key-path supplied). Enhancements
+  need a lineage. Mirrors main.install:1121-1124.
+- **run rejects IP-only domains** upfront — installer can't match IP SANs
+  to vhosts. Mirrors main.run:1438-1440.
+- **revoke verifies cert/key match** before sending the JWS so a typo'd
+  --key-path produces a clear local error, not an opaque server reply.
+  Mirrors crypto_util.verify_cert_matches_priv_key (crypto_util.py:375).
+- **`certificates` output**: drop trailing newline from each entry so the
+  list isn't separated by blank lines certbot doesn't emit; EXPIRED
+  boundary is inclusive (≤) matching cert_manager.py:266.
+- **safe_email regex** matches certbot's exact pattern + leading-dot +
+  double-dot rejection (util.py:522,528).
+- **chooseCertName / chooseCertNames** raise certbot's exact
+  "No existing certificates found." message (cert_manager.py:304).
