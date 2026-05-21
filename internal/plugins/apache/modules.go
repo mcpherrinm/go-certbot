@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/letsencrypt/go-certbot/internal/config"
+	"github.com/letsencrypt/go-certbot/internal/extenv"
 )
 
 // ensureModules makes sure each requested apache module is loaded. On Debian
@@ -49,7 +50,9 @@ func ensureModules(ctx context.Context, cfg *config.Config, want []string) error
 		return nil
 	}
 	args := append([]string{}, missing...)
-	out, err := exec.CommandContext(ctx, opts.A2EnMod, args...).CombinedOutput()
+	a2cmd := exec.CommandContext(ctx, opts.A2EnMod, args...)
+	a2cmd.Env = extenv.Env()
+	out, err := a2cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("apache: `%s %v` failed: %w\n%s", opts.A2EnMod, args, err, string(out))
 	}
@@ -60,7 +63,9 @@ func ensureModules(ctx context.Context, cfg *config.Config, want []string) error
 // loadedModules parses `apachectl -M` (or `httpd -M`) output into a set
 // like {"ssl_module": true, "headers_module": true}.
 func loadedModules(ctx context.Context, ctl string) (map[string]bool, error) {
-	out, err := exec.CommandContext(ctx, ctl, "-M").CombinedOutput()
+	listCmd := exec.CommandContext(ctx, ctl, "-M")
+	listCmd.Env = extenv.Env()
+	out, err := listCmd.CombinedOutput()
 	if err != nil {
 		return nil, err
 	}

@@ -37,6 +37,7 @@ import (
 
 	"github.com/letsencrypt/go-certbot/internal/checkpoint"
 	"github.com/letsencrypt/go-certbot/internal/config"
+	"github.com/letsencrypt/go-certbot/internal/extenv"
 	"github.com/letsencrypt/go-certbot/internal/plugins"
 	"github.com/letsencrypt/go-certbot/internal/plugins/apache/parser"
 )
@@ -437,7 +438,9 @@ func apacheVersion(ctx context.Context, cfg *config.Config) apacheVer {
 		return apacheVerCache
 	}
 	query := apacheQueryBin(cfg)
-	out, err := exec.CommandContext(ctx, query, "-v").CombinedOutput()
+	verCmd := exec.CommandContext(ctx, query, "-v")
+	verCmd.Env = extenv.Env()
+	out, err := verCmd.CombinedOutput()
 	if err != nil {
 		apacheVerCacheOK = true
 		apacheVerCache = apacheVer{2, 4, 0}
@@ -885,7 +888,9 @@ func stripChallengeMarkers(nodes []parser.Node) {
 // Honors cfg.ApacheCtl if set.
 func testAndReload(ctx context.Context, cfg *config.Config) error {
 	ctl := apacheCtl(cfg)
-	if out, err := exec.CommandContext(ctx, ctl, "configtest").CombinedOutput(); err != nil {
+	testCmd := exec.CommandContext(ctx, ctl, "configtest")
+	testCmd.Env = extenv.Env()
+	if out, err := testCmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("apache: `%s configtest` failed: %w\n%s", ctl, err, string(out))
 	}
 	// `apachectl graceful` is Debian; `httpd -k graceful` is RHEL.
@@ -896,6 +901,7 @@ func testAndReload(ctx context.Context, cfg *config.Config) error {
 	} else {
 		reload = exec.CommandContext(ctx, ctl, "graceful")
 	}
+	reload.Env = extenv.Env()
 	if out, err := reload.CombinedOutput(); err == nil {
 		return nil
 	} else {
@@ -908,7 +914,9 @@ func testAndReload(ctx context.Context, cfg *config.Config) error {
 			alt = []string{cfg.ApacheCtl, "restart"}
 		}
 		if len(alt) > 0 {
-			altOut, altErr := exec.CommandContext(ctx, alt[0], alt[1:]...).CombinedOutput()
+			altCmd := exec.CommandContext(ctx, alt[0], alt[1:]...)
+			altCmd.Env = extenv.Env()
+			altOut, altErr := altCmd.CombinedOutput()
 			if altErr == nil {
 				return nil
 			}
