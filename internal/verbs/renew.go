@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"sort"
@@ -14,18 +15,21 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/term"
+
 	"github.com/letsencrypt/go-certbot/internal/account"
 	"github.com/letsencrypt/go-certbot/internal/client"
 	"github.com/letsencrypt/go-certbot/internal/config"
 	"github.com/letsencrypt/go-certbot/internal/hooks"
 	"github.com/letsencrypt/go-certbot/internal/plugins"
+	"github.com/letsencrypt/go-certbot/internal/storage"
 	"github.com/letsencrypt/go-certbot/internal/storage/renewalconf"
 )
 
-// defaultRenewBefore is the window during which we consider a cert "near
-// expiry" if the renewal conf doesn't specify renew_before_expiry. Certbot's
-// default is "30 days" (renewal.py:480).
-const defaultRenewBefore = 30 * 24 * time.Hour
+// shortCertCutoff is the lifetime under which Certbot switches from
+// "renew at 2/3 of lifetime" to "renew at half-life" — see
+// _default_renewal_time (renewal.py:426).
+const shortCertCutoff = 10 * 24 * time.Hour
 
 // Renew implements `go-certbot renew`. Iterates renewal/*.conf, restores the
 // recorded params (with CLI overrides winning), checks expiry, and runs
@@ -80,6 +84,40 @@ func Renew(ctx context.Context, cfg *config.Config, reg *plugins.Registry) error
 	}
 	sort.Strings(names)
 
+	// --cert-name <misspelled>: Certbot raises CertStorageError when there's
+	// no matching lineage (storage.py:63-69). Mirror so non-interactive
+	// scripts don't quietly exit-0.
+	if cfg.CertName != "" {
+		found := false
+		for _, name := range names {
+			if strings.TrimSuffix(name, ".conf") == cfg.CertName {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("renew: no certificate found with name %q", cfg.CertName)
+		}
+	}
+
+	// Random sleep on renew: Certbot inserts a uniform 1-8min delay on the
+	// first lineage that actually needs renewal, but only when stdin is not
+	// a TTY (so interactive runs don't block) and --no-random-sleep-on-renew
+	// wasn't passed (renewal.py:668-708).
+	sleepOnce := false
+	maybeRandomSleep := func() {
+		if sleepOnce || !cfg.RandomSleepOnRenew {
+			return
+		}
+		if term.IsTerminal(int(os.Stdin.Fd())) {
+			return
+		}
+		dur := time.Duration(rand.Int64N(int64(8*time.Minute))) + time.Second
+		slog.Info("non-interactive renewal: random delay", "seconds", dur.Seconds())
+		time.Sleep(dur)
+		sleepOnce = true
+	}
+
 	var renewedCount, parseFailures, renewFailures int
 	for _, name := range names {
 		confPath := filepath.Join(dir, name)
@@ -89,7 +127,7 @@ func Renew(ctx context.Context, cfg *config.Config, reg *plugins.Registry) error
 		}
 		fmt.Println()
 		fmt.Println("Processing", confPath)
-		outcome, err := renewOne(ctx, cfg, reg, confPath, certName, preRunner)
+		outcome, err := renewOne(ctx, cfg, reg, confPath, certName, preRunner, maybeRandomSleep)
 		switch outcome.kind {
 		case outcomeRenewed:
 			renewedCount++
@@ -120,8 +158,11 @@ func Renew(ctx context.Context, cfg *config.Config, reg *plugins.Registry) error
 	}
 	fmt.Println(strings.Repeat("-", 72))
 
-	if renewFailures > 0 {
-		return fmt.Errorf("renew: %d certificate(s) failed", renewFailures)
+	// Certbot exits non-zero when either renew_failures OR parse_failures
+	// is non-zero (renewal.py:744-746). A corrupted renewal.conf shouldn't
+	// silently exit 0.
+	if renewFailures > 0 || parseFailures > 0 {
+		return fmt.Errorf("renew: %d certificate(s) failed to renew, %d parse failure(s)", renewFailures, parseFailures)
 	}
 	return nil
 }
@@ -139,7 +180,7 @@ const (
 	outcomeParseError = 3
 )
 
-func renewOne(ctx context.Context, cli *config.Config, reg *plugins.Registry, confPath, certName string, pre *hooks.PreRunner) (renewOutcome, error) {
+func renewOne(ctx context.Context, cli *config.Config, reg *plugins.Registry, confPath, certName string, pre *hooks.PreRunner, maybeRandomSleep func()) (renewOutcome, error) {
 	conf, err := renewalconf.Load(confPath)
 	if err != nil {
 		return renewOutcome{kind: outcomeParseError}, err
@@ -151,6 +192,15 @@ func renewOne(ctx context.Context, cli *config.Config, reg *plugins.Registry, co
 	merged := *cli // shallow copy is fine; we mutate only scalar fields below
 	merged.CertName = certName
 	mergeFromRenewalConf(&merged, conf)
+
+	// ensure_deployed: a previous interrupted renewal may have written
+	// archive/cert-N+1 without updating the live/ symlinks. Re-link the
+	// live/ dir to the highest archive version so downstream cert reads
+	// (NotAfter check, ARI) see the right cert. Mirrors
+	// storage.RenewableCert.ensure_deployed (storage.py:857-870).
+	if _, err := storage.EnsureDeployed(merged.ConfigDir, certName); err != nil {
+		slog.Warn("ensure_deployed failed", "lineage", certName, "err", err)
+	}
 
 	// Decide whether renewal is needed by reading the leaf NotAfter.
 	leafPath := conf.Top["cert"]
@@ -175,10 +225,16 @@ func renewOne(ctx context.Context, cli *config.Config, reg *plugins.Registry, co
 	// future, respect it. This mirrors RFC 9773 §4.1: clients should use the
 	// server's hint when available.
 	if !cli.ForceRenewal {
-		if dueAt, err := ariDecision(ctx, &merged, leafPath); err == nil && dueAt != nil && dueAt.After(time.Now()) {
+		if dueAt, err := ariDecision(ctx, &merged, conf, confPath, leafPath); err == nil && dueAt != nil && dueAt.After(time.Now()) {
 			fmt.Printf("ARI says wait until %s; skipping renewal.\n", dueAt.Format(time.RFC3339))
 			return renewOutcome{kind: outcomeSkipped, sans: append([]string(nil), merged.Domains...)}, nil
 		}
+	}
+
+	// First lineage that actually needs renewing: insert Certbot's
+	// random-delay sleep (no-op when stdin is a TTY or the flag is off).
+	if maybeRandomSleep != nil {
+		maybeRandomSleep()
 	}
 
 	// Now that we know this lineage needs renewing, run pre-hooks. Deduped
@@ -489,28 +545,25 @@ func needsRenewal(certPath string, conf *renewalconf.File) (bool, time.Time, err
 	if err != nil {
 		return false, time.Time{}, fmt.Errorf("renew: parse cert: %w", err)
 	}
-	// Match Certbot's _default_renewal_time (renewal.py:_default_renewal_time):
+	// Match Certbot's _default_renewal_time (renewal.py:413-431):
 	//   - User-set renew_before_expiry wins.
-	//   - For certs with lifetime <= 10 days, renew at NotBefore + lifetime/2
-	//     (half-life). This is the threshold Certbot uses for short-lived
-	//     ACME certs.
-	//   - Otherwise renew with a `min(L/3, 30 days)` remaining-time window.
-	const shortCertCutoff = 10 * 24 * time.Hour
+	//   - lifetime < 10 days  → renew at NotBefore + lifetime/2 (half-life).
+	//   - else                 → renew at NotBefore + lifetime*2/3 (no clamp).
+	// The 30-day clamp previous go-certbot used is wrong for long-lived
+	// certs (e.g. 365-day → 30d-before vs Certbot's 121d-before).
 	if raw := conf.Top["renew_before_expiry"]; raw != "" {
 		if d, perr := parseRenewBefore(raw); perr == nil {
 			return time.Now().Add(d).After(cert.NotAfter), cert.NotAfter, nil
 		}
 	}
 	lifetime := cert.NotAfter.Sub(cert.NotBefore)
-	if lifetime > 0 && lifetime <= shortCertCutoff {
-		dueAt := cert.NotBefore.Add(lifetime / 2)
-		return !time.Now().Before(dueAt), cert.NotAfter, nil
+	var dueAt time.Time
+	if lifetime > 0 && lifetime < shortCertCutoff {
+		dueAt = cert.NotBefore.Add(lifetime / 2)
+	} else {
+		dueAt = cert.NotBefore.Add(lifetime * 2 / 3)
 	}
-	window := defaultRenewBefore
-	if oneThird := lifetime / 3; oneThird > 0 && oneThird < window {
-		window = oneThird
-	}
-	return time.Now().Add(window).After(cert.NotAfter), cert.NotAfter, nil
+	return !time.Now().Before(dueAt), cert.NotAfter, nil
 }
 
 // parseRenewBefore parses Certbot's English-language interval, including

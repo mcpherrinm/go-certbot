@@ -415,7 +415,19 @@ func applyDryRunSideEffects(c *config.Config) {
 	if !c.DryRun {
 		return
 	}
-	// --dry-run implies --staging.
+	// --dry-run rewrites --server to the staging directory (only when the
+	// user didn't explicitly pick a custom server) and clears --account so
+	// the staging-side registration is used rather than a prod account.
+	// Certbot: cli_utils.py:set_test_server_options.
+	if !c.SetByUser("server") || c.Server == config.DefaultLetsEncryptDirectory {
+		c.Server = config.StagingDirectory
+		c.MarkSet("server", config.SourceRuntime)
+	}
+	if !c.SetByUser("account") {
+		c.Account = ""
+	}
+	// --dry-run still implies the --staging flag so downstream code
+	// (EffectiveServer, etc.) sees a consistent picture.
 	c.Staging = true
 	c.MarkSet("staging", config.SourceRuntime)
 	// --dry-run implies --break-my-certs so issuance against a non-default

@@ -183,6 +183,62 @@ func Write(configDir, certName string, fullchainPEM, chainPEM, privkeyPEM []byte
 	}, nil
 }
 
+// EnsureDeployed re-links live/<certname>/{cert,chain,fullchain,privkey}.pem
+// to the highest-numbered archive version present on disk. Mirrors
+// certbot.storage.RenewableCert.ensure_deployed (storage.py:857-870) which
+// recovers from interrupted-renewal state where archive/N+1 exists but the
+// live/ symlinks still point at N.
+//
+// Returns the version it pointed at (highest available), or 0 if archive
+// is empty.
+func EnsureDeployed(configDir, certName string) (int, error) {
+	archive := ArchiveDir(configDir, certName)
+	entries, err := os.ReadDir(archive)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	highest := 0
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasPrefix(name, "cert") || !strings.HasSuffix(name, ".pem") {
+			continue
+		}
+		n, err := strconv.Atoi(strings.TrimSuffix(strings.TrimPrefix(name, "cert"), ".pem"))
+		if err == nil && n > highest {
+			highest = n
+		}
+	}
+	if highest == 0 {
+		return 0, nil
+	}
+	arc := archiveSet(configDir, certName, highest)
+	live := liveSet(configDir, certName)
+	for _, sl := range []struct{ live, target string }{
+		{live.Cert, arc.Cert},
+		{live.Privkey, arc.Privkey},
+		{live.Chain, arc.Chain},
+		{live.Fullchain, arc.Fullchain},
+	} {
+		// Read the existing link target — only re-link if it's stale or
+		// missing. This avoids writing on every renew run.
+		want, err := filepath.Rel(filepath.Dir(sl.live), sl.target)
+		if err != nil {
+			return 0, err
+		}
+		got, _ := os.Readlink(sl.live)
+		if got == want {
+			continue
+		}
+		if err := replaceSymlink(sl.live, sl.target); err != nil {
+			return 0, err
+		}
+	}
+	return highest, nil
+}
+
 // replaceSymlink atomically replaces a symlink at linkPath with one pointing
 // at target. Uses a relative target so the link survives moves of configDir.
 func replaceSymlink(linkPath, target string) error {
