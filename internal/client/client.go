@@ -5,6 +5,9 @@ package client
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/x509"
 	"encoding/pem"
 	"errors"
@@ -177,6 +180,21 @@ func (c *Client) Obtain(ctx context.Context, auth plugins.Authenticator, domains
 		Profile:        c.cfg.PreferredProfile,
 		KeyType:        kt,
 	}
+	// P-521 / secp521r1: lego's certcrypto only defines EC256/EC384, so
+	// pre-generate the key ourselves and pass it via req.PrivateKey
+	// (lego's getObtainRequestPrivateKey honors PrivateKey when set —
+	// certificate.go:780-789). Certbot supports P-521 so a drop-in
+	// replacement should too.
+	if c.cfg.KeyType == "ecdsa" {
+		switch c.cfg.EllipticCurve {
+		case "secp521r1", "P-521":
+			key, err := ecdsa.GenerateKey(elliptic.P521(), rand.Reader)
+			if err != nil {
+				return nil, fmt.Errorf("client: generate P-521 key: %w", err)
+			}
+			req.PrivateKey = key
+		}
+	}
 	if c.cfg.RequiredProfile != "" {
 		req.Profile = c.cfg.RequiredProfile
 	}
@@ -266,22 +284,30 @@ func certKeyType(cfg *config.Config) (certcrypto.KeyType, error) {
 		switch cfg.RSAKeySize {
 		case 0, 2048:
 			return certcrypto.RSA2048, nil
+		case 3072:
+			return certcrypto.RSA3072, nil
 		case 4096:
 			return certcrypto.RSA4096, nil
 		case 8192:
 			return certcrypto.RSA8192, nil
 		}
-		return "", fmt.Errorf("client: unsupported rsa_key_size %d", cfg.RSAKeySize)
+		return "", fmt.Errorf("client: unsupported rsa_key_size %d (supported: 2048, 3072, 4096, 8192)", cfg.RSAKeySize)
 	case "ecdsa", "ec", "":
 		switch cfg.EllipticCurve {
 		case "", "secp256r1", "P-256":
 			return certcrypto.EC256, nil
 		case "secp384r1", "P-384":
 			return certcrypto.EC384, nil
+		case "secp521r1", "P-521":
+			// lego's KeyType enum doesn't include EC521; Obtain()
+			// pre-generates the key and sets req.PrivateKey, after
+			// which lego ignores req.KeyType. Returning EC384 is a
+			// safe placeholder.
+			return certcrypto.EC384, nil
 		}
-		return "", fmt.Errorf("client: unsupported elliptic_curve %q", cfg.EllipticCurve)
+		return "", fmt.Errorf("client: unsupported elliptic_curve %q (supported: secp256r1, secp384r1, secp521r1)", cfg.EllipticCurve)
 	}
-	return "", fmt.Errorf("client: unsupported key_type %q", cfg.KeyType)
+	return "", fmt.Errorf("client: unsupported key_type %q (supported: rsa, ecdsa)", cfg.KeyType)
 }
 
 // toPKCS8 rewraps a PEM-encoded private key into a PKCS#8 `PRIVATE KEY`

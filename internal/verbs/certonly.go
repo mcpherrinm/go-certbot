@@ -75,6 +75,17 @@ func Certonly(ctx context.Context, cfg *config.Config, reg *plugins.Registry) er
 			// proceed to issuance under a fresh cert-name suffix
 			certName = nextDuplicateCertName(cfg, certName)
 		}
+		// When reissuing an existing lineage, keep the existing
+		// key_type if the user didn't explicitly pass --key-type.
+		// Mirrors certbot integration test
+		// test_certonly_non_default_key_size_kept: `certonly
+		// --force-renewal -d existing` without --key-type preserves
+		// the lineage's key_type but resets key SIZE to the default
+		// (i.e. we do NOT also restore rsa_key_size; that uses the
+		// CLI default 2048).
+		if reuse != "newcert" {
+			mergeExistingKeyType(cfg, certName)
+		}
 	}
 
 	// pre_hook runs before challenge work; post_hook always runs after.
@@ -195,6 +206,32 @@ func resolveAuthenticatorName(cfg *config.Config) (string, error) {
 		return "", errors.New("certonly: an authenticator is required (--standalone / --webroot / --manual / --dns-* / --authenticator)")
 	}
 	return picked, nil
+}
+
+// mergeExistingKeyType reads the existing lineage's renewal conf and
+// preserves the lineage's key_type when the user didn't pass --key-type
+// on the cmd line. Per certbot test_certonly_non_default_key_size_kept,
+// key_type stays but key SIZE resets to default — so we only merge the
+// key_type and elliptic_curve fields, not rsa_key_size.
+func mergeExistingKeyType(cfg *config.Config, certName string) {
+	if cfg.SetByUser("key-type") {
+		return
+	}
+	confPath := filepath.Join(cfg.RenewalConfigsDir(), certName+".conf")
+	conf, err := renewalconf.Load(confPath)
+	if err != nil {
+		return
+	}
+	if v := conf.RenewalParams["key_type"]; v != "" {
+		cfg.KeyType = v
+	}
+	// Preserve elliptic_curve only when key_type is ecdsa AND the user
+	// didn't pass --elliptic-curve; otherwise the CLI default applies.
+	if cfg.KeyType == "ecdsa" && !cfg.SetByUser("elliptic-curve") {
+		if v := conf.RenewalParams["elliptic_curve"]; v != "" {
+			cfg.EllipticCurve = v
+		}
+	}
 }
 
 // findCertDispatch looks for an existing lineage that overlaps with the

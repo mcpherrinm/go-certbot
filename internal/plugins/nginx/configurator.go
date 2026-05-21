@@ -285,12 +285,23 @@ func (p *Plugin) Install(ctx context.Context, cfg *config.Config, domains []stri
 	return nil
 }
 
-// serverIsHTTPS reports whether the server block listens on :443 or has any
-// listen directive with the `ssl` keyword.
+// serverIsHTTPS reports whether the server block listens on :443, has any
+// listen directive with the `ssl` keyword, OR has a top-level `ssl on;`
+// directive. Mirrors certbot _is_ssl_on_directive + has_ssl_on_directive
+// (parser.py:582-591, configurator.py:629-630). The standalone `ssl on;`
+// form was deprecated in nginx 1.15 but legacy configs still use it; pre-
+// fix go-certbot misclassified those servers as HTTP and skipped them.
 func serverIsHTTPS(srv *parser.Block) bool {
 	for _, n := range srv.Body {
 		d, ok := n.(*parser.Directive)
-		if !ok || d.Name != "listen" || len(d.Args) == 0 {
+		if !ok {
+			continue
+		}
+		if d.Name == "ssl" && len(d.Args) == 1 &&
+			strings.EqualFold(strings.Trim(d.Args[0], `"'`), "on") {
+			return true
+		}
+		if d.Name != "listen" || len(d.Args) == 0 {
 			continue
 		}
 		if containsArg(d.Args, "ssl") {
