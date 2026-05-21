@@ -22,6 +22,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -126,7 +127,7 @@ func (a *Authenticator) Present(ctx context.Context, domain, token, keyAuth stri
 		default:
 			fmt.Fprintf(os.Stderr, httpInstructions+"\n",
 				keyAuth,
-				"http://"+domain+"/.well-known/acme-challenge/"+token)
+				"http://"+httpURIHost(domain)+"/.well-known/acme-challenge/"+token)
 		}
 		_ = display.YesNoDefault("Press Y to continue", true)
 		a.mu.Lock()
@@ -144,6 +145,16 @@ func (a *Authenticator) Present(ctx context.Context, domain, token, keyAuth stri
 	a.authOutputs[domain] = strings.TrimSpace(out)
 	a.mu.Unlock()
 	return nil
+}
+
+// httpURIHost wraps `host` in brackets if it's an IPv6 literal. RFC 3986
+// §3.2.2 requires bracketing for IPv6 hosts in HTTP URIs (`http://[::1]/...`).
+// Mirrors certbot's acme.challenges.HTTP01.uri fix (PR #10548 / bd7b64f1e).
+func httpURIHost(host string) string {
+	if ip := net.ParseIP(host); ip != nil && strings.Contains(host, ":") {
+		return "[" + host + "]"
+	}
+	return host
 }
 
 func envValue(env []string, key string) string {

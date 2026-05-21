@@ -788,3 +788,195 @@ surprises. Highlights:
   operate on an accounts dir owned by a different uid. Empty accounts
   dir + populated predecessor (per `LE_REUSE_SERVERS`) now migrates as a
   whole-directory symlink, matching `account.py:200-213`.
+
+## Phase 14 — Certbot 4.0–5.6 bug sweep
+
+Audit of bug-fix commits Certbot landed between releases 4.0.0 and 5.6.0
+(2025-04 through 2026-05). Each item below is a bug that existed in
+go-certbot and has now been fixed; items already present in go-certbot
+or not applicable to this codebase aren't listed.
+
+- **Private keys saved in PKCS#8** (was lego's PKCS#1 for RSA, SEC1 for
+  EC). `internal/client/client.go` now rewraps `resource.PrivateKey`
+  with `x509.MarshalPKCS8PrivateKey` before passing to storage.Write.
+  Matches certbot 3.2.0 — Certbot itself regressed to PKCS#1 in 3.1
+  before fixing this; go-certbot inherited the buggy state from lego.
+
+- **Scrub snap env from every external program**, not just user hooks.
+  New `internal/extenv` package strips SNAP*, OPENSSL_MODULES,
+  OPENSSL_FORCE_FIPS_MODE, LD_PRELOAD, PYTHONPATH and trims /snap/
+  entries from PATH / LD_LIBRARY_PATH. Applied to nginx -t / -s reload
+  / -c (start), apache `-v` / configtest / graceful / restart_cmd_alt,
+  a2enmod, and httpd -M. Hooks already had a subset of this scrub; the
+  new package is the single source of truth.
+
+- **nginx addListenSSL preserves IP host.** When converting `listen
+  127.0.0.1:80;` to SSL, the emitted listen now reads `listen
+  127.0.0.1:443 ssl;` (was bare `listen 443 ssl;`, losing the bind
+  address). Mirrors certbot _make_server_ssl
+  (configurator.py:709-784). New `TestInsertSSLPreservesIPHost`.
+
+- **nginx http {} discovery across included files.** http_01.py /
+  nginx-installer-style edits now scan every parsed file for the
+  `http {}` block, not just `nginx.conf`. Distros that place http {} in
+  `/etc/nginx/conf.d/server.conf` (and use the root nginx.conf only
+  for `events {}` + `include`) previously silently did nothing and
+  http-01 challenges failed.
+
+- **nginx parser tolerates inline comments inside directive args.**
+  `server_name *.example.com\n  # internal\n  www.example.com;` now
+  parses with both names retained and the comment preserved through
+  round-trip. Mirrors certbot 6fd6a541d (#10147). New AST fields
+  `Directive.InternalComments` and `Directive.ArgLeadingWS` keep edits
+  on these directives lossless.
+
+- **nginx lexer handles multibyte whitespace.** consumeWhitespace /
+  consumeWord now use `utf8.DecodeRuneInString` instead of byte-cast
+  rune, so NBSP (U+00A0, UTF-8 `C2 A0`) and other multibyte spaces
+  inserted by word processors lex as whitespace. Pre-fix the leading
+  0xC2 byte silently glued into the next word.
+
+- **manual plugin HTTP-01 instructions bracket IPv6.** Interactive
+  manual mode now prints `http://[::1]/.well-known/acme-challenge/...`
+  rather than `http://::1/...`. Mirrors certbot bd7b64f1e (#10548).
+
+- **Skip ARI for expired certs and during --dry-run.** RFC 9773 §4.3
+  forbids ARI for expired serials; certbot 95a70e98c added the gate.
+  Separately, `--dry-run` against staging while the cert was issued by
+  prod produced a noisy mismatch warning (certbot b68268744); the
+  dry-run path doesn't need ARI anyway.
+
+- **Auto-register without email when prompt blank.** Empty interactive
+  email response (or `--non-interactive` with no email) now flips
+  `RegisterUnsafelyWithoutEmail = true` rather than returning an
+  error. Matches the accounts verb's behavior and certbot 3.3.0.
+
+## Phase 14 — round-5 extended sweep
+
+After the initial Phase 14 batch, four parallel audit agents inspected
+nginx, apache, storage, and CLI for residual bugs. The findings produced
+the following additional fixes:
+
+### Storage / on-disk compatibility
+
+- **ARI Retry-After datetime format.** Certbot writes a NAIVE ISO
+  datetime (no tz suffix); reader compares to naive datetime.now() and
+  raises TypeError on tz-aware input. We were writing time.RFC3339
+  ('...Z'), which crashed Certbot's renewal logic on every read.
+  Now naive form; reader accepts both.
+- **`[acme_renewal_info]` preservation.** writeRenewalConf was creating
+  a fresh File every time and wiping any Certbot-written section.
+  Loads existing first, merges only known keys.
+- **NextVersion scans all four kinds** (cert/privkey/chain/fullchain),
+  not just `cert*.pem`. Pre-fix an orphaned privkey<N>.pem after a
+  manual cleanup would be silently overwritten.
+- **Privkey mode + gid preserved on renewal.** Mirrors
+  certbot.compat.filesystem.compute_private_key_mode + chown.
+- **O_EXCL on archive privkey write.** Refuses to clobber an existing
+  per-version file.
+- **previous_*.pem recovery.** EnsureDeployed detects Certbot's
+  half-completed-link-update sentinels and restores the live links
+  to the previous_* target before any further write.
+- **renewalconf: inline `# comments` stripped from values** on parse.
+- **renewalconf: deterministic emission** for unordered residue keys.
+
+### CLI surface
+
+- **Domain normalization**: lowercase, trim trailing dot, dedupe per
+  certbot DomainsAction.
+- **`--key-type` lowercased** before validation; downstream string
+  compares work.
+- **Mutual-exclusion guards**: `--force-interactive` vs `-n`, `--hsts`
+  vs `--auto-hsts`, `--csr` vs `--allow-subset-of-names`, `--csr`
+  restricted to certonly, `--dry-run` restricted to
+  certonly/renew/run/reconfigure.
+- **`--dry-run` TOS auto-flip** gated on existing account on disk.
+- **`--quiet` redirects stdout** to /dev/null (was only suppressing
+  slog; verb-level Println calls still leaked).
+- **Non-interactive account creation** requires `--email` or
+  `--register-unsafely-without-email`.
+- **Auto-register on blank email** in interactive mode.
+- **RSA 3072** added; **secp521r1 (P-521)** supported via
+  pre-generated key (lego's certcrypto lacks EC521).
+
+### nginx plugin
+
+- **server_name matching is case-insensitive** (RFC 4343).
+- **`_make_server_ssl`-equivalent preserves IP host** on the new SSL
+  listen, emits `ipv6only=on` on the default IPv6 fallback, detects
+  legacy `ssl on;` directive at the server-block level.
+- **Best-vhost selection per domain** (exact > leading-wildcard >
+  trailing-wildcard > regex, SSL tie-break). Pre-fix Install touched
+  every overlapping vhost.
+- **Implicit HTTP listen preserved** on SSL install: if a vhost had
+  no listen directives at all, add explicit `listen 80;` first so the
+  vhost keeps its HTTP listener.
+- **default_server fallback prefers port 80**, then 443, then any.
+- **splitListenAddr handles bare hostname**: `listen myhost;` now
+  parsed as host with empty port (= default 80).
+- **Parser tolerates inline `# comment` between directive args**
+  (multi-line server_name); preserves them through round-trip via
+  new InternalComments + ArgLeadingWS AST fields.
+- **NBSP whitespace** decoded as a rune.
+- **`http {}` block discovery** spans all parsed files; tracks owning
+  file for cleanup.
+
+### apache plugin
+
+- **Authenticator walks the Include tree.** Pre-fix it parsed only
+  the root apache2.conf, so on Debian (vhosts in sites-enabled/*.conf)
+  http-01 failed entirely with "no <VirtualHost> matches".
+- **Authenticator checkpoints** the modified config files BEFORE
+  writing the challenge Alias snippet, so a crash between Present and
+  Cleanup can be rolled back instead of leaving the injected snippet
+  forever.
+- **options-ssl-apache.conf included in install checkpoint** so
+  rollback restores the pre-existing version.
+- **Hand-modified options-ssl-apache.conf digest** file written so
+  the warning only prints once per file state.
+- **realpath dedupe** in loadAll: a file reached through both
+  sites-available/foo.conf and sites-enabled/foo.conf (= symlink) is
+  parsed once, not twice.
+- **Vhost matching case-insensitive**; ServerName `scheme://host:port`
+  decoration stripped; LAST ServerName wins on duplicates.
+- **`SSLCertificateFile`/`KeyFile` deduped** before re-install
+  (Apache uses last-wins).
+- **HTTP-01 fallback** to unnamed vhosts then every :80 vhost.
+- **`addRewriteRedirect` preflight** matches the canonical 3-arg
+  signature exactly and recurses into nested sections.
+
+### Other
+
+- **snap env vars stripped from every external program call**
+  (nginx, apache, hooks) via new `internal/extenv` package.
+- **PKCS#8 private keys** on storage write (certbot 3.2.0+).
+- **revoke overlap check**: don't delete archive files when another
+  renewal conf shares the archive_dir.
+- **certonly preserves existing key_type** when --key-type
+  unspecified on reissue.
+
+### Phase 14 round-5 continuation
+
+After landing the initial round-5 sweep, additional bugs surfaced through direct
+review of certbot integration tests and `cli_test.py`:
+
+- **revoke: cert-path → lineage resolution.** `revoke --cert-path X` without
+  --cert-name now scans renewal confs to find the owning lineage so the
+  post-revoke delete prompt fires correctly. Server + account pinned from
+  the resolved lineage. (test_revoke_simple.)
+- **revoke: overlap check.** Don't delete when another renewal conf shares
+  the archive_dir.
+- **revoke: non-interactive default-to-delete.** Mirrors certbot's
+  display_util.yesno-returns-default behavior.
+- **certonly: require --cert-name to change key_type on existing lineage.**
+  Mirrors certbot _handle_key_type_change wording.
+- **--reuse-key actually reuses the key** via lego ObtainRequest.PrivateKey.
+  --new-key forces fresh for one run while keeping the flag in renewal.conf.
+  --reuse-key with changed key params errors unless --new-key set.
+- **multi-email --email** support: comma-separated emails saved as one
+  mailto: each (lego limits remote-side to first email).
+- **--force-interactive with renew** rejected (certbot helpful.py).
+- **--preferred-challenges trim** around comma-separated entries.
+- **install paths abspath**: --cert-path / --key-path / --chain-path /
+  --fullchain-path resolved to absolute paths at parse time.
+- **--cert-path routes to AuthCertPath for certonly --csr.**

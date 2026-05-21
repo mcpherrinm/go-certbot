@@ -93,3 +93,58 @@ func TestWriteIncrementsVersion(t *testing.T) {
 		t.Errorf("live link points at %q, expected cert2.pem", target)
 	}
 }
+
+// TestNextVersionAllKinds mirrors the certbot.storage.next_free_version
+// behavior: the next version is one more than the max version across all
+// of cert/privkey/chain/fullchain, not just cert.
+func TestNextVersionAllKinds(t *testing.T) {
+	dir := t.TempDir()
+	full, chain, key := makePEMChain(t)
+	if _, err := Write(dir, "x", full, chain, key, WriteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate an interrupted state: delete cert1.pem but leave the others.
+	if err := os.Remove(filepath.Join(dir, "archive", "x", "cert1.pem")); err != nil {
+		t.Fatal(err)
+	}
+	n, err := NextVersion(dir, "x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Errorf("NextVersion = %d after orphan privkey1/chain1/fullchain1, want 2", n)
+	}
+}
+
+// TestWritePropagatesPrivkeyMode mirrors certbot integration test
+// test_renew_files_propagate_permissions: when a user chmods their
+// privkey to add a group/other read bit, the next renewal must keep
+// that bit.
+func TestWritePropagatesPrivkeyMode(t *testing.T) {
+	if testing.Short() {
+		t.Skip("filesystem perms test")
+	}
+	dir := t.TempDir()
+	full, chain, key := makePEMChain(t)
+	if _, err := Write(dir, "x", full, chain, key, WriteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	priv1 := filepath.Join(dir, "archive", "x", "privkey1.pem")
+	// User chmods their privkey to add group-read + other-read.
+	if err := os.Chmod(priv1, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Write(dir, "x", full, chain, key, WriteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	priv2 := filepath.Join(dir, "archive", "x", "privkey2.pem")
+	st, err := os.Stat(priv2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 0o644 has bits 0o044 in the certbotMask (S_IRGRP|S_IROTH).
+	// Result: 0o600 | 0o044 = 0o644.
+	if got := st.Mode().Perm(); got != 0o644 {
+		t.Errorf("renewed privkey perm: got %o want 0644 (propagated from prior)", got)
+	}
+}

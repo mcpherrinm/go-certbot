@@ -29,6 +29,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -170,6 +171,17 @@ func parse(b []byte) (*File, error) {
 		}
 		key := strings.TrimSpace(trimmed[:idx])
 		value := strings.TrimSpace(trimmed[idx+1:])
+		// Strip inline `# comment` from the value. configobj's default
+		// parser separates the comment from the scalar. We must
+		// reproduce that — otherwise a Certbot-written value of the
+		// form `useful = value # A useful value` round-trips through
+		// our writer as `useful = "value # A useful value"`,
+		// permanently embedding the comment text and breaking
+		// subsequent reads in Certbot.
+		//
+		// The comment delimiter is `#` not inside a quoted scalar.
+		// Quoted scalars (`"..."` or `'...'`) survive intact.
+		value = stripInlineComment(value)
 		switch {
 		case nested != "" && section == "renewalparams":
 			if _, ok := f.Nested[nested][key]; !ok {
@@ -231,11 +243,20 @@ func emitKV(sb *strings.Builder, order []string, m map[string]string) {
 		fmt.Fprintf(sb, "%s = %s\n", k, formatValue(m[k]))
 		written[k] = true
 	}
-	for k, v := range m {
-		if written[k] {
-			continue
+	// Emit any keys not in the explicit insertion-order list in sorted
+	// (alphabetical) order. Without this, Go's map iteration randomness
+	// makes two Save() calls produce diff'able output, defeating
+	// VCS-tracked renewal confs and producing noisy git diffs after
+	// touch-only renewals.
+	var leftovers []string
+	for k := range m {
+		if !written[k] {
+			leftovers = append(leftovers, k)
 		}
-		fmt.Fprintf(sb, "%s = %s\n", k, formatValue(v))
+	}
+	sort.Strings(leftovers)
+	for _, k := range leftovers {
+		fmt.Fprintf(sb, "%s = %s\n", k, formatValue(m[k]))
 	}
 }
 
@@ -389,6 +410,36 @@ func writeFile(path string, data []byte, mode os.FileMode) error {
 
 // New returns an empty renewal config.
 func New() *File { return newFile() }
+
+// stripInlineComment trims a trailing `# ...` comment from a scalar
+// value. Honors quoted scalars: a `#` inside a single- or double-quoted
+// string is preserved verbatim. Trailing whitespace is trimmed.
+//
+// Examples:
+//
+//	`foo # bar`      → `foo`
+//	`"foo # bar"`    → `"foo # bar"`
+//	`'foo # bar'`    → `'foo # bar'`
+//	`# bare`         → `` (entire value is a comment)
+//	`foo "x# y" #c`  → `foo "x# y"` (only the LAST unquoted # starts a comment)
+func stripInlineComment(v string) string {
+	inSingle, inDouble := false, false
+	for i := 0; i < len(v); i++ {
+		c := v[i]
+		switch {
+		case c == '\\' && i+1 < len(v):
+			i++ // skip escaped char
+			continue
+		case c == '"' && !inSingle:
+			inDouble = !inDouble
+		case c == '\'' && !inDouble:
+			inSingle = !inSingle
+		case c == '#' && !inSingle && !inDouble:
+			return strings.TrimRight(v[:i], " \t")
+		}
+	}
+	return v
+}
 
 // ErrNotFound is returned when a renewal config file doesn't exist.
 var ErrNotFound = errors.New("renewalconf: file not found")

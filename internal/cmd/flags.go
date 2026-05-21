@@ -61,6 +61,14 @@ func registerFlags(fs *pflag.FlagSet, c *config.Config) {
 	// Domains
 	fs.StringSliceVarP(&c.Domains, "domain", "d", c.Domains, "Domain name to include (repeatable).")
 	fs.StringSliceVar(&c.Domains, "domains", c.Domains, "Alias for --domain.")
+	// Mirrors certbot._internal.cli.cli_utils.DomainsAction: lowercase,
+	// strip trailing dot, dedupe preserving order. Without this, a user
+	// who passes `-d Example.COM.` issues against `example.com` but
+	// renewal config records the unnormalized form, causing the next
+	// renewal cycle to think it's a different SAN set.
+	c.PostParseHooks = append(c.PostParseHooks, func() {
+		c.Domains = normalizeDomains(c.Domains)
+	})
 	fs.StringSliceVar(&c.IPAddresses, "ip-address", c.IPAddresses, "IP address SAN (repeatable). Requires --preferred-profile shortlived for Let's Encrypt.")
 	fs.StringVar(&c.CertName, "cert-name", c.CertName, "Name (lineage) under which to track this cert.")
 
@@ -248,7 +256,13 @@ func registerFlags(fs *pflag.FlagSet, c *config.Config) {
 	// Normalize aliases (`http`/`http_01` → `http-01`, `dns`/`dns_01` →
 	// `dns-01`) so downstream comparisons can match the canonical name.
 	// Mirrors Certbot's _PrefChallAction (cli_utils.py:185-221).
+	// Trim whitespace around each entry so `--preferred-challenges
+	// 'http, dns'` (Certbot's cli_test exercises the space variant)
+	// works the same as `'http,dns'`.
 	c.PostParseHooks = append(c.PostParseHooks, func() {
+		for i, ch := range c.PreferredChallenges {
+			c.PreferredChallenges[i] = strings.TrimSpace(ch)
+		}
 		for i, ch := range c.PreferredChallenges {
 			switch ch {
 			case "http", "http_01":
@@ -271,7 +285,12 @@ func registerFlags(fs *pflag.FlagSet, c *config.Config) {
 		if !c.SetByUser("key-type") {
 			return
 		}
-		switch strings.ToLower(c.KeyType) {
+		// Normalize to lowercase canonical form. Certbot's argparse
+		// `choices=['rsa','ecdsa']` rejects mixed-case outright; we
+		// accept it but canonicalize so downstream string-compare
+		// checks (cfg.KeyType=="ecdsa") work.
+		c.KeyType = strings.ToLower(c.KeyType)
+		switch c.KeyType {
 		case "rsa", "ecdsa":
 		default:
 			fmt.Fprintf(os.Stderr, "go-certbot: invalid --key-type %q (expected rsa or ecdsa)\n", c.KeyType)
@@ -312,6 +331,46 @@ func registerFlags(fs *pflag.FlagSet, c *config.Config) {
 	// certonly --csr destinations Certbot uses these chain variants.
 	fs.StringVar(&c.AuthChainPath, "chain-path", c.AuthChainPath, "Where to write the issuer chain when using --csr.")
 	fs.StringVar(&c.FullchainPath, "fullchain-path", c.FullchainPath, "Where to write the full chain when using --csr.")
+	// Under certonly --csr, --cert-path is the OUTPUT path (default
+	// ./cert.pem), not the input. Certbot's paths_parser.py:20-27
+	// binds --cert-path to `auth_cert_path` when verb=certonly. We
+	// route here in a PostParseHook so the same flag works for
+	// revoke/install (input) and certonly --csr (output) without
+	// requiring callers to know about both fields.
+	c.PostParseHooks = append(c.PostParseHooks, func() {
+		if c.Verb == "certonly" && c.CSR.Path != "" && c.SetByUser("cert-path") {
+			c.AuthCertPath = c.CertPath
+			c.CertPath = ""
+		}
+	})
+	// Convert install/revoke path flags to absolute paths so the
+	// resolved paths survive the `cd` Certbot performs into a temp
+	// working dir, and so renewal.conf records absolute paths.
+	// Mirrors certbot _internal/cli/paths_parser.py's `path_surgery`
+	// and the test_install_abspath test (cli_test.py:142-156).
+	c.PostParseHooks = append(c.PostParseHooks, func() {
+		abs := func(p string) string {
+			if p == "" {
+				return p
+			}
+			if a, err := filepath.Abs(p); err == nil {
+				return a
+			}
+			return p
+		}
+		if c.SetByUser("cert-path") {
+			c.CertPath = abs(c.CertPath)
+		}
+		if c.SetByUser("key-path") {
+			c.KeyPath = abs(c.KeyPath)
+		}
+		if c.SetByUser("chain-path") {
+			c.AuthChainPath = abs(c.AuthChainPath)
+		}
+		if c.SetByUser("fullchain-path") {
+			c.FullchainPath = abs(c.FullchainPath)
+		}
+	})
 
 	// Hooks
 	fs.StringVar(&c.PreHook, "pre-hook", c.PreHook, "Command to run before challenge.")
@@ -371,6 +430,53 @@ func registerFlags(fs *pflag.FlagSet, c *config.Config) {
 		}
 		if instIface {
 			c.PluginIfaces = append(c.PluginIfaces, "Installer")
+		}
+	})
+
+	// Mutual-exclusion checks. Each mirrors a Certbot helpful.py guard.
+	// Run as a single PostParseHook so the error message comes after all
+	// flags are parsed and `SetByUser` is reliable.
+	c.PostParseHooks = append(c.PostParseHooks, func() {
+		fail := func(msg string) {
+			fmt.Fprintln(os.Stderr, "go-certbot:", msg)
+			os.Exit(2)
+		}
+		// --force-interactive + -n/--non-interactive  (helpful.py:277-280)
+		if c.ForceInteractive && c.NonInteractive {
+			fail("Flag for non-interactive mode and --force-interactive conflict")
+		}
+		// --force-interactive forbidden with `renew` (helpful.py:284-285).
+		// renew is always batch and cannot be interactive — pre-fix we
+		// silently accepted the combination and ignored the flag.
+		if c.ForceInteractive && c.Verb == "renew" {
+			fail("--force-interactive cannot be used with renew")
+		}
+		// --hsts + --auto-hsts  (helpful.py:306-308)
+		if c.HSTS && c.AutoHSTS {
+			fail("Parameters --hsts and --auto-hsts cannot be used simultaneously.")
+		}
+		// --allow-subset-of-names + --csr  (helpful.py:329-330)
+		if c.AllowSubsetOfNames && c.CSR.Path != "" {
+			fail("--allow-subset-of-names cannot be used with --csr")
+		}
+		// --csr is only allowed with `certonly` (helpful.py:323-328).
+		// Pre-fix we silently ignored --csr with run/renew/etc.
+		if c.CSR.Path != "" && c.Verb != "" && c.Verb != "certonly" {
+			fail("Currently, a CSR file may only be specified when obtaining a new or replacement via the certonly command.")
+		}
+		// --dry-run is only valid with certonly/renew/reconfigure
+		// (cli_utils.py:282-284). Pre-fix we applied dry-run side
+		// effects (rewrite to staging, flip --break-my-certs) for any
+		// verb, which made `certbot install --dry-run` quietly point
+		// at the staging account directory.
+		if c.DryRun {
+			switch c.Verb {
+			case "", "certonly", "renew", "run", "reconfigure":
+				// `run` is allowed because Certbot's certonly+install
+				// fused path is `run`; staging works there too.
+			default:
+				fail("--dry-run currently only works with the certonly, renew, run, or reconfigure verbs")
+			}
 		}
 	})
 
@@ -435,17 +541,39 @@ func applyDryRunSideEffects(c *config.Config) {
 	// server doesn't error out on the "are you sure?" check.
 	c.BreakMyCerts = true
 	c.MarkSet("break-my-certs", config.SourceRuntime)
-	// --dry-run + no agreement + no email => Certbot auto-agrees TOS and
-	// uses the unsafely-without-email mode (cli_utils.py:280-289). We
-	// mirror only the auto-TOS half; the email-skip remains explicit.
-	if !c.TOS {
-		c.TOS = true
-		c.MarkSet("agree-tos", config.SourceRuntime)
+	// --dry-run + no agreement + no email + no existing account =>
+	// Certbot auto-agrees TOS and uses the unsafely-without-email mode
+	// only when there's no prod account on disk. Mirrors
+	// cli_utils.py:286-290 which checks
+	// `glob.glob(... ACCOUNTS_DIR/*)` before flipping the flags. If
+	// the user already has an account, registration is a no-op and
+	// these flags are irrelevant — flipping them unconditionally
+	// would surprise users who deliberately omit --agree-tos.
+	if !hasAnyAccount(c) {
+		if !c.TOS {
+			c.TOS = true
+			c.MarkSet("agree-tos", config.SourceRuntime)
+		}
+		if c.Email == "" {
+			c.RegisterUnsafelyWithoutEmail = true
+			c.MarkSet("register-unsafely-without-email", config.SourceRuntime)
+		}
 	}
-	if c.Email == "" {
-		c.RegisterUnsafelyWithoutEmail = true
-		c.MarkSet("register-unsafely-without-email", config.SourceRuntime)
+}
+
+// hasAnyAccount returns true if the configured AccountsDir contains at
+// least one entry. Mirrors certbot's existence check in
+// cli_utils.set_test_server_options: glob.glob(... accounts dir/*).
+func hasAnyAccount(c *config.Config) bool {
+	d, err := c.AccountsDir()
+	if err != nil {
+		return false
 	}
+	entries, err := os.ReadDir(d)
+	if err != nil {
+		return false
+	}
+	return len(entries) > 0
 }
 
 // trackSources walks the FlagSet after parsing and records, for each flag
@@ -507,4 +635,28 @@ func registerDeprecated(fs *pflag.FlagSet, c *config.Config, names []string) {
 			}
 		})
 	}
+}
+
+// normalizeDomains lower-cases each entry, strips trailing dots, and dedupes
+// preserving first-seen order. Mirrors certbot.cli.cli_utils.DomainsAction
+// (cli_utils.py:_DomainsAction.__call__).
+func normalizeDomains(in []string) []string {
+	if len(in) == 0 {
+		return in
+	}
+	out := make([]string, 0, len(in))
+	seen := make(map[string]bool, len(in))
+	for _, raw := range in {
+		s := strings.TrimSpace(raw)
+		s = strings.ToLower(s)
+		// Strip a single trailing dot; an FQDN with `.` at the end
+		// (the root label) is equivalent to the same name without.
+		s = strings.TrimSuffix(s, ".")
+		if s == "" || seen[s] {
+			continue
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	return out
 }

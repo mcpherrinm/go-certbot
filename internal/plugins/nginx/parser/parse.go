@@ -81,6 +81,8 @@ func (p *parserState) parseBody(nodes *[]Node, topLevel bool) error {
 		ws := nameTok.Whitespace
 		name := nameTok.Value
 		var args []string
+		var argLeadingWS []string
+		var internalComments []InternalComment
 		for {
 			next, err := p.peek()
 			if err != nil {
@@ -89,6 +91,22 @@ func (p *parserState) parseBody(nodes *[]Node, topLevel bool) error {
 			if next.Kind == tokWord || next.Kind == tokQuotedString {
 				_, _ = p.take()
 				args = append(args, next.Value)
+				argLeadingWS = append(argLeadingWS, next.Whitespace)
+				continue
+			}
+			// Allow comments interleaved between args (e.g.
+			// `server_name foo\n  # internal\n  bar;`). Track them
+			// so emit can round-trip the file. Mirrors certbot
+			// 6fd6a541d which preserves these comments rather than
+			// failing the parse. Trailing comments after `;` are
+			// handled below.
+			if next.Kind == tokComment {
+				_, _ = p.take()
+				internalComments = append(internalComments, InternalComment{
+					AfterArgIndex: len(args) - 1,
+					Whitespace:    next.Whitespace,
+					Value:         next.Value,
+				})
 				continue
 			}
 			break
@@ -106,11 +124,13 @@ func (p *parserState) parseBody(nodes *[]Node, topLevel bool) error {
 				trailing = peek.Whitespace + peek.Value
 			}
 			*nodes = append(*nodes, &Directive{
-				Whitespace:      ws,
-				Name:            name,
-				Args:            args,
-				Semicolon:       true,
-				TrailingComment: trailing,
+				Whitespace:       ws,
+				Name:             name,
+				Args:             args,
+				ArgLeadingWS:     argLeadingWS,
+				Semicolon:        true,
+				TrailingComment:  trailing,
+				InternalComments: internalComments,
 			})
 		case tokOpenBrace:
 			block := &Block{Whitespace: ws, Name: name, Args: args}

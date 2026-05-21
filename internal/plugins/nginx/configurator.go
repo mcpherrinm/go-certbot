@@ -39,6 +39,7 @@ import (
 
 	"github.com/letsencrypt/go-certbot/internal/checkpoint"
 	"github.com/letsencrypt/go-certbot/internal/config"
+	"github.com/letsencrypt/go-certbot/internal/extenv"
 	"github.com/letsencrypt/go-certbot/internal/plugins"
 	"github.com/letsencrypt/go-certbot/internal/plugins/nginx/parser"
 )
@@ -53,8 +54,9 @@ type Plugin struct {
 	challengeDir      string
 	challengeConfPath string // <work_dir>/le_http_01_cert_challenge.conf
 	addedLocations    []*serverLocation
-	addedInclude      bool // we added the include line to nginx.conf
-	addedBucketSize   bool // we added server_names_hash_bucket_size to nginx.conf
+	addedInclude      bool   // we added the include line to nginx.conf
+	addedBucketSize   bool   // we added server_names_hash_bucket_size to nginx.conf
+	httpBlockFile     string // absolute path of the conf file containing the http {} block we edited
 	pendingChallenges []challengeEntry
 }
 
@@ -230,7 +232,17 @@ func (p *Plugin) Install(ctx context.Context, cfg *config.Config, domains []stri
 	if err != nil {
 		return err
 	}
-	hits := findMatchingServersAcrossFiles(files, domains)
+	// Select THE best server per requested domain rather than the union
+	// of all overlapping matches. Pre-fix install touched every vhost
+	// whose server_name overlapped any domain — for a config with both
+	// `server_name example.com` and `server_name *.example.com`,
+	// installing a cert for `example.com` ended up mutating both. Match
+	// certbot _choose_vhost_single (configurator.py:475-494).
+	hits := selectBestServerPerDomain(files, domains)
+	if len(hits) == 0 {
+		// Fall back to default_server matches (the catch-all path).
+		hits = findMatchingServersAcrossFiles(files, domains)
+	}
 	if len(hits) == 0 {
 		return fmt.Errorf("nginx: no server block matched any of %v in %s (or its includes)", domains, configPath)
 	}
@@ -238,7 +250,7 @@ func (p *Plugin) Install(ctx context.Context, cfg *config.Config, domains []stri
 	// install we accept it implicitly: the fullchain IS the chain we want
 	// nginx to use for ssl_trusted_certificate.
 	for _, h := range hits {
-		insertSSLDirectives(h.Server, fullchainPath, privkeyPath, cfg.HTTPSPort)
+		insertSSLDirectives(h.Server, fullchainPath, privkeyPath, cfg.HTTP01Port, cfg.HTTPSPort)
 		if cfg.Redirect != nil && *cfg.Redirect {
 			addRedirectIfHTTPOnly(h.Server, domains)
 		}
@@ -273,12 +285,23 @@ func (p *Plugin) Install(ctx context.Context, cfg *config.Config, domains []stri
 	return nil
 }
 
-// serverIsHTTPS reports whether the server block listens on :443 or has any
-// listen directive with the `ssl` keyword.
+// serverIsHTTPS reports whether the server block listens on :443, has any
+// listen directive with the `ssl` keyword, OR has a top-level `ssl on;`
+// directive. Mirrors certbot _is_ssl_on_directive + has_ssl_on_directive
+// (parser.py:582-591, configurator.py:629-630). The standalone `ssl on;`
+// form was deprecated in nginx 1.15 but legacy configs still use it; pre-
+// fix go-certbot misclassified those servers as HTTP and skipped them.
 func serverIsHTTPS(srv *parser.Block) bool {
 	for _, n := range srv.Body {
 		d, ok := n.(*parser.Directive)
-		if !ok || d.Name != "listen" || len(d.Args) == 0 {
+		if !ok {
+			continue
+		}
+		if d.Name == "ssl" && len(d.Args) == 1 &&
+			strings.EqualFold(strings.Trim(d.Args[0], `"'`), "on") {
+			return true
+		}
+		if d.Name != "listen" || len(d.Args) == 0 {
 			continue
 		}
 		if containsArg(d.Args, "ssl") {
@@ -364,6 +387,43 @@ func isDefaultServer(b *parser.Block) bool {
 	for _, n := range b.Body {
 		d, ok := n.(*parser.Directive)
 		if !ok || d.Name != "listen" {
+			continue
+		}
+		for _, a := range d.Args {
+			if a == "default_server" || a == "default" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// isDefaultServerOnPort returns true iff the block has a `listen` directive
+// that BOTH names `port` (or is bare/wildcard-on-port) AND carries
+// `default_server`. Mirrors certbot _get_default_vhost's port-matching
+// prefilter (configurator.py:436-460): when picking a fallback target for
+// HTTPS install, we want a default_server on :443 rather than one on :80.
+func isDefaultServerOnPort(b *parser.Block, port string) bool {
+	if port == "" {
+		return isDefaultServer(b)
+	}
+	for _, n := range b.Body {
+		d, ok := n.(*parser.Directive)
+		if !ok || d.Name != "listen" || len(d.Args) == 0 {
+			continue
+		}
+		// Port match: either the first arg names this port, or
+		// there's no port at all (nginx's implicit default 80).
+		_, p, parsed := splitListenAddr(strings.Trim(d.Args[0], `"'`))
+		matches := false
+		switch {
+		case parsed && p == port:
+			matches = true
+		case parsed && p == "" && port == "80":
+			// bare hostname listen = default port 80.
+			matches = true
+		}
+		if !matches {
 			continue
 		}
 		for _, a := range d.Args {
@@ -484,24 +544,192 @@ func findMatchingServers(cfg *parser.Config, domains []string) []*parser.Block {
 	// If no exact / wildcard / regex match was found, fall back to any
 	// vhost that's flagged `default_server` on its listen line — that's
 	// the catch-all nginx routes unmatched requests to. Mirrors
-	// certbot-nginx's get_vhosts default-server fallback.
+	// certbot-nginx's get_vhosts default-server fallback. Prefer
+	// default_servers on port 80 (the HTTP-01 challenge port) then 443
+	// (HTTPS) then any, so the fallback matches the request shape that
+	// would have hit the named vhost. Certbot's _get_default_vhost does
+	// the same port filter (configurator.py:436-460).
 	if len(out) == 0 {
-		var fallback func(nodes []parser.Node)
-		fallback = func(nodes []parser.Node) {
+		var collect func(nodes []parser.Node, port string, into *[]*parser.Block)
+		collect = func(nodes []parser.Node, port string, into *[]*parser.Block) {
 			for _, n := range nodes {
 				b, ok := n.(*parser.Block)
 				if !ok {
 					continue
 				}
-				if b.Name == "server" && isDefaultServer(b) {
-					out = append(out, b)
+				if b.Name == "server" && isDefaultServerOnPort(b, port) {
+					*into = append(*into, b)
 				}
-				fallback(b.Body)
+				collect(b.Body, port, into)
 			}
 		}
-		fallback(cfg.Nodes)
+		var port80, port443, any []*parser.Block
+		collect(cfg.Nodes, "80", &port80)
+		collect(cfg.Nodes, "443", &port443)
+		switch {
+		case len(port80) > 0:
+			out = port80
+		case len(port443) > 0:
+			out = port443
+		default:
+			collect(cfg.Nodes, "", &any)
+			out = any
+		}
 	}
 	return out
+}
+
+// selectBestServerPerDomain picks ONE server block per requested domain
+// using certbot/nginx's name-selection priority: exact > longest
+// start-wildcard (*.example.com) > longest end-wildcard (mail.*) >
+// regex; with SSL preferred over non-SSL within a tie. Mirrors
+// certbot configurator.py:_choose_vhost_single + _select_best_name_match
+// (configurator.py:475-494).
+//
+// Pre-fix Install touched every server whose server_name overlapped any
+// requested domain, including less-specific wildcards the user didn't
+// intend to receive the cert. Returns the union of selected vhosts (a
+// single vhost can be returned multiple times if best for multiple
+// domains; deduped by pointer).
+func selectBestServerPerDomain(files []*parsedFile, domains []string) []serverHit {
+	type candidate struct {
+		hit   serverHit
+		score int
+	}
+	type bestEntry struct {
+		hit   serverHit
+		score int
+	}
+	// First pass: collect all server blocks across files.
+	type sNode struct {
+		hit serverHit
+	}
+	var allServers []sNode
+	for _, f := range files {
+		var visit func(nodes []parser.Node)
+		visit = func(nodes []parser.Node) {
+			for _, n := range nodes {
+				b, ok := n.(*parser.Block)
+				if !ok {
+					continue
+				}
+				if b.Name == "server" {
+					allServers = append(allServers, sNode{hit: serverHit{File: f, Server: b}})
+				}
+				visit(b.Body)
+			}
+		}
+		visit(f.AST.Nodes)
+	}
+	// Per-domain best, then collect unique hits.
+	best := map[string]bestEntry{} // domain → best hit
+	for _, dom := range domains {
+		lcDom := strings.ToLower(dom)
+		for _, s := range allServers {
+			score := serverNameScore(s.hit.Server, lcDom)
+			if score == 0 {
+				continue
+			}
+			// SSL preference: bump score if the server already
+			// listens with ssl. Tie-break only.
+			if serverIsHTTPS(s.hit.Server) {
+				score++
+			}
+			cur, ok := best[lcDom]
+			if !ok || score > cur.score {
+				best[lcDom] = bestEntry{hit: s.hit, score: score}
+			}
+		}
+	}
+	// Dedupe results by *parser.Block pointer.
+	seen := map[*parser.Block]bool{}
+	var out []serverHit
+	for _, dom := range domains {
+		lcDom := strings.ToLower(dom)
+		entry, ok := best[lcDom]
+		if !ok {
+			continue
+		}
+		if seen[entry.hit.Server] {
+			continue
+		}
+		seen[entry.hit.Server] = true
+		out = append(out, entry.hit)
+	}
+	_ = candidate{} // keep unused-var quiet during incremental work
+	return out
+}
+
+// serverNameScore returns 0 if no match, or a positive integer scoring
+// the match's specificity per certbot's selection rules. Larger == more
+// specific.
+//
+// Score scheme (per Certbot's certbot/_internal/plugins/nginx/parser.py
+// best-match logic):
+//
+//	1000 + len(name)  exact match (longer FQDN ranks higher)
+//	 500 + len(name)  start wildcard (*.example.com) — leading-dot variant
+//	 400 + len(name)  end wildcard (mail.*)
+//	 100              regex match
+//	   0              no match
+//
+// The constants leave space for a +1 SSL-tie-break bump at the caller.
+func serverNameScore(srv *parser.Block, lcDom string) int {
+	best := 0
+	for _, n := range srv.Body {
+		d, ok := n.(*parser.Directive)
+		if !ok || d.Name != "server_name" {
+			continue
+		}
+		for _, raw := range d.Args {
+			name := strings.ToLower(strings.Trim(raw, `"'`))
+			score := nameMatchScore(name, lcDom)
+			if score > best {
+				best = score
+			}
+		}
+	}
+	return best
+}
+
+// nameMatchScore is the per-name-token scorer.
+func nameMatchScore(name, lcDom string) int {
+	if name == "" {
+		return 0
+	}
+	if name == lcDom {
+		return 1000 + len(name)
+	}
+	if strings.HasPrefix(name, "*.") {
+		suffix := name[1:]
+		if strings.HasSuffix(lcDom, suffix) {
+			return 500 + len(name)
+		}
+	}
+	if strings.HasPrefix(name, ".") {
+		bare := name[1:]
+		if lcDom == bare || strings.HasSuffix(lcDom, name) {
+			return 500 + len(name)
+		}
+	}
+	if strings.HasSuffix(name, ".*") {
+		prefix := name[:len(name)-1] // "mail."
+		if strings.HasPrefix(lcDom, prefix) {
+			return 400 + len(name)
+		}
+	}
+	if strings.HasPrefix(name, "~") {
+		pat := strings.TrimPrefix(name, "~")
+		if strings.HasPrefix(pat, "*") {
+			pat = "(?i)" + strings.TrimPrefix(pat, "*")
+		}
+		if re, err := regexpCompile(pat); err == nil {
+			if re.MatchString(lcDom) {
+				return 100
+			}
+		}
+	}
+	return 0
 }
 
 // serverMatchesAny returns true if the server block's server_name covers any
@@ -515,25 +743,44 @@ func findMatchingServers(cfg *parser.Config, domains []string) []*parser.Block {
 //   - regex name:        ~^foo\.example\.com$
 //   - catch-all:         _ (treated as matching iff the server is the default)
 func serverMatchesAny(srv *parser.Block, want map[string]bool) bool {
+	// Build a lowercase view of the wanted names — DNS names are
+	// case-insensitive (RFC 4343) and Certbot's _exact_match /
+	// _wildcard_match lowercases both sides (parser.py:525-565). Without
+	// this, a vhost configured as `server_name Example.COM` wouldn't
+	// match a request for `example.com`.
+	lcWant := make(map[string]bool, len(want))
+	for w := range want {
+		lcWant[strings.ToLower(w)] = true
+	}
 	for _, n := range srv.Body {
 		d, ok := n.(*parser.Directive)
 		if !ok || d.Name != "server_name" {
 			continue
 		}
 		for _, raw := range d.Args {
-			name := strings.Trim(raw, `"'`)
+			name := strings.ToLower(strings.Trim(raw, `"'`))
 			if name == "" {
 				continue
 			}
 			// Exact name.
-			if want[name] {
+			if lcWant[name] {
 				return true
 			}
-			// Regex (`~^...$`). Compile lazily; fall through on parse error.
+			// Regex (`~^...$` or `~*^...$` for case-insensitive).
+			// Compile lazily; fall through on parse error.
 			if strings.HasPrefix(name, "~") {
-				re, err := regexpCompile(strings.TrimPrefix(name, "~"))
+				pat := strings.TrimPrefix(name, "~")
+				caseInsensitive := false
+				if strings.HasPrefix(pat, "*") {
+					pat = strings.TrimPrefix(pat, "*")
+					caseInsensitive = true
+				}
+				if caseInsensitive {
+					pat = "(?i)" + pat
+				}
+				re, err := regexpCompile(pat)
 				if err == nil {
-					for w := range want {
+					for w := range lcWant {
 						if re.MatchString(w) {
 							return true
 						}
@@ -545,7 +792,7 @@ func serverMatchesAny(srv *parser.Block, want map[string]bool) bool {
 			// (and, for leading-dot, also the bare name).
 			if strings.HasPrefix(name, "*.") {
 				suffix := name[1:] // ".example.com"
-				for w := range want {
+				for w := range lcWant {
 					if strings.HasSuffix(w, suffix) {
 						return true
 					}
@@ -554,7 +801,7 @@ func serverMatchesAny(srv *parser.Block, want map[string]bool) bool {
 			}
 			if strings.HasPrefix(name, ".") {
 				bare := name[1:]
-				for w := range want {
+				for w := range lcWant {
 					if w == bare || strings.HasSuffix(w, name) {
 						return true
 					}
@@ -564,7 +811,7 @@ func serverMatchesAny(srv *parser.Block, want map[string]bool) bool {
 			// Trailing wildcard: `mail.*` matches mail.example.com, mail.example.org, etc.
 			if strings.HasSuffix(name, ".*") {
 				prefix := name[:len(name)-1] // "mail."
-				for w := range want {
+				for w := range lcWant {
 					if strings.HasPrefix(w, prefix) {
 						return true
 					}
@@ -584,14 +831,17 @@ func serverMatchesAny(srv *parser.Block, want map[string]bool) bool {
 // `listen <port> ssl` to a server block (replacing existing values if
 // present). Indentation is borrowed from the first inner directive so the
 // edit blends in with the surrounding file.
-func insertSSLDirectives(srv *parser.Block, fullchain, privkey string, httpsPort int) {
+func insertSSLDirectives(srv *parser.Block, fullchain, privkey string, httpPort, httpsPort int) {
 	indent := childIndent(srv)
 	if httpsPort <= 0 {
 		httpsPort = 443
 	}
+	if httpPort <= 0 {
+		httpPort = 80
+	}
 	setOrAppend(srv, indent, "ssl_certificate", fullchain)
 	setOrAppend(srv, indent, "ssl_certificate_key", privkey)
-	addListenSSL(srv, indent, httpsPort)
+	addListenSSL(srv, indent, httpPort, httpsPort)
 }
 
 // childIndent returns the leading whitespace of the first directive child of
@@ -637,42 +887,142 @@ func setOrAppend(b *parser.Block, indent, name, arg string) {
 	})
 }
 
-// addListenSSL ensures the server block has a `listen <port> ssl` directive.
-// If a plain `listen` is already there on the same port, we add the `ssl`
-// keyword; otherwise we append a new directive.
-func addListenSSL(b *parser.Block, indent string, port int) {
-	portStr := fmt.Sprintf("%d", port)
+// addListenSSL ensures the server block has the right `listen ... ssl`
+// directive(s). Mirrors certbot _make_server_ssl (configurator.py:709-784):
+//
+//  1. If the block already has any `listen` matching the HTTPS port (with or
+//     without `ssl`), make sure each carries the `ssl` flag and stop —
+//     respecting whatever host/port tuples the user already configured.
+//  2. Otherwise, for every existing `listen` matching the HTTP01 port (e.g.
+//     `listen 127.0.0.1:80;`), emit a parallel SSL listen preserving the
+//     host (`listen 127.0.0.1:443 ssl;`).
+//  3. If neither matched, fall back to bare defaults: `[::]:443 ssl` for
+//     IPv6, `443 ssl` for IPv4, derived from whatever existing listens hint
+//     at family preference (or both if no hint).
+func addListenSSL(b *parser.Block, indent string, httpPort, httpsPort int) {
+	httpStr := fmt.Sprintf("%d", httpPort)
+	httpsStr := fmt.Sprintf("%d", httpsPort)
+	// If the block has NO listen directives at all, nginx defaults to
+	// port 80. After we add ssl listens that implicit default goes away
+	// and the vhost loses its HTTP listener. Add an explicit `listen
+	// 80;` (or HTTP01Port) FIRST to preserve the original behavior.
+	// Mirrors certbot _make_server_ssl (configurator.py:735-737).
+	hasListen := false
+	for _, n := range b.Body {
+		if d, ok := n.(*parser.Directive); ok && d.Name == "listen" {
+			hasListen = true
+			break
+		}
+	}
+	if !hasListen {
+		b.Body = append(b.Body, &parser.Directive{
+			Whitespace: "\n" + indent,
+			Name:       "listen",
+			Args:       []string{httpStr},
+			Semicolon:  true,
+		})
+	}
+	// Pass 1: existing HTTPS-port listens — promote to ssl if needed and
+	// trust whatever the user configured.
+	foundHTTPS := false
 	for _, n := range b.Body {
 		d, ok := n.(*parser.Directive)
-		if !ok || d.Name != "listen" {
+		if !ok || d.Name != "listen" || len(d.Args) == 0 {
 			continue
 		}
-		if len(d.Args) == 0 {
+		first := strings.Trim(d.Args[0], `"'`)
+		_, p, ok := splitListenAddr(first)
+		if !ok || p != httpsStr {
+			continue
+		}
+		foundHTTPS = true
+		if !containsArg(d.Args, "ssl") {
+			d.Args = append(d.Args, "ssl")
+		}
+	}
+	if foundHTTPS {
+		return
+	}
+	// Pass 2: derive SSL listens from HTTP-port listens, preserving host.
+	var derived []string
+	hasV4, hasV6 := false, false
+	for _, n := range b.Body {
+		d, ok := n.(*parser.Directive)
+		if !ok || d.Name != "listen" || len(d.Args) == 0 {
 			continue
 		}
 		first := strings.Trim(d.Args[0], `"'`)
 		host, p, ok := splitListenAddr(first)
-		_ = host
-		if !ok || p != portStr {
+		if !ok || p != httpStr {
 			continue
 		}
-		if !containsArg(d.Args, "ssl") {
-			d.Args = append(d.Args, "ssl")
+		isV6 := strings.HasPrefix(host, "[")
+		if isV6 {
+			hasV6 = true
+		} else {
+			hasV4 = true
 		}
-		return
+		if host != "" {
+			derived = append(derived, host+":"+httpsStr)
+		} else {
+			derived = append(derived, httpsStr)
+		}
 	}
-	b.Body = append(b.Body, &parser.Directive{
-		Whitespace: "\n" + indent,
-		Name:       "listen",
-		Args:       []string{portStr, "ssl"},
-		Semicolon:  true,
-	})
+	defaultFallback := len(derived) == 0
+	if defaultFallback {
+		// No HTTP listen either — fall back to the same default set
+		// nginx itself would have used. Match Certbot's behavior of
+		// adding both IPv4 and IPv6 default listens when no hint.
+		if !hasV4 && !hasV6 {
+			hasV4, hasV6 = true, true
+		}
+		if hasV6 {
+			derived = append(derived, "[::]:"+httpsStr)
+		}
+		if hasV4 {
+			derived = append(derived, httpsStr)
+		}
+	}
+	for _, addr := range derived {
+		args := []string{addr, "ssl"}
+		// Certbot _make_server_ssl appends `ipv6only=on` to new IPv6
+		// listens it emits (configurator.py:751-764). Without this,
+		// the kernel's net.ipv6.bindv6only default decides whether
+		// the IPv6 socket also accepts IPv4 connections, which can
+		// produce unpredictable behavior across distros. Only safe
+		// for the default-fallback path here — for listens derived
+		// from existing HTTP IPv6 listens, the original likely
+		// already has ipv6only=on (or deliberately doesn't), and
+		// nginx errors if multiple vhosts set ipv6only=on for the
+		// same socket. Adding it only on the default fallback
+		// matches the "this is a freshly-issued vhost, no other
+		// vhost will conflict" case Certbot's test exercises.
+		if defaultFallback && strings.HasPrefix(addr, "[") {
+			args = append(args, "ipv6only=on")
+		}
+		b.Body = append(b.Body, &parser.Directive{
+			Whitespace: "\n" + indent,
+			Name:       "listen",
+			Args:       args,
+			Semicolon:  true,
+		})
+	}
 }
 
 // splitListenAddr parses an nginx listen value into host/port.
-// Accepts plain "80", "127.0.0.1:80", "[::]:80". Returns ok=false for
-// unix:/... socket forms so callers skip those vhosts (we can't SSL-upgrade
-// a unix listener).
+// Accepts:
+//
+//	"80"               → host="", port="80"
+//	"127.0.0.1:80"     → host="127.0.0.1", port="80"
+//	"[::]:80"          → host="[::]", port="80"
+//	"myhost"           → host="myhost", port=""  (bare hostname: nginx
+//	                     defaults to port 80 — callers treat empty port
+//	                     as DEFAULT_LISTEN_PORT, mirroring certbot
+//	                     obj.Addr.fromstring's regex check `^\d+$` for
+//	                     all-digits first part)
+//
+// Returns ok=false for unix:/... socket forms so callers skip those
+// vhosts (we can't SSL-upgrade a unix listener).
 func splitListenAddr(v string) (host, port string, ok bool) {
 	if strings.HasPrefix(v, "unix:") {
 		return "", "", false
@@ -687,7 +1037,27 @@ func splitListenAddr(v string) (host, port string, ok bool) {
 	if i := strings.LastIndex(v, ":"); i >= 0 {
 		return v[:i], v[i+1:], true
 	}
-	return "", v, true
+	// No `:` — either all-digits (`80`) or a bare hostname.
+	// Certbot's obj.Addr.fromstring checks `re.match(r'^\d+$', tup[0])`:
+	// all-digits → port; otherwise → host (with empty port).
+	if isAllDigits(v) {
+		return "", v, true
+	}
+	return v, "", true
+}
+
+// isAllDigits returns true for strings consisting solely of ASCII digits
+// (and at least one). Mirrors `re.match(r'^\d+$', s)` for ASCII input.
+func isAllDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func containsArg(args []string, want string) bool {
@@ -799,10 +1169,14 @@ func testAndReload(ctx context.Context, cfg *config.Config) error {
 	if ctl == "" {
 		ctl = "nginx"
 	}
-	if out, err := exec.CommandContext(ctx, ctl, "-t").CombinedOutput(); err != nil {
+	testCmd := exec.CommandContext(ctx, ctl, "-t")
+	testCmd.Env = extenv.Env()
+	if out, err := testCmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("nginx: `%s -t` failed: %w\n%s", ctl, err, string(out))
 	}
-	if out, err := exec.CommandContext(ctx, ctl, "-s", "reload").CombinedOutput(); err == nil {
+	reload := exec.CommandContext(ctx, ctl, "-s", "reload")
+	reload.Env = extenv.Env()
+	if out, err := reload.CombinedOutput(); err == nil {
 		_ = out
 		// Sleep 1s post-reload so subsequent challenge verification
 		// doesn't race the worker swap. Matches Certbot's
@@ -815,6 +1189,7 @@ func testAndReload(ctx context.Context, cfg *config.Config) error {
 	// pointing at the discovered nginx.conf so the right config tree gets
 	// loaded.
 	cmd := exec.CommandContext(ctx, ctl, "-c", nginxConfigPath(cfg))
+	cmd.Env = extenv.Env()
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("nginx: reload failed and `%s` (start) also failed: %w\n%s", ctl, err, string(out))
 	}
@@ -859,13 +1234,17 @@ func (p *Plugin) injectChallengeLocations(configPath, webroot string) error {
 		}
 	}
 	// Inject the include + server_names_hash_bucket_size at the top of
-	// http {} in the root file. Track whether we added them so cleanup
-	// can remove them. The challenge conf lives under config_dir to
-	// match Certbot's http_01.py:46-47 (so `find /etc/letsencrypt -name
-	// le_http_01*` finds it the same way under both tools).
+	// the http {} block — searching across ALL parsed files (not just
+	// the root nginx.conf). Debian/Ubuntu layouts often place `http {}`
+	// in /etc/nginx/conf.d/*.conf rather than the root; pre-fix this
+	// silently no-op'd and http-01 challenges then failed because the
+	// include never landed. Mirrors certbot e32f4fc5f.
 	challengeConfPath := filepath.Join(p.cfg.ConfigDir, "le_http_01_cert_challenge.conf")
-	p.addedInclude = ensureHTTPInclude(files[0].AST, challengeConfPath)
-	p.addedBucketSize = ensureBucketSize(files[0].AST)
+	if owner := findHTTPBlockFile(files); owner != nil {
+		p.addedInclude = ensureHTTPInclude(owner.AST, challengeConfPath)
+		p.addedBucketSize = ensureBucketSize(owner.AST)
+		p.httpBlockFile = owner.Path
+	}
 	p.challengeConfPath = challengeConfPath
 
 	// Seed the challenge conf with an empty default_server so reload
@@ -907,13 +1286,40 @@ func (p *Plugin) removeChallengeLocations() error {
 			return err
 		}
 		stripChallengeRewrites(root.Nodes)
+		// Only strip include/bucket here if this is ALSO the http {} file.
+		// Otherwise we strip them below from the dedicated http file.
+		if sl.confPath == p.httpBlockFile {
+			if p.addedInclude {
+				stripHTTPInclude(root, p.challengeConfPath)
+			}
+			if p.addedBucketSize {
+				stripBucketSize(root)
+			}
+		}
+		if err := os.WriteFile(sl.confPath, []byte(root.String()), 0o644); err != nil {
+			return err
+		}
+	}
+	// If the http {} block lives in a file that wasn't touched as a
+	// challenge-rewrite target (common Debian/Ubuntu layout where
+	// http {} is in nginx.conf but vhosts live in sites-enabled/*.conf),
+	// strip include/bucket directly from that file now.
+	if p.httpBlockFile != "" && !seen[p.httpBlockFile] && (p.addedInclude || p.addedBucketSize) {
+		srcBytes, err := os.ReadFile(p.httpBlockFile)
+		if err != nil {
+			return err
+		}
+		root, err := parser.Parse(string(srcBytes))
+		if err != nil {
+			return err
+		}
 		if p.addedInclude {
 			stripHTTPInclude(root, p.challengeConfPath)
 		}
 		if p.addedBucketSize {
 			stripBucketSize(root)
 		}
-		if err := os.WriteFile(sl.confPath, []byte(root.String()), 0o644); err != nil {
+		if err := os.WriteFile(p.httpBlockFile, []byte(root.String()), 0o644); err != nil {
 			return err
 		}
 	}
@@ -1066,6 +1472,21 @@ func findHTTPBlock(nodes []parser.Node) *parser.Block {
 		}
 		if inner := findHTTPBlock(b.Body); inner != nil {
 			return inner
+		}
+	}
+	return nil
+}
+
+// findHTTPBlockFile returns the parsed file whose AST contains an `http {}`
+// block. Certbot's nginx parser walks the entire include tree to find the
+// http block — Debian/Ubuntu's /etc/nginx layout places `http {}` in the
+// root nginx.conf, but other distros (or operator-customized layouts) put
+// it in a separately-included conf.d/ file. Returns nil if no http block
+// exists anywhere in the include tree.
+func findHTTPBlockFile(files []*parsedFile) *parsedFile {
+	for _, f := range files {
+		if findHTTPBlock(f.AST.Nodes) != nil {
+			return f
 		}
 	}
 	return nil

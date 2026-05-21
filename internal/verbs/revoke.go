@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/letsencrypt/go-certbot/internal/account"
 	"github.com/letsencrypt/go-certbot/internal/client"
@@ -48,6 +49,25 @@ func Revoke(ctx context.Context, cfg *config.Config, reg *plugins.Registry) erro
 		}
 		if v := conf.RenewalParams["account"]; v != "" && !cfg.SetByUser("account") {
 			cfg.Account = v
+		}
+	} else if cfg.CertName == "" {
+		// --cert-path was given without --cert-name. Walk renewal confs
+		// to find a lineage that owns this cert path so the post-revoke
+		// delete prompt (when not suppressed) targets the right
+		// lineage. Mirrors certbot cert_manager.cert_path_to_lineage
+		// (main.py:799-801). Silently skip on lookup failure — the
+		// revoke itself still proceeds against the cert bytes.
+		if name := certPathToLineage(cfg, certPath); name != "" {
+			cfg.CertName = name
+			// Also pin server + account from the resolved lineage.
+			if conf, err := renewalconf.Load(filepath.Join(cfg.RenewalConfigsDir(), name+".conf")); err == nil {
+				if v := conf.RenewalParams["server"]; v != "" && !cfg.SetByUser("server") {
+					cfg.Server = v
+				}
+				if v := conf.RenewalParams["account"]; v != "" && !cfg.SetByUser("account") {
+					cfg.Account = v
+				}
+			}
 		}
 	}
 	certBytes, err := os.ReadFile(certPath)
@@ -93,7 +113,11 @@ func Revoke(ctx context.Context, cfg *config.Config, reg *plugins.Registry) erro
 
 	// Mirrors Certbot's main.revoke 786-794: prompt the user to also
 	// delete the lineage (default Yes) unless --no-delete-after-revoke
-	// was passed.
+	// was passed. In non-interactive mode the prompt's default is
+	// returned, so the default behavior is to DELETE — matches
+	// certbot integration test_revoke_simple which expects
+	// `revoke --cert-path X --delete-after-revoke` AND
+	// `revoke --cert-path X` (no flag) to both delete by default.
 	if cfg.CertName != "" {
 		var doDelete bool
 		switch {
@@ -102,19 +126,105 @@ func Revoke(ctx context.Context, cfg *config.Config, reg *plugins.Registry) erro
 		case cfg.SetByUser("no-delete-after-revoke"):
 			doDelete = false
 		case cfg.NonInteractive:
-			// Certbot errors out in non-interactive mode if neither flag
-			// was passed (main.py:788-791 uses force_interactive=True).
-			return errors.New("revoke: --delete-after-revoke or --no-delete-after-revoke must be set in non-interactive mode")
+			// certbot's display_util.yesno returns the default (True)
+			// in non-interactive mode; mirror by defaulting to delete.
+			doDelete = true
 		default:
 			doDelete = display.YesNoDefault(
 				"Would you like to delete the certificate(s) you just revoked, along with all earlier and later versions of the certificate?",
 				true)
 		}
 		if doDelete {
+			if hasOverlappingArchiveDir(cfg, cfg.CertName) {
+				fmt.Fprintf(os.Stderr,
+					"Not deleting revoked certificates due to overlapping archive dirs. "+
+						"More than one certificate is using %s\n",
+					archiveDirFor(cfg, cfg.CertName))
+				return nil
+			}
 			return Delete(ctx, cfg, reg)
 		}
 	}
 	return nil
+}
+
+// certPathToLineage returns the lineage name (renewal-conf basename without
+// the `.conf` suffix) whose `cert` or `fullchain` top-level key matches
+// targetPath. Empty when nothing matches. Mirrors certbot
+// cert_manager.cert_path_to_lineage which scans renewal confs by file path.
+func certPathToLineage(cfg *config.Config, targetPath string) string {
+	abs, err := filepath.Abs(targetPath)
+	if err != nil {
+		abs = targetPath
+	}
+	entries, err := os.ReadDir(cfg.RenewalConfigsDir())
+	if err != nil {
+		return ""
+	}
+	for _, e := range entries {
+		if !e.Type().IsRegular() || !strings.HasSuffix(e.Name(), ".conf") {
+			continue
+		}
+		name := strings.TrimSuffix(e.Name(), ".conf")
+		conf, err := renewalconf.Load(filepath.Join(cfg.RenewalConfigsDir(), e.Name()))
+		if err != nil {
+			continue
+		}
+		for _, key := range []string{"cert", "fullchain"} {
+			if p := conf.Top[key]; p != "" {
+				if pa, err := filepath.Abs(p); err == nil && pa == abs {
+					return name
+				}
+				if p == targetPath {
+					return name
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// hasOverlappingArchiveDir returns true iff any renewal conf OTHER than
+// certName points at the same archive_dir. Mirrors certbot's pre-delete
+// safety check in main.revoke (main.py:802-815): without this, revoking a
+// cert whose renewal conf was hand-copied or shares archive_dir with
+// another lineage would delete files still referenced by the sibling.
+func hasOverlappingArchiveDir(cfg *config.Config, certName string) bool {
+	if certName == "" {
+		return false
+	}
+	target := archiveDirFor(cfg, certName)
+	if target == "" {
+		return false
+	}
+	entries, err := os.ReadDir(cfg.RenewalConfigsDir())
+	if err != nil {
+		return false
+	}
+	for _, e := range entries {
+		if !e.Type().IsRegular() || !strings.HasSuffix(e.Name(), ".conf") {
+			continue
+		}
+		otherName := strings.TrimSuffix(e.Name(), ".conf")
+		if otherName == certName {
+			continue
+		}
+		if archiveDirFor(cfg, otherName) == target {
+			return true
+		}
+	}
+	return false
+}
+
+// archiveDirFor reads renewal/<certName>.conf and returns the archive_dir
+// top-level key. Returns "" on any error so callers fail-open (treat as
+// no overlap detected).
+func archiveDirFor(cfg *config.Config, certName string) string {
+	conf, err := renewalconf.Load(filepath.Join(cfg.RenewalConfigsDir(), certName+".conf"))
+	if err != nil {
+		return ""
+	}
+	return conf.Top["archive_dir"]
 }
 
 // revokeWithCertKey performs cert-key revocation per RFC 8555 §7.6. The cert's

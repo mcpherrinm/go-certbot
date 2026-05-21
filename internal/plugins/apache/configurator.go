@@ -37,6 +37,7 @@ import (
 
 	"github.com/letsencrypt/go-certbot/internal/checkpoint"
 	"github.com/letsencrypt/go-certbot/internal/config"
+	"github.com/letsencrypt/go-certbot/internal/extenv"
 	"github.com/letsencrypt/go-certbot/internal/plugins"
 	"github.com/letsencrypt/go-certbot/internal/plugins/apache/parser"
 )
@@ -47,7 +48,8 @@ type Plugin struct {
 
 	mu             sync.Mutex
 	challengeDir   string
-	injectedConfig string // path we wrote to during Present
+	injectedConfig string   // legacy single-file path (compat with tests)
+	injectedFiles  []string // every conf file we mutated during Present (across include tree)
 }
 
 func New() *Plugin { return &Plugin{} }
@@ -84,7 +86,20 @@ func (p *Plugin) Prepare(ctx context.Context, cfg *config.Config, domains []stri
 func (p *Plugin) Cleanup(ctx context.Context) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.injectedConfig != "" {
+	// Strip from every file we touched during injection. On Debian the
+	// challenge Alias lands in sites-enabled/*.conf — the root apache2.conf
+	// usually has zero VirtualHost blocks of its own.
+	seen := map[string]bool{}
+	for _, fpath := range p.injectedFiles {
+		if seen[fpath] {
+			continue
+		}
+		seen[fpath] = true
+		if err := p.removeChallengeAliases(fpath); err != nil {
+			fmt.Fprintf(os.Stderr, "apache: cleanup remove %s: %v\n", fpath, err)
+		}
+	}
+	if p.injectedConfig != "" && !seen[p.injectedConfig] {
 		if err := p.removeChallengeAliases(p.injectedConfig); err != nil {
 			fmt.Fprintf(os.Stderr, "apache: cleanup remove: %v\n", err)
 		}
@@ -93,6 +108,11 @@ func (p *Plugin) Cleanup(ctx context.Context) error {
 		_ = os.RemoveAll(p.challengeDir)
 		p.challengeDir = ""
 	}
+	// Cleanup completed — mark the apache-http01 checkpoint clean so
+	// a subsequent signal-driven rollback doesn't re-undo our (now
+	// already-undone) injection. If injection never happened, MarkClean
+	// is a no-op.
+	checkpoint.MarkClean()
 	if err := testAndReload(ctx, p.cfg); err != nil {
 		fmt.Fprintf(os.Stderr, "apache: cleanup reload: %v\n", err)
 	}
@@ -129,13 +149,12 @@ func (p *Plugin) Install(ctx context.Context, cfg *config.Config, domains []stri
 		return fmt.Errorf("apache: no <VirtualHost> matched any of %v in %s (or its includes)", domains, configPath)
 	}
 
-	// Install the Mozilla-intermediate SSL snippet once. The Include
-	// directive is added to every SSL vhost so the recommended
-	// SSLProtocol/SSLCipherSuite/SSLHonorCipherOrder triple takes effect.
-	sslSnippet, err := installOptionsSSLApacheConf(cfg.ConfigDir)
-	if err != nil {
-		return err
-	}
+	// options-ssl-apache.conf path. The actual write happens AFTER the
+	// checkpoint below so that rollback can restore the pre-existing
+	// version. Without this ordering, installOptionsSSLApacheConf
+	// overwrote the file BEFORE checkpoint.Save took its snapshot,
+	// making the snapshot capture the new (already-overwritten) state.
+	sslSnippet := filepath.Join(cfg.ConfigDir, "options-ssl-apache.conf")
 
 	// On Apache < 2.4.8 the chain must be in a separate
 	// SSLCertificateChainFile; on 2.4.8+ the chain lives inside fullchain
@@ -199,8 +218,20 @@ func (p *Plugin) Install(ctx context.Context, cfg *config.Config, domains []stri
 	for _, e := range extras {
 		paths = append(paths, e.path)
 	}
+	// Include the SSL options conf (and its `.dist` sibling for
+	// hand-modified flows) in the install checkpoint so a rollback
+	// restores the pre-existing version. The actual write happens
+	// after the checkpoint snapshot is taken.
+	paths = append(paths, sslSnippet, sslSnippet+".dist")
 	if _, err := checkpoint.Save(cfg.WorkDir, "apache-install", paths); err != nil {
 		return fmt.Errorf("apache: checkpoint: %w", err)
+	}
+	// Install the Mozilla-intermediate SSL snippet once. The Include
+	// directive (already wired through to applySSLDirectives /
+	// cloneAsSSLVHost via the sslSnippet path above) becomes effective
+	// once this write lands.
+	if _, err := installOptionsSSLApacheConf(cfg.ConfigDir); err != nil {
+		return err
 	}
 	if err := writeAllFiles(files); err != nil {
 		return err
@@ -259,14 +290,22 @@ func wrapInIfModuleSSL(sec *parser.Section) string {
 // the per-name RewriteCond prevents the rule firing for vhosts that share
 // the same :80 listener but aren't part of our cert. Idempotent.
 func addRewriteRedirect(sec *parser.Section) {
-	for _, n := range sec.Body {
-		if d, ok := n.(*parser.Directive); ok && strings.EqualFold(d.Name, "RewriteRule") {
-			for _, a := range d.Args {
-				if strings.HasPrefix(strings.TrimSpace(a), `https://`) {
-					return
-				}
-			}
-		}
+	// Detect an existing certbot/go-certbot redirect by exact-match on
+	// the 3-arg RewriteRule signature ("^",
+	// "https://%{SERVER_NAME}%{REQUEST_URI}", "[END,NE,R=permanent]").
+	// We also need to recurse into nested sections (e.g. <IfModule
+	// mod_rewrite.c>) because operators often wrap RewriteRule blocks
+	// in module guards. Mirrors certbot _verify_no_certbot_redirect
+	// (configurator.py:2114-2157) which uses find_dir.
+	//
+	// Pre-fix we matched any RewriteRule arg starting with "https://",
+	// which false-positived on innocent rewrites like
+	// `RewriteRule ^/old https://other.example.com/new` and skipped
+	// adding the cert redirect. We also failed to look inside nested
+	// sections, so a rewrite hidden in <IfModule> caused us to emit a
+	// duplicate at the top level on re-runs.
+	if hasCertbotRedirect(sec.Body) {
+		return
 	}
 	indent := childIndent(sec)
 	sec.Body = append(sec.Body,
@@ -294,11 +333,55 @@ func addRewriteRedirect(sec *parser.Section) {
 	})
 }
 
-// vhostNames returns the ServerName + ServerAlias values for a vhost
-// section (single ServerName, plus aliases). Used by the RewriteCond
-// per-domain guard.
+// hasCertbotRedirect walks `nodes` recursively (descending into nested
+// sections) looking for a 3-arg RewriteRule whose args match the canonical
+// certbot/go-certbot redirect signature:
+//
+//	RewriteRule ^ https://%{SERVER_NAME}%{REQUEST_URI} [END,NE,R=permanent]
+//
+// Anything else (e.g. legacy OLD_REWRITE_HTTPS_ARGS variants or innocent
+// rewrites pointing at other domains) is ignored.
+func hasCertbotRedirect(nodes []parser.Node) bool {
+	for _, n := range nodes {
+		switch nn := n.(type) {
+		case *parser.Directive:
+			if !strings.EqualFold(nn.Name, "RewriteRule") {
+				continue
+			}
+			if isCertbotRedirectRule(nn.Args) {
+				return true
+			}
+		case *parser.Section:
+			if hasCertbotRedirect(nn.Body) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// isCertbotRedirectRule matches the canonical certbot 3-arg rewrite.
+func isCertbotRedirectRule(args []string) bool {
+	if len(args) != 3 {
+		return false
+	}
+	clean := make([]string, len(args))
+	for i, a := range args {
+		clean[i] = strings.Trim(a, `"'`)
+	}
+	return clean[0] == "^" &&
+		clean[1] == "https://%{SERVER_NAME}%{REQUEST_URI}" &&
+		clean[2] == "[END,NE,R=permanent]"
+}
+
+// vhostNames returns the active ServerName + every ServerAlias for a
+// vhost. Mirrors certbot configurator.py:_get_servernames: when multiple
+// ServerName directives are present, the LAST one wins (Apache override
+// semantics — configurator.py:958-961). Values are stripped of optional
+// scheme:// prefix and :port suffix (obj.py:127).
 func vhostNames(sec *parser.Section) []string {
-	var out []string
+	var aliases []string
+	var lastServerName string
 	for _, n := range sec.Body {
 		d, ok := n.(*parser.Directive)
 		if !ok {
@@ -307,13 +390,18 @@ func vhostNames(sec *parser.Section) []string {
 		switch strings.ToLower(d.Name) {
 		case "servername":
 			if len(d.Args) > 0 {
-				out = append(out, d.Args[0])
+				lastServerName = stripServerNameDecoration(d.Args[0])
 			}
 		case "serveralias":
-			out = append(out, d.Args...)
+			for _, a := range d.Args {
+				aliases = append(aliases, stripServerNameDecoration(a))
+			}
 		}
 	}
-	return out
+	if lastServerName != "" {
+		return append([]string{lastServerName}, aliases...)
+	}
+	return aliases
 }
 
 // apacheConfigPath returns where to read/write, honoring --apache-server-root
@@ -437,7 +525,9 @@ func apacheVersion(ctx context.Context, cfg *config.Config) apacheVer {
 		return apacheVerCache
 	}
 	query := apacheQueryBin(cfg)
-	out, err := exec.CommandContext(ctx, query, "-v").CombinedOutput()
+	verCmd := exec.CommandContext(ctx, query, "-v")
+	verCmd.Env = extenv.Env()
+	out, err := verCmd.CombinedOutput()
 	if err != nil {
 		apacheVerCacheOK = true
 		apacheVerCache = apacheVer{2, 4, 0}
@@ -523,6 +613,67 @@ func findMatchingVHosts(cfg *parser.Config, domains []string, wantPort string) [
 	return out
 }
 
+// unnamedVHostsOnPort returns vhosts on wantPort that have NO ServerName
+// directive at all. Mirrors certbot http_01.py's `_unnamed_vhosts` —
+// these catch requests that don't match any named vhost (default-vhost
+// behavior) and must also be given the challenge Alias so the CA's
+// validation request lands on the right handler.
+func unnamedVHostsOnPort(cfg *parser.Config, wantPort string) []*parser.Section {
+	var out []*parser.Section
+	var visit func(nodes []parser.Node, inMacro bool)
+	visit = func(nodes []parser.Node, inMacro bool) {
+		for _, n := range nodes {
+			sec, ok := n.(*parser.Section)
+			if !ok {
+				continue
+			}
+			macroHere := inMacro || strings.EqualFold(sec.Name, "Macro")
+			if !macroHere &&
+				strings.EqualFold(sec.Name, "VirtualHost") &&
+				vhostOnPort(sec, wantPort) &&
+				len(vhostNames(sec)) == 0 {
+				out = append(out, sec)
+			}
+			visit(sec.Body, macroHere)
+		}
+	}
+	visit(cfg.Nodes, false)
+	return out
+}
+
+// allVHostsOnPort returns every vhost (named or not) on wantPort.
+func allVHostsOnPort(cfg *parser.Config, wantPort string) []*parser.Section {
+	var out []*parser.Section
+	var visit func(nodes []parser.Node, inMacro bool)
+	visit = func(nodes []parser.Node, inMacro bool) {
+		for _, n := range nodes {
+			sec, ok := n.(*parser.Section)
+			if !ok {
+				continue
+			}
+			macroHere := inMacro || strings.EqualFold(sec.Name, "Macro")
+			if !macroHere &&
+				strings.EqualFold(sec.Name, "VirtualHost") &&
+				vhostOnPort(sec, wantPort) {
+				out = append(out, sec)
+			}
+			visit(sec.Body, macroHere)
+		}
+	}
+	visit(cfg.Nodes, false)
+	return out
+}
+
+// vhostInHits reports whether sec is already present in hits.
+func vhostInHits(hits []vhostHit, sec *parser.Section) bool {
+	for _, h := range hits {
+		if h.Sec == sec {
+			return true
+		}
+	}
+	return false
+}
+
 // vhostOnPort returns true if the vhost's first arg ends in :wantPort, or if
 // wantPort is "". `*:443`, `_default_:443`, `1.2.3.4:443` all match "443".
 func vhostOnPort(sec *parser.Section, wantPort string) bool {
@@ -541,31 +692,74 @@ func vhostOnPort(sec *parser.Section, wantPort string) bool {
 }
 
 // vhostMatchesAny: does ServerName or ServerAlias cover any requested domain?
+// DNS matching is case-insensitive (RFC 4343) and Apache itself is
+// case-insensitive for ServerName / ServerAlias. We also strip the optional
+// scheme:// prefix and :port suffix that Apache accepts on ServerName per
+// VirtualHost.strip_name (certbot _internal/plugins/apache_/obj.py:127).
+// Mirrors certbot's `domain_in_names` (configurator.py:773-794).
 func vhostMatchesAny(sec *parser.Section, want map[string]bool) bool {
+	// Build a lowercase set of wanted names for O(1) lookup.
+	lcWant := make(map[string]bool, len(want))
+	for w := range want {
+		lcWant[strings.ToLower(w)] = true
+	}
+	// Per Apache: when multiple ServerName directives are present, the
+	// LAST one wins (subsequent overrides earlier). Walk Body in order
+	// and remember the most recent ServerName; ServerAlias accumulates.
+	var lastServerName string
+	var aliases []string
 	for _, n := range sec.Body {
 		d, ok := n.(*parser.Directive)
 		if !ok {
 			continue
 		}
 		switch strings.ToLower(d.Name) {
-		case "servername", "serveralias":
-			for _, raw := range d.Args {
-				name := strings.Trim(raw, `"`)
-				if want[name] {
+		case "servername":
+			if len(d.Args) > 0 {
+				lastServerName = stripServerNameDecoration(d.Args[0])
+			}
+		case "serveralias":
+			for _, a := range d.Args {
+				aliases = append(aliases, stripServerNameDecoration(a))
+			}
+		}
+	}
+	names := aliases
+	if lastServerName != "" {
+		names = append(names, lastServerName)
+	}
+	for _, raw := range names {
+		name := strings.ToLower(raw)
+		if name == "" {
+			continue
+		}
+		if lcWant[name] {
+			return true
+		}
+		if strings.HasPrefix(name, "*.") {
+			suffix := name[1:]
+			for w := range lcWant {
+				if strings.HasSuffix(w, suffix) {
 					return true
-				}
-				if strings.HasPrefix(name, "*.") {
-					suffix := name[1:]
-					for w := range want {
-						if strings.HasSuffix(w, suffix) {
-							return true
-						}
-					}
 				}
 			}
 		}
 	}
 	return false
+}
+
+// stripServerNameDecoration removes surrounding quotes and the optional
+// `scheme://` prefix / `:port` suffix Apache accepts on ServerName /
+// ServerAlias values. e.g. `https://example.com:8080` → `example.com`.
+func stripServerNameDecoration(raw string) string {
+	s := strings.Trim(raw, `"'`)
+	if i := strings.Index(s, "://"); i >= 0 {
+		s = s[i+3:]
+	}
+	if i := strings.IndexByte(s, ':'); i >= 0 {
+		s = s[:i]
+	}
+	return s
 }
 
 // applySSLDirectives writes (or updates) SSLEngine on, SSLCertificateFile,
@@ -581,8 +775,16 @@ func vhostMatchesAny(sec *parser.Section, want map[string]bool) bool {
 func applySSLDirectives(sec *parser.Section, fullchain, privkey, chainPath, sslSnippet string) {
 	indent := childIndent(sec)
 	setOrAppend(sec, indent, "SSLEngine", "on")
-	setOrAppend(sec, indent, "SSLCertificateFile", fullchain)
-	setOrAppend(sec, indent, "SSLCertificateKeyFile", privkey)
+	// Drop ALL existing SSLCertificateFile/KeyFile lines before appending
+	// the canonical pair. Apache uses the LAST instance of each, so a
+	// stale or hand-edited duplicate would cause the wrong cert to be
+	// served. Mirrors certbot _clean_vhost (configurator.py:1654-1675).
+	removeDirective(sec, "SSLCertificateFile")
+	removeDirective(sec, "SSLCertificateKeyFile")
+	sec.Body = append(sec.Body,
+		&parser.Directive{Indent: indent, Name: "SSLCertificateFile", Args: []string{fullchain}, Newline: "\n"},
+		&parser.Directive{Indent: indent, Name: "SSLCertificateKeyFile", Args: []string{privkey}, Newline: "\n"},
+	)
 	if chainPath != "" {
 		setOrAppend(sec, indent, "SSLCertificateChainFile", chainPath)
 	} else {
@@ -795,31 +997,60 @@ func childIndent(sec *parser.Section) string {
 	return strings.Repeat(" ", 4)
 }
 
-// injectChallengeAliases parses the config and inserts a temporary
-// `Alias /.well-known/acme-challenge/ <webroot>/.well-known/acme-challenge/`
+// injectChallengeAliases follows the full Include tree from configPath and
+// inserts a temporary `Alias /.well-known/acme-challenge/ <webroot>/...`
 // directive into every <VirtualHost *:80> that matches any requested domain.
 // A marker comment is added so cleanup can find what we put in.
+//
+// Pre-fix this read only the root apache2.conf, which on Debian/Ubuntu
+// holds zero vhost definitions (vhosts live in sites-enabled/*.conf via
+// IncludeOptional). The auth path then errored out with "no matching
+// VirtualHost" or wrote into the wrong file, breaking http-01 entirely.
 func (p *Plugin) injectChallengeAliases(configPath, webroot string) error {
-	src, err := os.ReadFile(configPath)
+	files, err := loadAll(configPath)
 	if err != nil {
 		return err
 	}
-	root, err := parser.Parse(string(src))
-	if err != nil {
-		return err
+	hits := findMatchingVHostsAcrossFiles(files, p.domains, "80")
+	// Certbot http_01.py also picks up unnamed (ServerName-less)
+	// vhosts when at least one named match exists — the unnamed vhost
+	// will catch any request whose Host header doesn't match a
+	// ServerName, including requests for IP-address SANs or domains
+	// behind a proxy that rewrites Host. Add those as additional
+	// targets when we already have a name match. Mirrors
+	// http_01.py:91-104 (`_unnamed_vhosts`).
+	if len(hits) > 0 {
+		for _, f := range files {
+			for _, sec := range unnamedVHostsOnPort(f.AST, "80") {
+				if !vhostInHits(hits, sec) {
+					hits = append(hits, vhostHit{File: f, Sec: sec})
+				}
+			}
+		}
+	} else {
+		// No name match anywhere — fall back to every :80 vhost
+		// (Apache's "default vhost is the first defined" rule will
+		// then handle the routing). Mirrors http_01.py's behavior
+		// when name-matching yields nothing on a fresh-install where
+		// the user hasn't set ServerName yet.
+		for _, f := range files {
+			for _, sec := range allVHostsOnPort(f.AST, "80") {
+				hits = append(hits, vhostHit{File: f, Sec: sec})
+			}
+		}
 	}
-	matched := findMatchingVHosts(root, p.domains, "80")
-	if len(matched) == 0 {
-		// Fall back to any matching vhost.
-		matched = findMatchingVHosts(root, p.domains, "")
+	// As a last resort, accept any :port vhost.
+	if len(hits) == 0 {
+		hits = findMatchingVHostsAcrossFiles(files, p.domains, "")
 	}
-	if len(matched) == 0 {
-		return fmt.Errorf("apache: no <VirtualHost> in %s matches any of %v", configPath, p.domains)
+	if len(hits) == 0 {
+		return fmt.Errorf("apache: no <VirtualHost> in %s (or its includes) matches any of %v", configPath, p.domains)
 	}
 	target := filepath.Join(webroot, ".well-known", "acme-challenge") + string(filepath.Separator)
-	for _, sec := range matched {
-		indent := childIndent(sec)
-		sec.Body = append(sec.Body,
+	touched := map[string]*parsedFile{}
+	for _, h := range hits {
+		indent := childIndent(h.Sec)
+		h.Sec.Body = append(h.Sec.Body,
 			&parser.CommentLine{Verbatim: indent + "# go-certbot acme-challenge (auto-cleaned)", Newline: "\n"},
 			&parser.Directive{Indent: indent, Name: "Alias", Args: []string{`/.well-known/acme-challenge/`, target}, Newline: "\n"},
 			&parser.Section{
@@ -831,11 +1062,35 @@ func (p *Plugin) injectChallengeAliases(configPath, webroot string) error {
 				CloseIndent: indent, CloseNewline: "\n",
 			},
 		)
+		touched[h.File.Path] = h.File
 	}
+	// Checkpoint every file we're about to mutate so a crash between
+	// Present and Cleanup (panic, SIGKILL, OOM) can be rolled back by
+	// the next go-certbot/certbot run via reverter recovery. Pre-fix
+	// the Alias snippet stayed in the user's config forever on
+	// abnormal termination. Mirrors certbot http_01.py:61-70 which
+	// register file modifications with the reverter.
+	checkpointPaths := make([]string, 0, len(touched))
+	for path := range touched {
+		checkpointPaths = append(checkpointPaths, path)
+	}
+	if _, err := checkpoint.Save(p.cfg.WorkDir, "apache-http01", checkpointPaths); err != nil {
+		return fmt.Errorf("apache: checkpoint: %w", err)
+	}
+	// Write back every mutated file. Track which files we wrote so
+	// Cleanup can roll them back.
 	p.mu.Lock()
-	p.injectedConfig = configPath
+	p.injectedConfig = configPath // legacy compat
+	for path := range touched {
+		p.injectedFiles = append(p.injectedFiles, path)
+	}
 	p.mu.Unlock()
-	return os.WriteFile(configPath, []byte(root.String()), 0o644)
+	for path, f := range touched {
+		if err := os.WriteFile(path, []byte(f.AST.String()), 0o644); err != nil {
+			return fmt.Errorf("apache: write %s: %w", path, err)
+		}
+	}
+	return nil
 }
 
 // removeChallengeAliases strips everything we marked with the sentinel comment.
@@ -885,7 +1140,9 @@ func stripChallengeMarkers(nodes []parser.Node) {
 // Honors cfg.ApacheCtl if set.
 func testAndReload(ctx context.Context, cfg *config.Config) error {
 	ctl := apacheCtl(cfg)
-	if out, err := exec.CommandContext(ctx, ctl, "configtest").CombinedOutput(); err != nil {
+	testCmd := exec.CommandContext(ctx, ctl, "configtest")
+	testCmd.Env = extenv.Env()
+	if out, err := testCmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("apache: `%s configtest` failed: %w\n%s", ctl, err, string(out))
 	}
 	// `apachectl graceful` is Debian; `httpd -k graceful` is RHEL.
@@ -896,6 +1153,7 @@ func testAndReload(ctx context.Context, cfg *config.Config) error {
 	} else {
 		reload = exec.CommandContext(ctx, ctl, "graceful")
 	}
+	reload.Env = extenv.Env()
 	if out, err := reload.CombinedOutput(); err == nil {
 		return nil
 	} else {
@@ -908,7 +1166,9 @@ func testAndReload(ctx context.Context, cfg *config.Config) error {
 			alt = []string{cfg.ApacheCtl, "restart"}
 		}
 		if len(alt) > 0 {
-			altOut, altErr := exec.CommandContext(ctx, alt[0], alt[1:]...).CombinedOutput()
+			altCmd := exec.CommandContext(ctx, alt[0], alt[1:]...)
+			altCmd.Env = extenv.Env()
+			altOut, altErr := altCmd.CombinedOutput()
 			if altErr == nil {
 				return nil
 			}

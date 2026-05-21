@@ -41,9 +41,14 @@ func ArchiveDir(configDir, certName string) string {
 	return filepath.Join(configDir, "archive", certName)
 }
 
-// NextVersion scans archive/<certname>/ and returns the next available
-// version number (one more than the highest cert<N>.pem present), or 1 if the
-// directory is empty/missing.
+// NextVersion scans archive/<certname>/ for any of {cert,privkey,chain,
+// fullchain}<N>.pem and returns one more than the highest N. Returns 1 if
+// the directory is empty/missing.
+//
+// Inspecting all four kinds (not just cert) prevents lineage corruption in
+// the case where, e.g., cert3.pem was manually deleted but privkey3.pem
+// still exists — using N=3 would overwrite the orphan privkey. Mirrors
+// certbot.storage.next_free_version (storage.py:843-855).
 func NextVersion(configDir, certName string) (int, error) {
 	archive := ArchiveDir(configDir, certName)
 	entries, err := os.ReadDir(archive)
@@ -55,16 +60,41 @@ func NextVersion(configDir, certName string) (int, error) {
 	}
 	highest := 0
 	for _, e := range entries {
-		name := e.Name()
-		if !strings.HasPrefix(name, "cert") || !strings.HasSuffix(name, ".pem") {
-			continue
-		}
-		n, err := strconv.Atoi(strings.TrimSuffix(strings.TrimPrefix(name, "cert"), ".pem"))
-		if err == nil && n > highest {
+		if n := archiveVersionFromName(e.Name()); n > highest {
 			highest = n
 		}
 	}
 	return highest + 1, nil
+}
+
+// archiveVersionFromName returns the N from "{cert,privkey,chain,fullchain}<N>.pem",
+// or 0 if the filename doesn't match.
+func archiveVersionFromName(name string) int {
+	if !strings.HasSuffix(name, ".pem") {
+		return 0
+	}
+	stem := strings.TrimSuffix(name, ".pem")
+	var rest string
+	switch {
+	case strings.HasPrefix(stem, "fullchain"):
+		rest = strings.TrimPrefix(stem, "fullchain")
+	case strings.HasPrefix(stem, "privkey"):
+		rest = strings.TrimPrefix(stem, "privkey")
+	case strings.HasPrefix(stem, "chain"):
+		rest = strings.TrimPrefix(stem, "chain")
+	case strings.HasPrefix(stem, "cert"):
+		rest = strings.TrimPrefix(stem, "cert")
+	default:
+		return 0
+	}
+	if rest == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(rest)
+	if err != nil {
+		return 0
+	}
+	return n
 }
 
 // archiveSet returns the four archive/<certname>/<kind>N.pem paths.
@@ -156,8 +186,27 @@ func Write(configDir, certName string, fullchainPEM, chainPEM, privkeyPEM []byte
 	if err := writeFile(arc.Fullchain, fullchainPEM, 0o644); err != nil {
 		return nil, err
 	}
-	if err := writeFile(arc.Privkey, privkeyPEM, 0o600); err != nil {
+	// Compute privkey mode + owner from the prior archive version, if any.
+	// Mirrors certbot.compat.filesystem.compute_private_key_mode +
+	// copy_ownership_and_apply_mode (storage.py:1191-1196): mode is
+	// 0600 | (prior_mode & (S_IRGRP|S_IWGRP|S_IXGRP|S_IROTH)) so a user
+	// who chmodded an earlier key to add group-read keeps that bit
+	// across renewals, and gid is propagated.
+	//
+	// Privkey writes use O_EXCL to refuse clobbering an existing file.
+	// archive/privkey<N>.pem is per-version unique by construction, so
+	// an existing file at that path indicates lineage corruption (or a
+	// concurrent writer) that we should fail loudly on, not silently
+	// overwrite. Mirrors certbot util.safe_open (storage.py:1073, :1188
+	// pass chmod=BASE_PRIVKEY_MODE + O_EXCL via safe_open's defaults).
+	privMode, copyFrom := computePrivkeyMode(configDir, certName, version)
+	if err := writeFileExclusive(arc.Privkey, privkeyPEM, privMode); err != nil {
 		return nil, err
+	}
+	if copyFrom != "" {
+		if err := copyGroupOwnership(copyFrom, arc.Privkey); err != nil {
+			return nil, err
+		}
 	}
 
 	liveFiles := liveSet(configDir, certName)
@@ -189,6 +238,13 @@ func Write(configDir, certName string, fullchainPEM, chainPEM, privkeyPEM []byte
 // recovers from interrupted-renewal state where archive/N+1 exists but the
 // live/ symlinks still point at N.
 //
+// Also recovers from a half-completed Certbot update_all_links_to: if any
+// previous_{cert,privkey,chain,fullchain}.pem symlink exists alongside the
+// live/ links, that's a crash signal from Certbot. Per storage.py:711-720,
+// we restore each live link to its previous_* target, then remove the
+// previous_* sentinels. This makes go-certbot resilient to a Certbot run
+// killed mid-link-update on the same lineage.
+//
 // Returns the version it pointed at (highest available), or 0 if archive
 // is empty.
 func EnsureDeployed(configDir, certName string) (int, error) {
@@ -200,14 +256,16 @@ func EnsureDeployed(configDir, certName string) (int, error) {
 		}
 		return 0, err
 	}
+	// Certbot half-completed-update recovery: if previous_*.pem
+	// symlinks exist in live/<certname>/, restore each kind's live
+	// link to the previous_*'s target. This restores the lineage to
+	// the pre-interrupted state before any further write.
+	if err := recoverPreviousLinks(configDir, certName); err != nil {
+		return 0, err
+	}
 	highest := 0
 	for _, e := range entries {
-		name := e.Name()
-		if !strings.HasPrefix(name, "cert") || !strings.HasSuffix(name, ".pem") {
-			continue
-		}
-		n, err := strconv.Atoi(strings.TrimSuffix(strings.TrimPrefix(name, "cert"), ".pem"))
-		if err == nil && n > highest {
+		if n := archiveVersionFromName(e.Name()); n > highest {
 			highest = n
 		}
 	}
@@ -288,6 +346,85 @@ func writeLiveTopReadme(configDir string) error {
 		"Each subdirectory contains four symlinks pointing into archive/. Do not\n" +
 		"move or delete the files in here; they are managed by certbot.\n"
 	return writeFile(path, []byte(body), 0o644)
+}
+
+// recoverPreviousLinks restores live/<certname>/{cert,privkey,chain,fullchain}.pem
+// from a sibling previous_{cert,privkey,chain,fullchain}.pem symlink if one
+// exists, then removes the sentinel. Mirrors certbot._previous_symlinks /
+// _fix_symlinks (storage.py:688-720): Certbot writes previous_* before
+// rotating live/, and removes them after the rotation completes; a stray
+// previous_* indicates the rotation was interrupted (killed mid-update,
+// disk full, etc.). Restoring to the previous_* target undoes the half-
+// rotation so the next write starts from a consistent state.
+func recoverPreviousLinks(configDir, certName string) error {
+	live := liveSet(configDir, certName)
+	for _, pair := range []struct {
+		current, prevName string
+	}{
+		{live.Cert, "previous_cert.pem"},
+		{live.Privkey, "previous_privkey.pem"},
+		{live.Chain, "previous_chain.pem"},
+		{live.Fullchain, "previous_fullchain.pem"},
+	} {
+		prev := filepath.Join(filepath.Dir(pair.current), pair.prevName)
+		target, err := os.Readlink(prev)
+		if err != nil {
+			continue // not a symlink, or doesn't exist — common case
+		}
+		// Restore current link to point at the same target the
+		// previous_* link pointed at, then remove previous_*.
+		_ = os.Remove(pair.current)
+		if err := os.Symlink(target, pair.current); err != nil {
+			return fmt.Errorf("storage: restore %s: %w", pair.current, err)
+		}
+		if err := os.Remove(prev); err != nil {
+			return fmt.Errorf("storage: remove %s: %w", prev, err)
+		}
+	}
+	return nil
+}
+
+// computePrivkeyMode returns the file mode + path of the prior version's
+// privkey to copy gid from. If there's no prior privkey (initial issuance)
+// it returns the base 0o600 mode and "". Mirrors
+// certbot.compat.filesystem.compute_private_key_mode (filesystem.py:449):
+// preserve user-set group/other read+write+execute bits on the previous
+// privkey across renewals.
+func computePrivkeyMode(configDir, certName string, newVersion int) (os.FileMode, string) {
+	if newVersion <= 1 {
+		return 0o600, ""
+	}
+	prior := archiveSet(configDir, certName, newVersion-1)
+	info, err := os.Stat(prior.Privkey)
+	if err != nil {
+		return 0o600, ""
+	}
+	const mask os.FileMode = 0o077 // S_IRWXG | S_IROTH | S_IWOTH | S_IXOTH
+	// Certbot's mask is narrower: 0o074 = S_IRGRP|S_IWGRP|S_IXGRP|S_IROTH.
+	// We use that exact mask to round-trip.
+	const certbotMask os.FileMode = 0o074
+	_ = mask
+	return 0o600 | (info.Mode().Perm() & certbotMask), prior.Privkey
+}
+
+// writeFileExclusive writes data to path with O_CREAT|O_EXCL|O_WRONLY,
+// failing if the file already exists. Used for archive private-key writes
+// where an existing file indicates a lineage-corruption bug we should
+// surface, not silently overwrite.
+func writeFileExclusive(path string, data []byte, mode os.FileMode) error {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, mode)
+	if err != nil {
+		return fmt.Errorf("storage: create %s: %w", path, err)
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		_ = os.Remove(path)
+		return fmt.Errorf("storage: write %s: %w", path, err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("storage: close %s: %w", path, err)
+	}
+	return nil
 }
 
 func writeFile(path string, data []byte, mode os.FileMode) error {

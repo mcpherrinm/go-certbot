@@ -35,6 +35,66 @@ func TestFindMatchingServersExact(t *testing.T) {
 	}
 }
 
+// TestSelectBestServerPerDomain mirrors certbot _choose_vhost_single
+// (configurator.py:475-494). For a config with overlapping wildcards,
+// install must touch only THE most-specific matching server per domain.
+func TestSelectBestServerPerDomain(t *testing.T) {
+	src := `http {
+    server {
+        listen 80;
+        server_name *.example.com;
+    }
+    server {
+        listen 80;
+        server_name example.com;
+    }
+    server {
+        listen 80;
+        server_name *.example.*;
+    }
+}
+`
+	cfg := parseOrFatal(t, src)
+	files := []*parsedFile{{Path: "/tmp/x.conf", AST: cfg}}
+	hits := selectBestServerPerDomain(files, []string{"example.com"})
+	if len(hits) != 1 {
+		t.Fatalf("expected exactly 1 best match, got %d", len(hits))
+	}
+	srv := hits[0].Server
+	// Must be the EXACT-match block, not *.example.com or *.example.*.
+	if got := serverNames(srv); len(got) != 1 || got[0] != "example.com" {
+		t.Errorf("expected exact-match `server_name example.com`, got %v", got)
+	}
+}
+
+// TestFindMatchingServersCaseInsensitive mirrors certbot's
+// parser._exact_match / _wildcard_match which lowercase both sides
+// (parser.py:525-565). DNS names are case-insensitive per RFC 4343.
+func TestFindMatchingServersCaseInsensitive(t *testing.T) {
+	src := `http {
+    server {
+        listen 80;
+        server_name Example.COM www.Example.COM;
+    }
+    server {
+        listen 80;
+        server_name *.WILDCARD.example;
+    }
+}
+`
+	cfg := parseOrFatal(t, src)
+	for _, dom := range []string{"example.com", "EXAMPLE.com", "www.example.com"} {
+		got := findMatchingServers(cfg, []string{dom})
+		if len(got) == 0 {
+			t.Errorf("expected a match for %q (server_name Example.COM)", dom)
+		}
+	}
+	got := findMatchingServers(cfg, []string{"sub.wildcard.example"})
+	if len(got) == 0 {
+		t.Errorf("expected wildcard match for sub.wildcard.example")
+	}
+}
+
 func TestFindMatchingServersWildcard(t *testing.T) {
 	src := `http {
     server {
@@ -63,8 +123,8 @@ func TestInsertSSLDirectivesIdempotent(t *testing.T) {
 `
 	cfg := parseOrFatal(t, src)
 	srv := cfg.Nodes[0].(*parser.Block)
-	insertSSLDirectives(srv, "/fc.pem", "/key.pem", 443)
-	insertSSLDirectives(srv, "/fc.pem", "/key.pem", 443) // second call shouldn't double
+	insertSSLDirectives(srv, "/fc.pem", "/key.pem", 80, 443)
+	insertSSLDirectives(srv, "/fc.pem", "/key.pem", 80, 443) // second call shouldn't double
 	out := cfg.String()
 	if strings.Count(out, "ssl_certificate ") != 1 {
 		t.Errorf("ssl_certificate inserted %d times:\n%s", strings.Count(out, "ssl_certificate "), out)
@@ -82,13 +142,35 @@ func TestInsertSSLOnExistingListen443(t *testing.T) {
 `
 	cfg := parseOrFatal(t, src)
 	srv := cfg.Nodes[0].(*parser.Block)
-	insertSSLDirectives(srv, "/fc.pem", "/key.pem", 443)
+	insertSSLDirectives(srv, "/fc.pem", "/key.pem", 80, 443)
 	out := cfg.String()
 	if !strings.Contains(out, "listen 443 ssl;") {
 		t.Errorf("should upgrade existing listen 443:\n%s", out)
 	}
 	if strings.Count(out, "listen") != 1 {
 		t.Errorf("should not add a second listen line:\n%s", out)
+	}
+}
+
+// TestInsertSSLPreservesIPHost mirrors certbot#9978 fix: when the existing
+// http listen has an IP host (e.g. `listen 127.0.0.1:80;`), the new SSL
+// listen must keep the same host on the HTTPS port.
+func TestInsertSSLPreservesIPHost(t *testing.T) {
+	src := `server {
+    listen 127.0.0.1:80;
+    server_name example.com;
+}
+`
+	cfg := parseOrFatal(t, src)
+	srv := cfg.Nodes[0].(*parser.Block)
+	insertSSLDirectives(srv, "/fc.pem", "/key.pem", 80, 443)
+	out := cfg.String()
+	if !strings.Contains(out, "listen 127.0.0.1:443 ssl;") {
+		t.Errorf("expected 127.0.0.1:443 ssl listen:\n%s", out)
+	}
+	// The original http listen must NOT be modified.
+	if !strings.Contains(out, "listen 127.0.0.1:80;") {
+		t.Errorf("expected original http listen preserved:\n%s", out)
 	}
 }
 

@@ -224,7 +224,16 @@ func renewOne(ctx context.Context, cli *config.Config, reg *plugins.Registry, co
 	// If the ACME server supports ARI and the suggested window is in the
 	// future, respect it. This mirrors RFC 9773 §4.1: clients should use the
 	// server's hint when available.
-	if !cli.ForceRenewal {
+	//
+	// Skip the ARI check in two cases:
+	//   - The cert is already expired (RFC 9773 §4.3 forbids ARI for expired
+	//     serials; servers may return an error). Mirrors certbot 95a70e98c.
+	//   - --dry-run is set against staging while the cert was issued by prod:
+	//     the staging server has no record of the prod serial and would
+	//     return a noisy "no info for serial" warning. Mirrors certbot
+	//     b68268744. The dry-run path also doesn't need ARI because it isn't
+	//     going to write a new lineage anyway.
+	if !cli.ForceRenewal && !cli.DryRun && expiresAt.After(time.Now()) {
 		if dueAt, err := ariDecision(ctx, &merged, conf, confPath, leafPath); err == nil && dueAt != nil && dueAt.After(time.Now()) {
 			fmt.Printf("ARI says wait until %s; skipping renewal.\n", dueAt.Format(time.RFC3339))
 			return renewOutcome{kind: outcomeSkipped, sans: append([]string(nil), merged.Domains...)}, nil

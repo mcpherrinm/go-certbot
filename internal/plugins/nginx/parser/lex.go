@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 )
 
 // token is a single lexical unit. Kind discriminates; Value is the raw text
@@ -96,11 +97,16 @@ func (l *lexer) next() (token, error) {
 func (l *lexer) consumeWhitespace() string {
 	start := l.pos
 	for l.pos < len(l.src) {
-		c := rune(l.src[l.pos])
-		if !unicode.IsSpace(c) {
+		// Decode as rune so multibyte whitespace like NBSP (U+00A0,
+		// UTF-8 0xC2 0xA0) lexes correctly. Certbot's nginx parser
+		// allows NBSP since b18c07408 — word processors that insert
+		// it into config snippets used to make our parser silently
+		// concatenate the NBSP byte into the next word/directive.
+		r, w := utf8.DecodeRuneInString(l.src[l.pos:])
+		if !unicode.IsSpace(r) {
 			break
 		}
-		l.pos++
+		l.pos += w
 	}
 	return l.src[start:l.pos]
 }
@@ -132,16 +138,20 @@ func (l *lexer) consumeQuoted(quote byte) (string, error) {
 }
 
 // consumeWord reads characters until whitespace, ';', '{', '}', or '#' (comment).
-// Allows `=`, `~`, regex constructs, paths, IPs, etc.
+// Allows `=`, `~`, regex constructs, paths, IPs, etc. Rune-aware so
+// multibyte whitespace (NBSP etc.) terminates the word correctly.
 func (l *lexer) consumeWord() string {
 	start := l.pos
 	for l.pos < len(l.src) {
 		c := l.src[l.pos]
-		if unicode.IsSpace(rune(c)) ||
-			c == ';' || c == '{' || c == '}' || c == '#' {
+		if c == ';' || c == '{' || c == '}' || c == '#' {
 			break
 		}
-		l.pos++
+		r, w := utf8.DecodeRuneInString(l.src[l.pos:])
+		if unicode.IsSpace(r) {
+			break
+		}
+		l.pos += w
 	}
 	if l.pos == start {
 		// Should not happen — caller already checked specials.

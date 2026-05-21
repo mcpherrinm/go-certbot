@@ -32,10 +32,20 @@ func loadInto(path string, visited map[string]bool, out *[]*parsedFile) error {
 	if err != nil {
 		return err
 	}
-	if visited[abs] {
+	// Dedupe by symlink-resolved real path so a file reached through
+	// both sites-available/foo.conf AND sites-enabled/foo.conf (which
+	// is a symlink to the former) isn't parsed twice. Without this,
+	// the second parse + writeAllFiles loop would clobber the first's
+	// edits — and `applySSLDirectives` would run twice per vhost.
+	// Mirrors certbot configurator.py:1076-1100 (`filesystem.realpath`).
+	real := abs
+	if r, err := filepath.EvalSymlinks(abs); err == nil {
+		real = r
+	}
+	if visited[real] {
 		return nil
 	}
-	visited[abs] = true
+	visited[real] = true
 	b, err := os.ReadFile(abs)
 	if err != nil {
 		return fmt.Errorf("apache: read %s: %w", abs, err)
@@ -44,6 +54,10 @@ func loadInto(path string, visited map[string]bool, out *[]*parsedFile) error {
 	if err != nil {
 		return fmt.Errorf("apache: parse %s: %w", abs, err)
 	}
+	// Track the user-facing path (the symlink they configured) on the
+	// parsedFile so writeAllFiles writes through it. We dedupe ONCE
+	// per real file, so subsequent writes from the same source path
+	// remain correct.
 	*out = append(*out, &parsedFile{Path: abs, AST: cfg})
 	return walkIncludes(filepath.Dir(abs), cfg.Nodes, visited, out)
 }

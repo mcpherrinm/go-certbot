@@ -75,6 +75,48 @@ func Certonly(ctx context.Context, cfg *config.Config, reg *plugins.Registry) er
 			// proceed to issuance under a fresh cert-name suffix
 			certName = nextDuplicateCertName(cfg, certName)
 		}
+		// When reissuing an existing lineage, keep the existing
+		// key_type if the user didn't explicitly pass --key-type.
+		// Mirrors certbot integration test
+		// test_certonly_non_default_key_size_kept: `certonly
+		// --force-renewal -d existing` without --key-type preserves
+		// the lineage's key_type but resets key SIZE to the default
+		// (i.e. we do NOT also restore rsa_key_size; that uses the
+		// CLI default 2048).
+		//
+		// If --key-type is set AND it differs from the lineage's
+		// current key_type AND --cert-name isn't pinned, error out.
+		// Mirrors certbot _handle_key_type_change: an accidental
+		// `certonly -d X --key-type rsa` on a domain that happens to
+		// match an existing ecdsa lineage shouldn't silently flip
+		// the key type. The user must opt in via --cert-name to
+		// confirm they meant THIS specific lineage. test_renew_with
+		// _ec_keys asserts the exact error wording.
+		if reuse != "newcert" {
+			if reuse != "" && cfg.SetByUser("key-type") && cfg.CertName == "" {
+				if prior := lineageKeyType(cfg, certName); prior != "" && prior != cfg.KeyType {
+					return fmt.Errorf("Please provide both --cert-name and --key-type to change the type of the existing %q lineage from %s to %s", certName, prior, cfg.KeyType)
+				}
+			}
+			// --reuse-key conflicts with changing key parameters
+			// (--key-type, --rsa-key-size, --elliptic-curve) unless
+			// --new-key is also set to acknowledge the key swap.
+			// Mirrors certbot's renewal._reuse_key check: a user
+			// passing --reuse-key with a new key size signals
+			// confusion — we'd either silently re-issue with the OLD
+			// key (ignoring the new size) or silently issue a NEW
+			// key (ignoring --reuse-key). Both are surprising.
+			// test_new_key asserts "Unable to change the
+			// --rsa-key-size".
+			if cfg.ReuseKey && !cfg.NewKey {
+				if prior := lineageKeyType(cfg, certName); prior != "" {
+					if msg := keyParamChangeMessage(cfg, certName, prior); msg != "" {
+						return errors.New(msg)
+					}
+				}
+			}
+			mergeExistingKeyType(cfg, certName)
+		}
 	}
 
 	// pre_hook runs before challenge work; post_hook always runs after.
@@ -195,6 +237,69 @@ func resolveAuthenticatorName(cfg *config.Config) (string, error) {
 		return "", errors.New("certonly: an authenticator is required (--standalone / --webroot / --manual / --dns-* / --authenticator)")
 	}
 	return picked, nil
+}
+
+// lineageKeyType returns the key_type stored in the given lineage's
+// renewal conf, or "" if not present or the file can't be read.
+func lineageKeyType(cfg *config.Config, certName string) string {
+	conf, err := renewalconf.Load(filepath.Join(cfg.RenewalConfigsDir(), certName+".conf"))
+	if err != nil {
+		return ""
+	}
+	return conf.RenewalParams["key_type"]
+}
+
+// keyParamChangeMessage returns the certbot-style error string when
+// --reuse-key is set AND a key parameter (--key-type, --rsa-key-size,
+// --elliptic-curve) was set by the user AND differs from the lineage's
+// stored value. Empty string means no conflict.
+func keyParamChangeMessage(cfg *config.Config, certName, priorKeyType string) string {
+	conf, err := renewalconf.Load(filepath.Join(cfg.RenewalConfigsDir(), certName+".conf"))
+	if err != nil {
+		return ""
+	}
+	if cfg.SetByUser("key-type") && cfg.KeyType != priorKeyType {
+		return fmt.Sprintf("Unable to change the --key-type from %s to %s for the %s lineage while --reuse-key is set. Pass --new-key to allow the key swap, or drop --reuse-key.", priorKeyType, cfg.KeyType, certName)
+	}
+	if cfg.SetByUser("rsa-key-size") {
+		priorSize, _, _ := conf.Int("rsa_key_size")
+		if priorSize != 0 && priorSize != cfg.RSAKeySize {
+			return fmt.Sprintf("Unable to change the --rsa-key-size from %d to %d for the %s lineage while --reuse-key is set. Pass --new-key to allow the key swap, or drop --reuse-key.", priorSize, cfg.RSAKeySize, certName)
+		}
+	}
+	if cfg.SetByUser("elliptic-curve") {
+		priorCurve := conf.RenewalParams["elliptic_curve"]
+		if priorCurve != "" && priorCurve != cfg.EllipticCurve {
+			return fmt.Sprintf("Unable to change the --elliptic-curve from %s to %s for the %s lineage while --reuse-key is set. Pass --new-key to allow the key swap, or drop --reuse-key.", priorCurve, cfg.EllipticCurve, certName)
+		}
+	}
+	return ""
+}
+
+// mergeExistingKeyType reads the existing lineage's renewal conf and
+// preserves the lineage's key_type when the user didn't pass --key-type
+// on the cmd line. Per certbot test_certonly_non_default_key_size_kept,
+// key_type stays but key SIZE resets to default — so we only merge the
+// key_type and elliptic_curve fields, not rsa_key_size.
+func mergeExistingKeyType(cfg *config.Config, certName string) {
+	if cfg.SetByUser("key-type") {
+		return
+	}
+	confPath := filepath.Join(cfg.RenewalConfigsDir(), certName+".conf")
+	conf, err := renewalconf.Load(confPath)
+	if err != nil {
+		return
+	}
+	if v := conf.RenewalParams["key_type"]; v != "" {
+		cfg.KeyType = v
+	}
+	// Preserve elliptic_curve only when key_type is ecdsa AND the user
+	// didn't pass --elliptic-curve; otherwise the CLI default applies.
+	if cfg.KeyType == "ecdsa" && !cfg.SetByUser("elliptic-curve") {
+		if v := conf.RenewalParams["elliptic_curve"]; v != "" {
+			cfg.EllipticCurve = v
+		}
+	}
 }
 
 // findCertDispatch looks for an existing lineage that overlaps with the
@@ -343,6 +448,16 @@ func loadOrCreateAccount(cfg *config.Config, storage *account.FileStorage) (*acc
 	}
 	if len(existing) > 0 {
 		return existing[0], nil
+	}
+	// Creating a new account: refuse to proceed in non-interactive mode
+	// when neither --email nor --register-unsafely-without-email is
+	// set. Mirrors certbot _determine_account (main.py:750-751): when
+	// these flags are missing, get_email() raises MissingCommandlineFlag
+	// in non-interactive mode rather than silently registering with no
+	// contact info. Interactive mode is handled later by
+	// EnsureRegistered which prompts for email.
+	if cfg.NonInteractive && cfg.Email == "" && !cfg.RegisterUnsafelyWithoutEmail {
+		return nil, fmt.Errorf("--email is required to create an account in non-interactive mode (or pass --register-unsafely-without-email)")
 	}
 	key, err := account.NewKey(cfg.KeyType, cfg.RSAKeySize)
 	if err != nil {

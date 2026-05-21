@@ -5,6 +5,10 @@ package client
 
 import (
 	"context"
+	"crypto"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/x509"
 	"encoding/pem"
 	"errors"
@@ -12,6 +16,7 @@ import (
 	"net"
 	"os"
 	"runtime"
+	"strings"
 	"time"
 
 	"github.com/go-acme/lego/v5/acme"
@@ -85,11 +90,18 @@ func (c *Client) EnsureRegistered(ctx context.Context, accountStorage *account.F
 	}
 	if c.cfg.Email == "" && !c.cfg.RegisterUnsafelyWithoutEmail {
 		if c.cfg.NonInteractive {
-			return errors.New("client: --email is required (or pass --register-unsafely-without-email)")
-		}
-		c.cfg.Email = display.Email("Enter email address (used for urgent renewal and security notices):")
-		if c.cfg.Email == "" {
-			return errors.New("client: --email is required (or pass --register-unsafely-without-email)")
+			// Certbot 3.3.0 dropped --register-unsafely-without-email's
+			// requirement in non-interactive mode: an empty email is
+			// treated as an explicit no-email opt-in.
+			c.cfg.RegisterUnsafelyWithoutEmail = true
+		} else {
+			c.cfg.Email = display.Email("Enter email address (used for urgent renewal and security notices):")
+			if c.cfg.Email == "" {
+				// Interactive: pressing Enter at the prompt registers
+				// without email, matching certbot._internal.main._determine_account
+				// and the accounts verb.
+				c.cfg.RegisterUnsafelyWithoutEmail = true
+			}
 		}
 	}
 
@@ -114,7 +126,11 @@ func (c *Client) EnsureRegistered(ctx context.Context, accountStorage *account.F
 	}
 	c.account.Registration.URI = reg.Location
 	if c.cfg.Email != "" {
-		c.account.Contact = []string{"mailto:" + c.cfg.Email}
+		// Certbot accepts comma-separated emails on --email and emits
+		// one `mailto:` contact per address. Pre-fix the entire string
+		// was crammed into a single mailto, producing an invalid URI
+		// like `mailto:a@b.org,c@d.org`.
+		c.account.Contact = emailsToContacts(c.cfg.Email)
 	}
 	c.account.Meta.CreationDT.Time = time.Now().UTC().Round(time.Second)
 	if h, err := os.Hostname(); err == nil {
@@ -170,6 +186,33 @@ func (c *Client) Obtain(ctx context.Context, auth plugins.Authenticator, domains
 		Profile:        c.cfg.PreferredProfile,
 		KeyType:        kt,
 	}
+	// --reuse-key: load the prior privkey from archive/<certname>/ and
+	// pass it via req.PrivateKey. lego will use the existing key
+	// instead of generating a new one (getObtainRequestPrivateKey at
+	// certificate.go:780-789). --new-key (or the test for changed key
+	// parameters above) overrides reuse-key for this run. Mirrors
+	// certbot's renewal._reuse_key (renewal.py).
+	if c.cfg.ReuseKey && !c.cfg.NewKey {
+		if reuseKey, err := loadPriorPrivkey(c.cfg.ConfigDir, certName); err == nil && reuseKey != nil {
+			req.PrivateKey = reuseKey
+		}
+	}
+	// P-521 / secp521r1: lego's certcrypto only defines EC256/EC384, so
+	// pre-generate the key ourselves and pass it via req.PrivateKey
+	// (lego's getObtainRequestPrivateKey honors PrivateKey when set —
+	// certificate.go:780-789). Certbot supports P-521 so a drop-in
+	// replacement should too. Don't overwrite a reuse-key-loaded key
+	// from above.
+	if req.PrivateKey == nil && c.cfg.KeyType == "ecdsa" {
+		switch c.cfg.EllipticCurve {
+		case "secp521r1", "P-521":
+			key, err := ecdsa.GenerateKey(elliptic.P521(), rand.Reader)
+			if err != nil {
+				return nil, fmt.Errorf("client: generate P-521 key: %w", err)
+			}
+			req.PrivateKey = key
+		}
+	}
 	if c.cfg.RequiredProfile != "" {
 		req.Profile = c.cfg.RequiredProfile
 	}
@@ -178,7 +221,14 @@ func (c *Client) Obtain(ctx context.Context, auth plugins.Authenticator, domains
 		return nil, fmt.Errorf("client: ACME order: %w", err)
 	}
 
-	lineage, err := storage.Write(c.cfg.ConfigDir, certName, resource.Certificate, resource.IssuerCertificate, resource.PrivateKey, storage.WriteOptions{
+	// Certbot saves private keys in PKCS#8 (PEM `PRIVATE KEY`). lego returns
+	// PKCS#1 for RSA and SEC1 for EC; re-wrap for on-disk parity.
+	pkcs8Key, err := toPKCS8(resource.PrivateKey)
+	if err != nil {
+		return nil, fmt.Errorf("client: re-encode key as PKCS#8: %w", err)
+	}
+
+	lineage, err := storage.Write(c.cfg.ConfigDir, certName, resource.Certificate, resource.IssuerCertificate, pkcs8Key, storage.WriteOptions{
 		StrictPermissions: c.cfg.StrictPermissions,
 	})
 	if err != nil {
@@ -252,22 +302,124 @@ func certKeyType(cfg *config.Config) (certcrypto.KeyType, error) {
 		switch cfg.RSAKeySize {
 		case 0, 2048:
 			return certcrypto.RSA2048, nil
+		case 3072:
+			return certcrypto.RSA3072, nil
 		case 4096:
 			return certcrypto.RSA4096, nil
 		case 8192:
 			return certcrypto.RSA8192, nil
 		}
-		return "", fmt.Errorf("client: unsupported rsa_key_size %d", cfg.RSAKeySize)
+		return "", fmt.Errorf("client: unsupported rsa_key_size %d (supported: 2048, 3072, 4096, 8192)", cfg.RSAKeySize)
 	case "ecdsa", "ec", "":
 		switch cfg.EllipticCurve {
 		case "", "secp256r1", "P-256":
 			return certcrypto.EC256, nil
 		case "secp384r1", "P-384":
 			return certcrypto.EC384, nil
+		case "secp521r1", "P-521":
+			// lego's KeyType enum doesn't include EC521; Obtain()
+			// pre-generates the key and sets req.PrivateKey, after
+			// which lego ignores req.KeyType. Returning EC384 is a
+			// safe placeholder.
+			return certcrypto.EC384, nil
 		}
-		return "", fmt.Errorf("client: unsupported elliptic_curve %q", cfg.EllipticCurve)
+		return "", fmt.Errorf("client: unsupported elliptic_curve %q (supported: secp256r1, secp384r1, secp521r1)", cfg.EllipticCurve)
 	}
-	return "", fmt.Errorf("client: unsupported key_type %q", cfg.KeyType)
+	return "", fmt.Errorf("client: unsupported key_type %q (supported: rsa, ecdsa)", cfg.KeyType)
+}
+
+// loadPriorPrivkey loads the highest-numbered privkey<N>.pem from
+// archive/<certName>/ and decodes it as a crypto.Signer (RSA or ECDSA).
+// Used by --reuse-key to feed the prior key back into lego's ObtainRequest.
+// Returns (nil, nil) when no prior key exists (initial issuance).
+func loadPriorPrivkey(configDir, certName string) (crypto.Signer, error) {
+	// Read the live/<name>/privkey.pem symlink target if present;
+	// otherwise fall back to scanning archive/. The live symlink is
+	// the canonical "currently deployed" key.
+	live := storage.LiveDir(configDir, certName)
+	livePath := live + "/privkey.pem"
+	data, err := os.ReadFile(livePath)
+	if err != nil {
+		return nil, nil
+	}
+	block, _ := pem.Decode(data)
+	if block == nil {
+		return nil, fmt.Errorf("client: empty PEM in %s", livePath)
+	}
+	// We write PKCS#8 in Obtain's output. Try PKCS#8 first; fall back
+	// to PKCS#1 (RSA) and SEC1 (EC) for keys written by older
+	// go-certbot or by certbot.
+	if key, err := x509.ParsePKCS8PrivateKey(block.Bytes); err == nil {
+		if signer, ok := key.(crypto.Signer); ok {
+			return signer, nil
+		}
+		return nil, fmt.Errorf("client: prior key in %s does not implement crypto.Signer", livePath)
+	}
+	if key, err := x509.ParsePKCS1PrivateKey(block.Bytes); err == nil {
+		return key, nil
+	}
+	if key, err := x509.ParseECPrivateKey(block.Bytes); err == nil {
+		return key, nil
+	}
+	return nil, fmt.Errorf("client: cannot parse prior privkey in %s", livePath)
+}
+
+// emailsToContacts splits a possibly-comma-separated email value into one
+// mailto: URI per address. Empty entries (e.g. trailing commas) and
+// whitespace-only entries are dropped. Mirrors certbot's
+// _internal/cli/cli_utils.py:_DomainsAction-style trimming plus
+// certbot.client.Client.register's split-by-comma behavior.
+func emailsToContacts(raw string) []string {
+	if raw == "" {
+		return nil
+	}
+	var out []string
+	for _, part := range strings.Split(raw, ",") {
+		p := strings.TrimSpace(part)
+		if p == "" {
+			continue
+		}
+		out = append(out, "mailto:"+p)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// toPKCS8 rewraps a PEM-encoded private key into a PKCS#8 `PRIVATE KEY`
+// block. lego emits PKCS#1 (`RSA PRIVATE KEY`) and SEC1 (`EC PRIVATE KEY`);
+// Certbot has saved keys in PKCS#8 since 3.2.0 (the older format was a
+// regression). Idempotent: already-PKCS#8 input is returned verbatim.
+func toPKCS8(keyPEM []byte) ([]byte, error) {
+	block, _ := pem.Decode(keyPEM)
+	if block == nil {
+		return nil, errors.New("empty PEM")
+	}
+	var key any
+	switch block.Type {
+	case "PRIVATE KEY":
+		return keyPEM, nil
+	case "RSA PRIVATE KEY":
+		k, err := x509.ParsePKCS1PrivateKey(block.Bytes)
+		if err != nil {
+			return nil, err
+		}
+		key = k
+	case "EC PRIVATE KEY":
+		k, err := x509.ParseECPrivateKey(block.Bytes)
+		if err != nil {
+			return nil, err
+		}
+		key = k
+	default:
+		return nil, fmt.Errorf("unsupported PEM type %q", block.Type)
+	}
+	der, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		return nil, err
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}), nil
 }
 
 // userAgent composes the User-Agent string Certbot sends to the ACME server.

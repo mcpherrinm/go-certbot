@@ -26,6 +26,8 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+
+	"github.com/letsencrypt/go-certbot/internal/extenv"
 )
 
 // Env is the deploy-hook environment that mirrors Certbot's contract.
@@ -107,29 +109,10 @@ func indent(s, prefix string) string {
 	return strings.TrimRight(b.String(), "\n")
 }
 
-// hookBaseEnv strips SNAP* / LD_PRELOAD / PYTHONPATH from os.Environ()
-// before passing to a hook subprocess. Mirrors Certbot's
-// util.env_no_snap_for_external_calls — without it, snap-installed
-// Certbot leaks SNAP-rooted paths into a user's hook script and breaks
-// any system tools the hook invokes (e.g. `systemctl reload nginx`).
-func hookBaseEnv() []string {
-	src := os.Environ()
-	out := make([]string, 0, len(src))
-	for _, e := range src {
-		i := strings.IndexByte(e, '=')
-		if i <= 0 {
-			out = append(out, e)
-			continue
-		}
-		switch k := e[:i]; {
-		case strings.HasPrefix(k, "SNAP"):
-		case k == "LD_PRELOAD", k == "LD_LIBRARY_PATH", k == "PYTHONPATH":
-		default:
-			out = append(out, e)
-		}
-	}
-	return out
-}
+// hookBaseEnv aliases extenv.Env so callers within this package keep the
+// short name. The actual scrub logic lives in internal/extenv so installer
+// reload paths (apache, nginx) can share it.
+func hookBaseEnv() []string { return extenv.Env() }
 
 // RunDir executes every executable file under dir, in lexicographic order.
 // Missing dir is not an error. dedupAgainst is the flag-hook command (if

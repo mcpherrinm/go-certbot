@@ -91,3 +91,48 @@ func serverNames(b *Block) []string {
 	}
 	return nil
 }
+
+// TestServerNameInternalComments mirrors certbot 6fd6a541d (#10147): a
+// directive with comments interleaved between args must parse, with the
+// comment NOT becoming an arg.
+func TestServerNameInternalComments(t *testing.T) {
+	src := `server {
+    server_name *.goo.far
+        # commented
+        baz.com;
+}
+`
+	cfg, err := Parse(src)
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	srv := cfg.Nodes[0].(*Block)
+	names := serverNames(srv)
+	if len(names) != 2 || names[0] != "*.goo.far" || names[1] != "baz.com" {
+		t.Errorf("server_name args = %v, want [*.goo.far baz.com]", names)
+	}
+	// Round-trip must preserve the comment.
+	if got := cfg.String(); got != src {
+		t.Errorf("round-trip diverged:\n--- got\n%s\n--- want\n%s", got, src)
+	}
+}
+
+// TestNBSPWhitespace mirrors certbot 3.2.0 fix: U+00A0 (NBSP) between
+// tokens must be treated as whitespace, not silently glued into the
+// adjacent word.
+func TestNBSPWhitespace(t *testing.T) {
+	// "server_name" + NBSP + "example.com;"
+	src := "server {\n    server_name example.com;\n}\n"
+	cfg, err := Parse(src)
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	srv := cfg.Nodes[0].(*Block)
+	if srv.Name != "server" {
+		t.Errorf("block name = %q, want server", srv.Name)
+	}
+	names := serverNames(srv)
+	if len(names) != 1 || names[0] != "example.com" {
+		t.Errorf("server_name args = %v, want [example.com]", names)
+	}
+}

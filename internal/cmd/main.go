@@ -420,5 +420,13 @@ func configureLogging(cfg *config.Config) {
 	// --quiet implies --non-interactive (log.py:140-141).
 	if cfg.Quiet {
 		cfg.NonInteractive = true
+		// Redirect stdout to /dev/null so verb-level fmt.Println /
+		// fmt.Printf output is silenced. Mirrors certbot main.py:
+		// 1823-1826 (`sys.stdout = open(os.devnull, 'w')` when
+		// --quiet is set). Stderr is left alone so genuine errors
+		// (and slog at LevelError or above) still surface.
+		if devnull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0); err == nil {
+			os.Stdout = devnull
+		}
 	}
 }

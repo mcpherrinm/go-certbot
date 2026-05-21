@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // optionsSSLApacheConf is the embedded copy of Certbot's
@@ -64,16 +65,39 @@ var historicalApacheSSLConfHashes = map[string]bool{
 func installOptionsSSLApacheConf(configDir string) (string, error) {
 	path := filepath.Join(configDir, "options-ssl-apache.conf")
 	existing, err := os.ReadFile(path)
+	digestPath := filepath.Join(configDir, ".updated-options-ssl-apache-conf-digest.txt")
+	currentHash := fmt.Sprintf("%x", sha256.Sum256([]byte(optionsSSLApacheConf)))
 	if err == nil {
 		if string(existing) == optionsSSLApacheConf {
+			// Already at the canonical version; keep the digest
+			// file in sync so future hand-edit-detection logic
+			// has a baseline.
+			_ = os.WriteFile(digestPath, []byte(currentHash), 0o644)
 			return path, nil
 		}
 		h := sha256.Sum256(existing)
 		hex := fmt.Sprintf("%x", h[:])
 		if !historicalApacheSSLConfHashes[hex] {
-			fmt.Fprintf(os.Stderr,
-				"apache: %s has been modified by hand; leaving untouched. New TLS settings are at %s.dist\n",
-				path, path)
+			// Hand-modified. Suppress the warning if we've
+			// already warned about this exact file state — the
+			// digest file records the hash of the canonical
+			// (would-be-installed) version we were trying to
+			// install at the time of the warning, so a fresh
+			// go-certbot version that bundles an updated snippet
+			// will re-warn. Mirrors certbot
+			// constants.UPDATED_OPTIONS_SSL_CONF_DIGEST.
+			alreadyWarned := false
+			if prev, perr := os.ReadFile(digestPath); perr == nil {
+				if strings.TrimSpace(string(prev)) == currentHash {
+					alreadyWarned = true
+				}
+			}
+			if !alreadyWarned {
+				fmt.Fprintf(os.Stderr,
+					"apache: %s has been modified by hand; leaving untouched. New TLS settings are at %s.dist\n",
+					path, path)
+				_ = os.WriteFile(digestPath, []byte(currentHash), 0o644)
+			}
 			distPath := path + ".dist"
 			if werr := os.WriteFile(distPath, []byte(optionsSSLApacheConf), 0o644); werr != nil {
 				return "", fmt.Errorf("apache: write %s: %w", distPath, werr)
