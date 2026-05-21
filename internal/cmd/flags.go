@@ -71,6 +71,9 @@ func registerFlags(fs *pflag.FlagSet, c *config.Config) {
 	fs.BoolVar(&c.HSTS, "hsts", c.HSTS, "Add a Strict-Transport-Security header (enhance verb).")
 	fs.BoolVar(&c.UIR, "uir", c.UIR, "Add a Content-Security-Policy: upgrade-insecure-requests header (enhance verb).")
 	fs.BoolVar(&c.Staple, "staple-ocsp", c.Staple, "Enable OCSP stapling (enhance verb).")
+
+	// Rollback
+	fs.IntVar(&c.RollbackCheckpoints, "checkpoints", c.RollbackCheckpoints, "Number of previous checkpoints to revert (rollback verb; default 1).")
 	fs.BoolVar(&c.Nginx, "nginx", c.Nginx, "Use the nginx plugin.")
 	fs.StringVar(&c.NginxConfig, "nginx-config", c.NginxConfig, "Path to nginx.conf (default /etc/nginx/nginx.conf).")
 	fs.StringVar(&c.NginxServerRoot, "nginx-server-root", c.NginxServerRoot, "Nginx server root (default /etc/nginx).")
@@ -169,8 +172,11 @@ func registerFlags(fs *pflag.FlagSet, c *config.Config) {
 		"no-self-upgrade",
 		"no-bootstrap",
 		"no-permissions-check",
-		"dns-route53-propagation-seconds",
 		"manual-public-ip-logging-ok",
+		// `dns-route53-propagation-seconds` is in Certbot's
+		// DEPRECATED_OPTIONS list but is also the real flag name we use
+		// for the per-plugin propagation timeout, so we don't register
+		// it as deprecated to avoid a pflag duplicate-flag panic.
 	})
 }
 

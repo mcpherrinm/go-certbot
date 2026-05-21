@@ -42,7 +42,7 @@ func Main(args []string) int {
 	// `--version` always prints and exits.
 	for _, a := range args {
 		if a == "--version" {
-			fmt.Println("go-certbot 0.7.0-phase7")
+			fmt.Println("go-certbot 1.0.0")
 			return 0
 		}
 	}

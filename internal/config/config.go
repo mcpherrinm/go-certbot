@@ -90,6 +90,9 @@ type Config struct {
 	HSTS   bool
 	UIR    bool
 	Staple bool
+
+	// Rollback
+	RollbackCheckpoints int
 	Standalone    bool
 	Webroot       bool
 	WebrootPath   []string

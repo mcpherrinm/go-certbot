@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/letsencrypt/go-certbot/internal/checkpoint"
 	"github.com/letsencrypt/go-certbot/internal/config"
 	"github.com/letsencrypt/go-certbot/internal/plugins"
 	"github.com/letsencrypt/go-certbot/internal/plugins/nginx/parser"
@@ -50,6 +51,9 @@ func (p *Plugin) Enhance(ctx context.Context, cfg *config.Config, domains []stri
 				return fmt.Errorf("nginx: unknown enhancement %q", e)
 			}
 		}
+	}
+	if _, err := checkpoint.Save(cfg.WorkDir, "nginx-enhance", []string{configPath}); err != nil {
+		return fmt.Errorf("nginx: checkpoint: %w", err)
 	}
 	if err := os.WriteFile(configPath, []byte(root.String()), 0o644); err != nil {
 		return fmt.Errorf("nginx: write %s: %w", configPath, err)

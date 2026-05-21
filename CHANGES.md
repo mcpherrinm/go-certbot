@@ -5,7 +5,62 @@ This file tracks every behavior in **go-certbot** that differs from upstream
 drop-in compatibility, so this file should stay short. Anything not listed
 here should behave identically to Certbot.
 
-## Phase 7 (current)
+## Phase 8 (current) — go-certbot 1.0.0
+
+### Implemented
+
+- **`rollback` verb**: reverts the most recent N config-file changes
+  go-certbot made (defaults to 1; configurable with `--checkpoints
+  N`). Reads checkpoints from `work_dir/backups/<timestamp>-<label>/`,
+  restores each file to the recorded content, removes the consumed
+  checkpoint dirs, and reloads nginx/apache if their control binary
+  is on PATH.
+- **`internal/checkpoint` package**: simple file-snapshot mechanism.
+  `Save(workDir, label, paths)` content-addresses the files under
+  `backups/<timestamp>-<label>/files/<sha>` plus a `manifest.json`.
+  `Restore(workDir, n)` replays the most recent N in reverse,
+  consuming them. Missing files are skipped (nothing to revert to).
+- **Checkpointing wired into nginx and apache** at every install /
+  enhance write so `rollback` has something to undo.
+- **End-to-end Pebble harness** in `tests/e2e/`. Tests start
+  `pebble` + `pebble-challtestsrv` (skipping if either binary isn't
+  on PATH), then exercise `cmd.Main` directly:
+  - `TestE2EStandaloneIssuance` issues a cert against Pebble and
+    verifies `accounts/<server>/<id>/{regr,private_key,meta}.json`,
+    `live/<domain>/*.pem` symlinks, and `renewal/<domain>.conf`
+    contents all match Certbot's layout.
+  - `TestE2ECertificatesListsIssuedCert` follows up with the
+    `certificates` verb and confirms the lineage shows up in its
+    output.
+  To run locally:
+  ```
+  go install github.com/letsencrypt/pebble/v2/cmd/pebble@latest
+  go install github.com/letsencrypt/pebble/v2/cmd/pebble-challtestsrv@latest
+  go test ./tests/e2e -v
+  ```
+
+### Status
+
+Every Certbot 5.x verb and bundled plugin now has an implementation;
+go-certbot is feature-complete vs. the upstream surface area. Tagged
+as **1.0.0**.
+
+| Verb | Status |
+| --- | --- |
+| `run`, `certonly`, `renew`, `certificates`, `delete`, `revoke`, `register`, `unregister`, `update_account`, `show_account`, `install`, `enhance`, `rollback`, `reconfigure`, `plugins` | ✅ |
+
+| Plugin | Status |
+| --- | --- |
+| `standalone`, `webroot`, `manual`, `nginx`, `apache`, 13 DNS plugins | ✅ |
+
+The original intentional breaking changes (single static binary, no
+third-party Python plugin loading, `dns-google` Application Default
+Credentials fallback) remain. Smaller scope limits documented in
+earlier phases (Apache `Include` resolution, per-OS overrides,
+auto-creating server blocks, Augeas-level fidelity) are tracked in
+GitHub issues against this repo as enhancements rather than bugs.
+
+## Phase 7
 
 ### Implemented
 
@@ -239,7 +294,6 @@ small behavioral difference.
 
 | Verb | Planned phase |
 | --- | --- |
-| `rollback` | Phase 8 |
 
 Plugins not yet implemented (using them returns a clear error):
 
