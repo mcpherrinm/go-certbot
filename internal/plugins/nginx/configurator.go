@@ -722,7 +722,8 @@ func addListenSSL(b *parser.Block, indent string, httpPort, httpsPort int) {
 			derived = append(derived, httpsStr)
 		}
 	}
-	if len(derived) == 0 {
+	defaultFallback := len(derived) == 0
+	if defaultFallback {
 		// No HTTP listen either — fall back to the same default set
 		// nginx itself would have used. Match Certbot's behavior of
 		// adding both IPv4 and IPv6 default listens when no hint.
@@ -737,10 +738,26 @@ func addListenSSL(b *parser.Block, indent string, httpPort, httpsPort int) {
 		}
 	}
 	for _, addr := range derived {
+		args := []string{addr, "ssl"}
+		// Certbot _make_server_ssl appends `ipv6only=on` to new IPv6
+		// listens it emits (configurator.py:751-764). Without this,
+		// the kernel's net.ipv6.bindv6only default decides whether
+		// the IPv6 socket also accepts IPv4 connections, which can
+		// produce unpredictable behavior across distros. Only safe
+		// for the default-fallback path here — for listens derived
+		// from existing HTTP IPv6 listens, the original likely
+		// already has ipv6only=on (or deliberately doesn't), and
+		// nginx errors if multiple vhosts set ipv6only=on for the
+		// same socket. Adding it only on the default fallback
+		// matches the "this is a freshly-issued vhost, no other
+		// vhost will conflict" case Certbot's test exercises.
+		if defaultFallback && strings.HasPrefix(addr, "[") {
+			args = append(args, "ipv6only=on")
+		}
 		b.Body = append(b.Body, &parser.Directive{
 			Whitespace: "\n" + indent,
 			Name:       "listen",
-			Args:       []string{addr, "ssl"},
+			Args:       args,
 			Semicolon:  true,
 		})
 	}

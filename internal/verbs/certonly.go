@@ -344,6 +344,16 @@ func loadOrCreateAccount(cfg *config.Config, storage *account.FileStorage) (*acc
 	if len(existing) > 0 {
 		return existing[0], nil
 	}
+	// Creating a new account: refuse to proceed in non-interactive mode
+	// when neither --email nor --register-unsafely-without-email is
+	// set. Mirrors certbot _determine_account (main.py:750-751): when
+	// these flags are missing, get_email() raises MissingCommandlineFlag
+	// in non-interactive mode rather than silently registering with no
+	// contact info. Interactive mode is handled later by
+	// EnsureRegistered which prompts for email.
+	if cfg.NonInteractive && cfg.Email == "" && !cfg.RegisterUnsafelyWithoutEmail {
+		return nil, fmt.Errorf("--email is required to create an account in non-interactive mode (or pass --register-unsafely-without-email)")
+	}
 	key, err := account.NewKey(cfg.KeyType, cfg.RSAKeySize)
 	if err != nil {
 		return nil, err
