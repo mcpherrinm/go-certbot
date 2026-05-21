@@ -1,17 +1,22 @@
 package verbs
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"time"
+
+	"golang.org/x/crypto/ocsp"
 
 	"github.com/letsencrypt/go-certbot/internal/config"
 	"github.com/letsencrypt/go-certbot/internal/plugins"
@@ -170,7 +175,7 @@ func describeCert(confPath, certName string) (*certInfo, error) {
 	// OCSP revocation check is a per-cert HTTP roundtrip; only attempt when
 	// the cert is otherwise valid so the listing isn't slow for a wall of
 	// expired certs.
-	if len(reasons) == 0 && certIsRevoked(cert) {
+	if len(reasons) == 0 && certIsRevoked(cert, conf.Top["chain"]) {
 		reasons = append(reasons, "REVOKED")
 	}
 	var status string
@@ -249,19 +254,48 @@ func isTestCert(cert *x509.Certificate) bool {
 	return false
 }
 
-// certIsRevoked queries the cert's OCSP responder. Errors and "unknown"
-// responses are treated as "not revoked" so transient OCSP outages don't
-// flag every managed cert as INVALID.
-func certIsRevoked(cert *x509.Certificate) bool {
-	if len(cert.OCSPServer) == 0 {
+// certIsRevoked queries the cert's OCSP responder using `issuer` from the
+// chain PEM. Errors and "unknown" responses are treated as "not revoked" so
+// transient OCSP outages don't flag every managed cert as INVALID.
+func certIsRevoked(cert *x509.Certificate, chainPath string) bool {
+	if len(cert.OCSPServer) == 0 || chainPath == "" {
 		return false
 	}
-	// We need the issuer to build the OCSP request. Without it we can't
-	// check; Certbot reads the issuer from the cert chain file alongside
-	// `cert`. The cert manager already has access to the chain via the
-	// renewal conf; we don't thread it here. So we conservatively return
-	// false and rely on the user noticing via expiry / their own tooling.
-	// A future pass should wire this up via the chain PEM.
-	_ = cert.OCSPServer
-	return false
+	chainBytes, err := os.ReadFile(chainPath)
+	if err != nil {
+		return false
+	}
+	block, _ := pem.Decode(chainBytes)
+	if block == nil {
+		return false
+	}
+	issuer, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return false
+	}
+	req, err := ocsp.CreateRequest(cert, issuer, nil)
+	if err != nil {
+		return false
+	}
+	httpReq, err := http.NewRequest(http.MethodPost, cert.OCSPServer[0], bytes.NewReader(req))
+	if err != nil {
+		return false
+	}
+	httpReq.Header.Set("Content-Type", "application/ocsp-request")
+	httpReq.Header.Set("Accept", "application/ocsp-response")
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return false
+	}
+	parsed, err := ocsp.ParseResponse(body, issuer)
+	if err != nil {
+		return false
+	}
+	return parsed.Status == ocsp.Revoked
 }

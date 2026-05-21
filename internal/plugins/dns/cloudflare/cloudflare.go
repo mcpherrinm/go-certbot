@@ -34,7 +34,14 @@ func (a *Authenticator) Prepare(_ context.Context, cfg *config.Config, _ []strin
 	if err != nil {
 		return 0, nil, err
 	}
-	if token := cred.Get("api_token"); token != "" {
+	hasToken := cred.Get("api_token") != ""
+	hasLegacy := cred.Get("email") != "" || cred.Get("api_key") != ""
+	if hasToken && hasLegacy {
+		// Matches certbot-dns-cloudflare's _validate_credentials: rejecting
+		// both forms at once prevents accidental fallback to the wrong one.
+		return 0, nil, fmt.Errorf("cloudflare: set dns_cloudflare_api_token OR (dns_cloudflare_email + dns_cloudflare_api_key), not both")
+	}
+	if hasToken {
 		_ = cred.SetEnv("api_token", "CLOUDFLARE_DNS_API_TOKEN")
 	} else {
 		if err := cred.Required("email", "api_key"); err != nil {

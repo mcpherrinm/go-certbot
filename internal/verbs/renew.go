@@ -61,13 +61,13 @@ func Renew(ctx context.Context, cfg *config.Config, reg *plugins.Registry) error
 	if err := hooks.Run(ctx, cfg.PreHook, nil); err != nil {
 		return err
 	}
-	if err := hooks.RunDir(ctx, cfg.HookDir("pre"), nil); err != nil {
+	if err := hooks.RunDir(ctx, cfg.HookDir("pre"), nil, cfg.PreHook); err != nil {
 		return err
 	}
 	defer func() {
 		// post_hook always runs.
 		_ = hooks.Run(ctx, cfg.PostHook, nil)
-		_ = hooks.RunDir(ctx, cfg.HookDir("post"), nil)
+		_ = hooks.RunDir(ctx, cfg.HookDir("post"), nil, cfg.PostHook)
 	}()
 
 	names := make([]string, 0, len(entries))
@@ -179,7 +179,7 @@ func renewOne(ctx context.Context, cli *config.Config, reg *plugins.Registry, co
 	if err := hooks.Run(ctx, merged.DeployHook, env); err != nil {
 		slog.Warn("deploy_hook failed", "err", err)
 	}
-	if err := hooks.RunDir(ctx, merged.HookDir("deploy"), env); err != nil {
+	if err := hooks.RunDir(ctx, merged.HookDir("deploy"), env, merged.DeployHook); err != nil {
 		slog.Warn("deploy-hook directory failed", "err", err)
 	}
 	return nil

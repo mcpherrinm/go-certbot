@@ -4,19 +4,22 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 
 	"github.com/letsencrypt/go-certbot/internal/config"
+	"github.com/letsencrypt/go-certbot/internal/hooks"
 	"github.com/letsencrypt/go-certbot/internal/plugins"
 	"github.com/letsencrypt/go-certbot/internal/storage/renewalconf"
 )
 
 // Reconfigure updates a renewal/<certname>.conf in place, applying any
 // user-set flags (everything tracked via SetByUser) to the [renewalparams]
-// section, then saving. No issuance happens.
-func Reconfigure(_ context.Context, cfg *config.Config, _ *plugins.Registry) error {
+// section, then saving. Validates the merged config (plugin selection +
+// hook commands) before committing.
+func Reconfigure(_ context.Context, cfg *config.Config, reg *plugins.Registry) error {
 	if cfg.CertName == "" {
 		return errors.New("reconfigure: --cert-name is required")
 	}
@@ -59,10 +62,56 @@ func Reconfigure(_ context.Context, cfg *config.Config, _ *plugins.Registry) err
 		fmt.Println("reconfigure: nothing to update (no overriding flags provided)")
 		return nil
 	}
+	// Dry-run-style validation before persisting: write to a temp file,
+	// re-parse, merge, and check the hook commands + plugin names that
+	// would be used on the next renewal. This catches typos in
+	// --pre-hook / unknown installer names / etc. before they break
+	// `certbot renew` later.
+	tmp := path + ".reconfigure-test"
+	if err := f.Save(tmp); err != nil {
+		return err
+	}
+	defer os.Remove(tmp)
+	if err := validateReconfiguredConf(tmp, cfg, reg); err != nil {
+		return fmt.Errorf("reconfigure: validation failed (config not written): %w", err)
+	}
 	if err := f.Save(path); err != nil {
 		return err
 	}
 	fmt.Printf("reconfigure: updated %d field(s) in %s\n", changed, path)
+	return nil
+}
+
+// validateReconfiguredConf re-reads the temp conf and checks that:
+//   - hook commands are present in PATH (matches `Validate`).
+//   - any named authenticator/installer is a registered plugin.
+//
+// Mirrors Certbot's reconfigure dry-run intent without actually contacting
+// the ACME server (which would also require live network + an account).
+func validateReconfiguredConf(path string, cfg *config.Config, reg *plugins.Registry) error {
+	f, err := renewalconf.Load(path)
+	if err != nil {
+		return err
+	}
+	if !cfg.DisableHookValidation {
+		for _, k := range []string{"pre_hook", "post_hook", "renew_hook", "deploy_hook"} {
+			if v := f.RenewalParams[k]; v != "" {
+				if err := hooks.Validate(v, k); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	if a := f.RenewalParams["authenticator"]; a != "" {
+		if _, err := reg.Authenticator(a); err != nil {
+			return err
+		}
+	}
+	if i := f.RenewalParams["installer"]; i != "" && i != "None" {
+		if _, err := reg.Installer(i); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 

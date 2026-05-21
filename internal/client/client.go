@@ -28,7 +28,7 @@ import (
 )
 
 // version is the go-certbot version string; used in the User-Agent.
-const version = "1.0.0"
+const version = "1.1.0"
 
 // Client bundles a lego Client with the loaded account.
 type Client struct {
@@ -249,13 +249,63 @@ func certKeyType(cfg *config.Config) (certcrypto.KeyType, error) {
 	return "", fmt.Errorf("client: unsupported key_type %q", cfg.KeyType)
 }
 
+// userAgent composes the User-Agent string Certbot sends to the ACME server.
+// Format mirrors certbot.client.determine_user_agent's template:
+//
+//	CertbotACMEClient/<ver> (<cmd>; <os>) Authenticator/<auth> Installer/<inst> (<verb>; flags: <flags>) Go/<ver>
+//
+// The flag-derived suffix encodes --duplicate (dup), --force-renewal (frn),
+// --allow-subset-of-names (asn), -n / --non-interactive (n), and the
+// presence of any hook (hook). The CA uses this for telemetry.
 func userAgent(cfg *config.Config) string {
 	if cfg.UserAgent != "" {
 		return cfg.UserAgent
 	}
-	base := fmt.Sprintf("go-certbot/%s (%s; %s)", version, runtime.GOOS, runtime.GOARCH)
-	if cfg.UserAgentComment != "" {
-		base += " " + cfg.UserAgentComment
+	authn := cfg.Authenticator
+	if authn == "" {
+		authn = "none"
 	}
-	return base
+	inst := cfg.Installer
+	if inst == "" {
+		inst = "none"
+	}
+	verb := cfg.Verb
+	if verb == "" {
+		verb = "run"
+	}
+	ua := fmt.Sprintf("CertbotACMEClient/%s (go-certbot; %s/%s) Authenticator/%s Installer/%s (%s; flags: %s) Go/%s",
+		version, runtime.GOOS, runtime.GOARCH, authn, inst, verb, uaFlags(cfg), runtime.Version())
+	if cfg.UserAgentComment != "" {
+		ua += " " + cfg.UserAgentComment
+	}
+	return ua
+}
+
+// uaFlags encodes the same flag bits Certbot's ua_flags emits.
+func uaFlags(cfg *config.Config) string {
+	var flags []string
+	if cfg.Duplicate {
+		flags = append(flags, "dup")
+	}
+	if cfg.ForceRenewal {
+		flags = append(flags, "frn")
+	}
+	if cfg.AllowSubsetOfNames {
+		flags = append(flags, "asn")
+	}
+	if cfg.NonInteractive {
+		flags = append(flags, "n")
+	}
+	if cfg.PreHook != "" || cfg.PostHook != "" || cfg.DeployHook != "" ||
+		cfg.ManualAuthHook != "" || cfg.ManualCleanupHook != "" {
+		flags = append(flags, "hook")
+	}
+	if len(flags) == 0 {
+		return ""
+	}
+	out := flags[0]
+	for _, f := range flags[1:] {
+		out += " " + f
+	}
+	return out
 }

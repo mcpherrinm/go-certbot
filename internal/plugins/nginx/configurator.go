@@ -155,6 +155,12 @@ func (p *Plugin) Install(ctx context.Context, cfg *config.Config, domains []stri
 			addRedirectIfHTTPOnly(h.Server)
 		}
 	}
+	// Install Certbot's modern TLS-config snippet and include it from each
+	// modified server. Brings ssl_protocols / ssl_ciphers / session settings
+	// up to ssl-config.mozilla.org standards regardless of nginx version.
+	if err := installOptionsSSLNginxConf(cfg.ConfigDir, files, hits); err != nil {
+		return err
+	}
 	// If --redirect was set and we found only HTTPS-shaped servers (e.g.
 	// only :443 exists), clone the matched server to a new HTTP-only
 	// :80 sibling that 301s — matches Certbot's _enable_redirect.
