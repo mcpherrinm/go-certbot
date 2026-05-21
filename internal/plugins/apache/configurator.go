@@ -149,13 +149,12 @@ func (p *Plugin) Install(ctx context.Context, cfg *config.Config, domains []stri
 		return fmt.Errorf("apache: no <VirtualHost> matched any of %v in %s (or its includes)", domains, configPath)
 	}
 
-	// Install the Mozilla-intermediate SSL snippet once. The Include
-	// directive is added to every SSL vhost so the recommended
-	// SSLProtocol/SSLCipherSuite/SSLHonorCipherOrder triple takes effect.
-	sslSnippet, err := installOptionsSSLApacheConf(cfg.ConfigDir)
-	if err != nil {
-		return err
-	}
+	// options-ssl-apache.conf path. The actual write happens AFTER the
+	// checkpoint below so that rollback can restore the pre-existing
+	// version. Without this ordering, installOptionsSSLApacheConf
+	// overwrote the file BEFORE checkpoint.Save took its snapshot,
+	// making the snapshot capture the new (already-overwritten) state.
+	sslSnippet := filepath.Join(cfg.ConfigDir, "options-ssl-apache.conf")
 
 	// On Apache < 2.4.8 the chain must be in a separate
 	// SSLCertificateChainFile; on 2.4.8+ the chain lives inside fullchain
@@ -219,8 +218,20 @@ func (p *Plugin) Install(ctx context.Context, cfg *config.Config, domains []stri
 	for _, e := range extras {
 		paths = append(paths, e.path)
 	}
+	// Include the SSL options conf (and its `.dist` sibling for
+	// hand-modified flows) in the install checkpoint so a rollback
+	// restores the pre-existing version. The actual write happens
+	// after the checkpoint snapshot is taken.
+	paths = append(paths, sslSnippet, sslSnippet+".dist")
 	if _, err := checkpoint.Save(cfg.WorkDir, "apache-install", paths); err != nil {
 		return fmt.Errorf("apache: checkpoint: %w", err)
+	}
+	// Install the Mozilla-intermediate SSL snippet once. The Include
+	// directive (already wired through to applySSLDirectives /
+	// cloneAsSSLVHost via the sslSnippet path above) becomes effective
+	// once this write lands.
+	if _, err := installOptionsSSLApacheConf(cfg.ConfigDir); err != nil {
+		return err
 	}
 	if err := writeAllFiles(files); err != nil {
 		return err

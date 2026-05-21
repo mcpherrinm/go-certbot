@@ -938,9 +938,19 @@ func addListenSSL(b *parser.Block, indent string, httpPort, httpsPort int) {
 }
 
 // splitListenAddr parses an nginx listen value into host/port.
-// Accepts plain "80", "127.0.0.1:80", "[::]:80". Returns ok=false for
-// unix:/... socket forms so callers skip those vhosts (we can't SSL-upgrade
-// a unix listener).
+// Accepts:
+//
+//	"80"               → host="", port="80"
+//	"127.0.0.1:80"     → host="127.0.0.1", port="80"
+//	"[::]:80"          → host="[::]", port="80"
+//	"myhost"           → host="myhost", port=""  (bare hostname: nginx
+//	                     defaults to port 80 — callers treat empty port
+//	                     as DEFAULT_LISTEN_PORT, mirroring certbot
+//	                     obj.Addr.fromstring's regex check `^\d+$` for
+//	                     all-digits first part)
+//
+// Returns ok=false for unix:/... socket forms so callers skip those
+// vhosts (we can't SSL-upgrade a unix listener).
 func splitListenAddr(v string) (host, port string, ok bool) {
 	if strings.HasPrefix(v, "unix:") {
 		return "", "", false
@@ -955,7 +965,27 @@ func splitListenAddr(v string) (host, port string, ok bool) {
 	if i := strings.LastIndex(v, ":"); i >= 0 {
 		return v[:i], v[i+1:], true
 	}
-	return "", v, true
+	// No `:` — either all-digits (`80`) or a bare hostname.
+	// Certbot's obj.Addr.fromstring checks `re.match(r'^\d+$', tup[0])`:
+	// all-digits → port; otherwise → host (with empty port).
+	if isAllDigits(v) {
+		return "", v, true
+	}
+	return v, "", true
+}
+
+// isAllDigits returns true for strings consisting solely of ASCII digits
+// (and at least one). Mirrors `re.match(r'^\d+$', s)` for ASCII input.
+func isAllDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func containsArg(args []string, want string) bool {
