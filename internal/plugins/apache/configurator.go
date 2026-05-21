@@ -241,10 +241,10 @@ func wrapInIfModuleSSL(sec *parser.Section) string {
 	wrapped := &parser.Config{
 		Nodes: []parser.Node{
 			&parser.Section{
-				Name:        "IfModule",
-				Args:        []string{"mod_ssl.c"},
-				OpenNewline: "\n",
-				Body:        []parser.Node{sec},
+				Name:         "IfModule",
+				Args:         []string{"mod_ssl.c"},
+				OpenNewline:  "\n",
+				Body:         []parser.Node{sec},
 				CloseNewline: "\n",
 			},
 		},
@@ -428,8 +428,8 @@ func apacheQueryBin(cfg *config.Config) string {
 type apacheVer struct{ Major, Minor, Patch int }
 
 var (
-	apacheVerCache    apacheVer
-	apacheVerCacheOK  bool
+	apacheVerCache   apacheVer
+	apacheVerCacheOK bool
 )
 
 func apacheVersion(ctx context.Context, cfg *config.Config) apacheVer {

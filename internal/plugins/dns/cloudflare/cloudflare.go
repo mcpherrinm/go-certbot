@@ -25,8 +25,10 @@ type Authenticator struct{}
 
 func New() *Authenticator { return &Authenticator{} }
 
-func (a *Authenticator) Name() string        { return "dns-cloudflare" }
-func (a *Authenticator) Description() string { return "Obtain certificates using a DNS TXT record via the Cloudflare API." }
+func (a *Authenticator) Name() string { return "dns-cloudflare" }
+func (a *Authenticator) Description() string {
+	return "Obtain certificates using a DNS TXT record via the Cloudflare API."
+}
 func (a *Authenticator) Cleanup(_ context.Context) error { return nil }
 
 func (a *Authenticator) Prepare(_ context.Context, cfg *config.Config, _ []string) (plugins.ChallengeKind, challenge.Provider, error) {

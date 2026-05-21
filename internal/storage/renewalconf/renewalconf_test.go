@@ -109,7 +109,7 @@ func TestFormatValueListSemantics(t *testing.T) {
 	for _, tc := range []struct{ in, want string }{
 		{"", ""},
 		{"plain", "plain"},
-		{"a=b", "a=b"},   // bare = is fine for configobj
+		{"a=b", "a=b"}, // bare = is fine for configobj
 		{"a.com,b.com", "a.com, b.com"},
 		{"a.com,", "a.com,"}, // single-element keeps trailing comma
 		{"a.com, b.com,c.com", "a.com, b.com, c.com"},

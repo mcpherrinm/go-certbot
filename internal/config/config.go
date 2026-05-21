@@ -68,9 +68,9 @@ type Config struct {
 	// supplied and the file's contents read at flag-set time. Mirrors
 	// Certbot's argparse type=read_file: ``config.csr = (path, contents)``
 	// (cli/subparsers.py:34-37; helpful.py:332-355 consumes `config.csr[0:2]`).
-	CSR              CSRArg
-	CertPath         string // existing fullchain PEM, e.g. for --revoke / --install
-	KeyPath          string // private key, e.g. for --install or --revoke --key-path
+	CSR      CSRArg
+	CertPath string // existing fullchain PEM, e.g. for --revoke / --install
+	KeyPath  string // private key, e.g. for --install or --revoke --key-path
 	// Reason is the revocation reason as a Certbot REVOCATION_REASONS int
 	// (0=unspecified, 1=keyCompromise, 3=affiliationChanged, 4=superseded,
 	// 5=cessationOfOperation). Defaults to 0 to match constants.py:94.
@@ -113,9 +113,9 @@ type Config struct {
 
 	// Rollback
 	RollbackCheckpoints int
-	Standalone    bool
-	Webroot       bool
-	WebrootPath   []string
+	Standalone          bool
+	Webroot             bool
+	WebrootPath         []string
 	// WebrootMap is the resolved domain → webroot path map. Built before
 	// pflag parsing from the `-w`/`-d` interleaving order in os.Args; mirrors
 	// Certbot's _WebrootPathProcessor. Persisted under [[webroot_map]] in the
@@ -146,12 +146,12 @@ type Config struct {
 	Verbose          int
 
 	// Hooks
-	PreHook            string
-	PostHook           string
-	DeployHook         string
-	DisableHookValidation bool
-	ManualAuthHook     string
-	ManualCleanupHook  string
+	PreHook                 string
+	PostHook                string
+	DeployHook              string
+	DisableHookValidation   bool
+	ManualAuthHook          string
+	ManualCleanupHook       string
 	ManualPublicIPLoggingOK bool
 
 	// User agent
@@ -181,12 +181,12 @@ type Config struct {
 	FullchainPath string // --fullchain-path
 
 	// `certificates`, `delete`, `revoke` numeric controls.
-	Num                int
-	BreakMyCerts       bool
-	ReinstallExisting  bool
+	Num                 int
+	BreakMyCerts        bool
+	ReinstallExisting   bool
 	RenewWithNewDomains bool
-	RunDeployHooks     bool
-	AutoHSTS           bool
+	RunDeployHooks      bool
+	AutoHSTS            bool
 	DisableRenewUpdates bool
 
 	// Three-state defaults-True flags (`--no-X` flips them off). Stored as
@@ -202,11 +202,11 @@ type Config struct {
 	PluginIfaces   []string // --authenticators / --installers selector
 
 	// Logging.
-	VerboseLevel      string
-	TextMode          bool
-	MaxLogBackups     int
+	VerboseLevel       string
+	TextMode           bool
+	MaxLogBackups      int
 	PreconfiguredRenew bool
-	DebugChallenges   bool
+	DebugChallenges    bool
 
 	// Sources tracks which fields were user-set, for renewal merge logic.
 	Sources map[string]ArgumentSource

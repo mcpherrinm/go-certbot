@@ -19,10 +19,12 @@ import (
 
 type Authenticator struct{}
 
-func New() *Authenticator                                 { return &Authenticator{} }
-func (a *Authenticator) Name() string                     { return "dns-gehirn" }
-func (a *Authenticator) Description() string              { return "Obtain certificates using a DNS TXT record via the Gehirn DNS API." }
-func (a *Authenticator) Cleanup(_ context.Context) error  { return nil }
+func New() *Authenticator             { return &Authenticator{} }
+func (a *Authenticator) Name() string { return "dns-gehirn" }
+func (a *Authenticator) Description() string {
+	return "Obtain certificates using a DNS TXT record via the Gehirn DNS API."
+}
+func (a *Authenticator) Cleanup(_ context.Context) error { return nil }
 
 func (a *Authenticator) Prepare(_ context.Context, cfg *config.Config, _ []string) (plugins.ChallengeKind, challenge.Provider, error) {
 	cred, err := common.LoadCredentials(common.CredentialsFor(cfg, "gehirn"), "dns_gehirn")

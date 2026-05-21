@@ -40,10 +40,12 @@ var acceptedAlgorithms = map[string]struct{}{
 
 type Authenticator struct{}
 
-func New() *Authenticator                                 { return &Authenticator{} }
-func (a *Authenticator) Name() string                     { return "dns-rfc2136" }
-func (a *Authenticator) Description() string              { return "Obtain certificates using a DNS TXT record via RFC 2136 dynamic updates." }
-func (a *Authenticator) Cleanup(_ context.Context) error  { return nil }
+func New() *Authenticator             { return &Authenticator{} }
+func (a *Authenticator) Name() string { return "dns-rfc2136" }
+func (a *Authenticator) Description() string {
+	return "Obtain certificates using a DNS TXT record via RFC 2136 dynamic updates."
+}
+func (a *Authenticator) Cleanup(_ context.Context) error { return nil }
 
 func (a *Authenticator) Prepare(_ context.Context, cfg *config.Config, _ []string) (plugins.ChallengeKind, challenge.Provider, error) {
 	cred, err := common.LoadCredentials(common.CredentialsFor(cfg, "rfc2136"), "dns_rfc2136")

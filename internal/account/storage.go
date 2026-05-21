@@ -134,16 +134,46 @@ func (s *FileStorage) FindAll() ([]*Account, error) {
 	if len(out) > 0 {
 		return out, nil
 	}
-	// Fallback: look in the predecessor's accounts dir.
+	// Whole-accounts-dir migration: if the current dir is empty (or
+	// missing) and a predecessor server's accounts dir is populated,
+	// replace the current dir with a symlink to the predecessor (per
+	// account.py:200-213 _symlink_to_accounts_dir). Falls back to a
+	// per-account symlink when the empty-dir replace fails (e.g. the
+	// parent isn't writable).
 	if prev := reuseFallbackDir(s.AccountsDir); prev != "" {
 		prevAccounts, err := s.findAllUnder(prev)
 		if err == nil && len(prevAccounts) > 0 {
+			if err := migrateAccountsDir(prev, s.AccountsDir); err == nil {
+				return prevAccounts, nil
+			}
+			// Fallback: per-account symlinks (older behavior).
 			if err := symlinkToAccountsDir(prev, s.AccountsDir); err == nil {
 				return prevAccounts, nil
 			}
 		}
 	}
 	return out, nil
+}
+
+// migrateAccountsDir replaces an empty AccountsDir with a symlink to the
+// predecessor's dir. Mirrors Certbot's _symlink_to_accounts_dir; only
+// fires when the current dir is empty (or doesn't exist).
+func migrateAccountsDir(prev, cur string) error {
+	if entries, err := os.ReadDir(cur); err == nil {
+		if len(entries) > 0 {
+			return errors.New("account: current accounts dir is non-empty; refusing whole-dir migration")
+		}
+		// Empty dir — remove it so we can replace with a symlink.
+		if err := os.Remove(cur); err != nil {
+			return err
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(cur), 0o700); err != nil {
+		return err
+	}
+	return os.Symlink(prev, cur)
 }
 
 func (s *FileStorage) findAllUnder(dir string) ([]*Account, error) {
@@ -241,6 +271,18 @@ func (s *FileStorage) Save(a *Account) error {
 	dir := s.accountDir(a.ID)
 	if err := os.MkdirAll(dir, accountDirMode); err != nil {
 		return fmt.Errorf("account: mkdir: %w", err)
+	}
+	// --strict-permissions: refuse to operate on a dir owned by a
+	// different uid (Certbot util.py:269-293 check_permissions). Caught
+	// here at Save() so a privileged go-certbot run doesn't silently
+	// overwrite files in a directory the operator didn't intend to write.
+	if s.StrictPermissions {
+		if err := strictCheckDir(s.AccountsDir); err != nil {
+			return err
+		}
+		if err := strictCheckDir(dir); err != nil {
+			return err
+		}
 	}
 
 	keyPath := filepath.Join(dir, "private_key.json")

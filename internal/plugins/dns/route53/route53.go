@@ -26,10 +26,12 @@ import (
 
 type Authenticator struct{}
 
-func New() *Authenticator                                 { return &Authenticator{} }
-func (a *Authenticator) Name() string                     { return "dns-route53" }
-func (a *Authenticator) Description() string              { return "Obtain certificates using a DNS TXT record via AWS Route 53." }
-func (a *Authenticator) Cleanup(_ context.Context) error  { return nil }
+func New() *Authenticator             { return &Authenticator{} }
+func (a *Authenticator) Name() string { return "dns-route53" }
+func (a *Authenticator) Description() string {
+	return "Obtain certificates using a DNS TXT record via AWS Route 53."
+}
+func (a *Authenticator) Cleanup(_ context.Context) error { return nil }
 
 func (a *Authenticator) Prepare(_ context.Context, cfg *config.Config, _ []string) (plugins.ChallengeKind, challenge.Provider, error) {
 	if path := common.CredentialsFor(cfg, "route53"); path != "" {

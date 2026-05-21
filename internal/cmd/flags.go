@@ -484,7 +484,7 @@ func registerBoolDefaultTrue(fs *pflag.FlagSet, c *config.Config, dst *bool, nam
 	negate := false
 	fs.BoolVar(&negate, "no-"+name, false, "Disable --"+name+".")
 	c.PostParseHooks = append(c.PostParseHooks, func() {
-		if c.SetByUser("no-"+name) {
+		if c.SetByUser("no-" + name) {
 			*dst = false
 		}
 	})

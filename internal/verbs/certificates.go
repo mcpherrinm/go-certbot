@@ -92,14 +92,14 @@ func Certificates(_ context.Context, cfg *config.Config, _ *plugins.Registry) er
 }
 
 type certInfo struct {
-	Name      string
-	Serial    string
-	KeyType   string
-	SANs      []string
-	NotAfter  time.Time
-	Status    string // "VALID: N days" or "INVALID: REASON"
-	CertPath  string // top-level "fullchain"
-	KeyPath   string // top-level "privkey"
+	Name     string
+	Serial   string
+	KeyType  string
+	SANs     []string
+	NotAfter time.Time
+	Status   string // "VALID: N days" or "INVALID: REASON"
+	CertPath string // top-level "fullchain"
+	KeyPath  string // top-level "privkey"
 }
 
 func (c certInfo) String() string {

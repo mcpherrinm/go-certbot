@@ -29,4 +29,3 @@ func Plugins(_ context.Context, _ *config.Config, reg *plugins.Registry) error {
 	}
 	return nil
 }
-

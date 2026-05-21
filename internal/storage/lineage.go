@@ -24,11 +24,11 @@ type FilenameSet struct {
 
 // Lineage represents a managed cert at a specific archive version.
 type Lineage struct {
-	CertName   string
-	ConfigDir  string
-	Version    int // 1-based version number
-	Archive    FilenameSet
-	Live       FilenameSet
+	CertName  string
+	ConfigDir string
+	Version   int // 1-based version number
+	Archive   FilenameSet
+	Live      FilenameSet
 }
 
 // LiveDir returns <config_dir>/live/<certname>.

@@ -20,7 +20,7 @@ func TestRewritePortIPv6(t *testing.T) {
 		{"1.2.3.4:80", "1.2.3.4:443"},
 		{"[::1]:80", "[::1]:443"},
 		{`"[::1]:80"`, `"[::1]:443"`},
-		{"*", "*"},                             // no port, unchanged
+		{"*", "*"}, // no port, unchanged
 		{"unix:/var/run/apache.sock", "unix:/var/run/apache.sock"}, // no port suffix
 	}
 	for _, tc := range cases {

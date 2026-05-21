@@ -30,7 +30,7 @@ func (c *Config) String() string {
 
 // Directive is a "name args;" entry.
 type Directive struct {
-	Whitespace string   // whitespace before Name
+	Whitespace string // whitespace before Name
 	Name       string
 	Args       []string // raw token values (quoted strings keep their quotes)
 	// Whether the directive was terminated with a semicolon. Always true for

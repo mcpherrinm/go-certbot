@@ -20,7 +20,7 @@ import (
 	"github.com/letsencrypt/go-certbot/internal/errorhandler"
 	"github.com/letsencrypt/go-certbot/internal/logfile"
 	"github.com/letsencrypt/go-certbot/internal/plugins"
-	"github.com/letsencrypt/go-certbot/internal/processlock"
+	"github.com/letsencrypt/go-certbot/internal/plugins/apache"
 	dnscloudflare "github.com/letsencrypt/go-certbot/internal/plugins/dns/cloudflare"
 	dnsdigitalocean "github.com/letsencrypt/go-certbot/internal/plugins/dns/digitalocean"
 	dnsdnsimple "github.com/letsencrypt/go-certbot/internal/plugins/dns/dnsimple"
@@ -34,11 +34,11 @@ import (
 	dnsrfc2136 "github.com/letsencrypt/go-certbot/internal/plugins/dns/rfc2136"
 	dnsroute53 "github.com/letsencrypt/go-certbot/internal/plugins/dns/route53"
 	dnssakuracloud "github.com/letsencrypt/go-certbot/internal/plugins/dns/sakuracloud"
-	"github.com/letsencrypt/go-certbot/internal/plugins/apache"
 	"github.com/letsencrypt/go-certbot/internal/plugins/manual"
 	"github.com/letsencrypt/go-certbot/internal/plugins/nginx"
 	"github.com/letsencrypt/go-certbot/internal/plugins/standalone"
 	"github.com/letsencrypt/go-certbot/internal/plugins/webroot"
+	"github.com/letsencrypt/go-certbot/internal/processlock"
 	"github.com/letsencrypt/go-certbot/internal/verbs"
 )
 
