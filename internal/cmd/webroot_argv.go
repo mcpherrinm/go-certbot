@@ -30,6 +30,13 @@ func buildWebrootMap(args []string) map[string]string {
 	)
 
 	add := func(domain, root string) {
+		// Match cli.normalizeDomains: lowercase + trim trailing dot so the
+		// map keys line up with cfg.Domains after parsing. Without this, an
+		// argv like `-d Example.com -w /var/www` produced map key
+		// "Example.com" while cfg.Domains held "example.com", and the
+		// webroot plugin failed lookup with "no webroot configured".
+		domain = strings.ToLower(strings.TrimSpace(domain))
+		domain = strings.TrimSuffix(domain, ".")
 		if domain == "" {
 			return
 		}

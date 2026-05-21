@@ -213,6 +213,12 @@ func registerFlags(fs *pflag.FlagSet, c *config.Config) {
 			c.WebrootMap = map[string]string{}
 		}
 		for k, v := range m {
+			// Lowercase the key so it matches normalized cfg.Domains.
+			k = strings.ToLower(strings.TrimSpace(k))
+			k = strings.TrimSuffix(k, ".")
+			if k == "" {
+				continue
+			}
 			c.WebrootMap[k] = v
 		}
 	})

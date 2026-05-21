@@ -43,6 +43,23 @@ const shortCertCutoff = 10 * 24 * time.Hour
 //   - renewal-hooks/{pre,post,deploy}/* dirs alongside the flag hooks,
 //     gated by --directory-hooks (default on)
 func Renew(ctx context.Context, cfg *config.Config, reg *plugins.Registry) error {
+	// Reject -d / --ip-address with `renew` (matches certbot renewal.py:641
+	// after #10225). The renew verb selects lineages by --cert-name only;
+	// users who want to renew by SAN should use `certonly`. --allow-subset-
+	// of-names is the documented escape hatch for partial renewal.
+	if !cfg.AllowSubsetOfNames {
+		if len(cfg.Domains) > 0 || len(cfg.IPAddresses) > 0 {
+			return fmt.Errorf(
+				"Currently, the renew verb is capable of either renewing all installed " +
+					"certificates that are due to be renewed or renewing a single " +
+					"certificate specified by its name using the --cert-name option " +
+					"(-d, --domain, and --ip-address are not valid options for the renew " +
+					"subcommand). If you would like to renew specific certificates by " +
+					"their identifiers, use the certonly command instead. The renew verb " +
+					"may provide other options for selecting certificates to renew in the " +
+					"future.")
+		}
+	}
 	dir := cfg.RenewalConfigsDir()
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -234,7 +251,20 @@ func renewOne(ctx context.Context, cli *config.Config, reg *plugins.Registry, co
 	//     b68268744. The dry-run path also doesn't need ARI because it isn't
 	//     going to write a new lineage anyway.
 	if !cli.ForceRenewal && !cli.DryRun && expiresAt.After(time.Now()) {
-		if dueAt, err := ariDecision(ctx, &merged, conf, confPath, leafPath); err == nil && dueAt != nil && dueAt.After(time.Now()) {
+		dueAt, err := ariDecision(ctx, &merged, conf, confPath, leafPath)
+		if err != nil {
+			// certbot 1f128b0e0 broadly catches ARI errors and prints a
+			// user-visible warning; the renewal then falls back to the
+			// NotAfter-based renew_before_expiry check. Mirror the warning
+			// wording verbatim so users (and grep-based tooling) see the
+			// same message they'd see under certbot.
+			fmt.Fprintln(os.Stderr,
+				"An error occurred requesting ACME Renewal Information (ARI). "+
+					"If this problem persists and you think it's a bug in Certbot, "+
+					"please open an issue at "+
+					"https://github.com/certbot/certbot/issues/new/choose.")
+			slog.Debug("ARI fetch error", "err", err)
+		} else if dueAt != nil && dueAt.After(time.Now()) {
 			fmt.Printf("ARI says wait until %s; skipping renewal.\n", dueAt.Format(time.RFC3339))
 			return renewOutcome{kind: outcomeSkipped, sans: append([]string(nil), merged.Domains...)}, nil
 		}
@@ -434,6 +464,13 @@ func mergeFromRenewalConf(cfg *config.Config, conf *renewalconf.File) {
 		if m := conf.NestedMap("webroot_map"); len(m) > 0 && len(cfg.WebrootMap) == 0 {
 			cfg.WebrootMap = map[string]string{}
 			for k, v := range m {
+				// Match cli normalization on read — older confs may have
+				// mixed-case keys but plugin lookup uses lowercased domains.
+				k = strings.ToLower(strings.TrimSpace(k))
+				k = strings.TrimSuffix(k, ".")
+				if k == "" {
+					continue
+				}
 				cfg.WebrootMap[k] = v
 			}
 		}

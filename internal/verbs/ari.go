@@ -5,6 +5,7 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"time"
@@ -36,6 +37,20 @@ func ariDecision(ctx context.Context, cfg *config.Config, conf *renewalconf.File
 		due := *cached
 		return &due, nil
 	}
+	// ARI must be addressed to the CA that issued this cert. If the lineage
+	// has no `server` field (lineages created before --server was persisted),
+	// certbot 1f128b0e0 explicitly skips ARI rather than falling back to the
+	// CLI --server, since the CLI server may be e.g. staging and would return
+	// "no info for serial". Print the same warning certbot does, naming the
+	// renewal conf so the user can fix it manually.
+	server := conf.RenewalParams["server"]
+	if server == "" {
+		fmt.Fprintf(os.Stderr,
+			"Skipping ARI check because %s has no 'server' field. "+
+				"This issue will not prevent certificate renewal\n",
+			confPath)
+		return nil, nil
+	}
 	b, err := os.ReadFile(leafPath)
 	if err != nil {
 		return nil, err
@@ -47,12 +62,6 @@ func ariDecision(ctx context.Context, cfg *config.Config, conf *renewalconf.File
 	leaf, err := x509.ParseCertificate(block.Bytes)
 	if err != nil {
 		return nil, err
-	}
-	// Force the ACME directory URL to the lineage's server even if --server
-	// was user-set, so ARI hits the CA that issued the cert.
-	server := conf.RenewalParams["server"]
-	if server == "" {
-		server = cfg.EffectiveServer()
 	}
 	ariCfg := *cfg
 	ariCfg.Server = server
