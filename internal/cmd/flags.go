@@ -325,6 +325,18 @@ func registerFlags(fs *pflag.FlagSet, c *config.Config) {
 	// certonly --csr destinations Certbot uses these chain variants.
 	fs.StringVar(&c.AuthChainPath, "chain-path", c.AuthChainPath, "Where to write the issuer chain when using --csr.")
 	fs.StringVar(&c.FullchainPath, "fullchain-path", c.FullchainPath, "Where to write the full chain when using --csr.")
+	// Under certonly --csr, --cert-path is the OUTPUT path (default
+	// ./cert.pem), not the input. Certbot's paths_parser.py:20-27
+	// binds --cert-path to `auth_cert_path` when verb=certonly. We
+	// route here in a PostParseHook so the same flag works for
+	// revoke/install (input) and certonly --csr (output) without
+	// requiring callers to know about both fields.
+	c.PostParseHooks = append(c.PostParseHooks, func() {
+		if c.Verb == "certonly" && c.CSR.Path != "" && c.SetByUser("cert-path") {
+			c.AuthCertPath = c.CertPath
+			c.CertPath = ""
+		}
+	})
 
 	// Hooks
 	fs.StringVar(&c.PreHook, "pre-hook", c.PreHook, "Command to run before challenge.")

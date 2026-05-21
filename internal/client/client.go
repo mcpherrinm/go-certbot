@@ -15,6 +15,7 @@ import (
 	"net"
 	"os"
 	"runtime"
+	"strings"
 	"time"
 
 	"github.com/go-acme/lego/v5/acme"
@@ -124,7 +125,11 @@ func (c *Client) EnsureRegistered(ctx context.Context, accountStorage *account.F
 	}
 	c.account.Registration.URI = reg.Location
 	if c.cfg.Email != "" {
-		c.account.Contact = []string{"mailto:" + c.cfg.Email}
+		// Certbot accepts comma-separated emails on --email and emits
+		// one `mailto:` contact per address. Pre-fix the entire string
+		// was crammed into a single mailto, producing an invalid URI
+		// like `mailto:a@b.org,c@d.org`.
+		c.account.Contact = emailsToContacts(c.cfg.Email)
 	}
 	c.account.Meta.CreationDT.Time = time.Now().UTC().Round(time.Second)
 	if h, err := os.Hostname(); err == nil {
@@ -308,6 +313,29 @@ func certKeyType(cfg *config.Config) (certcrypto.KeyType, error) {
 		return "", fmt.Errorf("client: unsupported elliptic_curve %q (supported: secp256r1, secp384r1, secp521r1)", cfg.EllipticCurve)
 	}
 	return "", fmt.Errorf("client: unsupported key_type %q (supported: rsa, ecdsa)", cfg.KeyType)
+}
+
+// emailsToContacts splits a possibly-comma-separated email value into one
+// mailto: URI per address. Empty entries (e.g. trailing commas) and
+// whitespace-only entries are dropped. Mirrors certbot's
+// _internal/cli/cli_utils.py:_DomainsAction-style trimming plus
+// certbot.client.Client.register's split-by-comma behavior.
+func emailsToContacts(raw string) []string {
+	if raw == "" {
+		return nil
+	}
+	var out []string
+	for _, part := range strings.Split(raw, ",") {
+		p := strings.TrimSpace(part)
+		if p == "" {
+			continue
+		}
+		out = append(out, "mailto:"+p)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // toPKCS8 rewraps a PEM-encoded private key into a PKCS#8 `PRIVATE KEY`
