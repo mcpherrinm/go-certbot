@@ -411,6 +411,12 @@ func registerFlags(fs *pflag.FlagSet, c *config.Config) {
 		if c.ForceInteractive && c.NonInteractive {
 			fail("Flag for non-interactive mode and --force-interactive conflict")
 		}
+		// --force-interactive forbidden with `renew` (helpful.py:284-285).
+		// renew is always batch and cannot be interactive — pre-fix we
+		// silently accepted the combination and ignored the flag.
+		if c.ForceInteractive && c.Verb == "renew" {
+			fail("--force-interactive cannot be used with renew")
+		}
 		// --hsts + --auto-hsts  (helpful.py:306-308)
 		if c.HSTS && c.AutoHSTS {
 			fail("Parameters --hsts and --auto-hsts cannot be used simultaneously.")
