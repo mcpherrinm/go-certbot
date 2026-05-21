@@ -10,9 +10,11 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/spf13/pflag"
 
+	"github.com/letsencrypt/go-certbot/internal/checkpoint"
 	"github.com/letsencrypt/go-certbot/internal/config"
 	"github.com/letsencrypt/go-certbot/internal/logfile"
 	"github.com/letsencrypt/go-certbot/internal/plugins"
@@ -44,7 +46,7 @@ func Main(args []string) int {
 	// `--version` always prints and exits.
 	for _, a := range args {
 		if a == "--version" {
-			fmt.Println("go-certbot 1.2.0")
+			fmt.Println("go-certbot 1.3.0")
 			return 0
 		}
 	}
@@ -158,6 +160,26 @@ func Main(args []string) int {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
+	// Background goroutine: when ctx is cancelled (SIGINT/SIGTERM),
+	// restore any in-flight checkpoint and print Certbot's exit message.
+	// Mirrors certbot._internal.log.exit_with_advice (log.py:362-364).
+	sigDone := make(chan struct{})
+	go func() {
+		<-ctx.Done()
+		if err := checkpoint.RestoreInFlight(); err == nil {
+			fmt.Fprintln(os.Stderr, "Exiting due to user request.")
+		} else {
+			fmt.Fprintln(os.Stderr, "Exiting due to user request (warning: in-flight checkpoint rollback failed:", err, ")")
+		}
+		close(sigDone)
+		// Give the active handler a moment to wrap up, then force-exit
+		// so we don't hang on a misbehaving plugin.
+		go func() {
+			time.Sleep(5 * time.Second)
+			os.Exit(130)
+		}()
+	}()
+
 	handler := dispatch(verb)
 	if handler == nil {
 		fmt.Fprintf(os.Stderr, "go-certbot: unknown subcommand %q\n", verb)
@@ -165,6 +187,13 @@ func Main(args []string) int {
 		return 2
 	}
 	if err := handler(ctx, cfg, reg); err != nil {
+		// If we exited because of a signal, the message has already
+		// been printed by the goroutine above.
+		select {
+		case <-sigDone:
+			return 130
+		default:
+		}
 		fmt.Fprintln(os.Stderr, "go-certbot:", err)
 		return 1
 	}

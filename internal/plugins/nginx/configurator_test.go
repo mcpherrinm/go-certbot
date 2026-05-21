@@ -101,10 +101,13 @@ func TestAddRedirectIfHTTPOnly(t *testing.T) {
 `
 	cfg := parseOrFatal(t, src)
 	srv := cfg.Nodes[0].(*parser.Block)
-	addRedirectIfHTTPOnly(srv)
+	addRedirectIfHTTPOnly(srv, []string{"example.com"})
 	out := cfg.String()
 	if !strings.Contains(out, "return 301 https://$host$request_uri") {
 		t.Errorf("redirect not added:\n%s", out)
+	}
+	if !strings.Contains(out, "if ($host = example.com)") {
+		t.Errorf("expected per-host `if` guard:\n%s", out)
 	}
 }
 
@@ -116,7 +119,7 @@ func TestAddRedirectSkipsHTTPSServer(t *testing.T) {
 `
 	cfg := parseOrFatal(t, src)
 	srv := cfg.Nodes[0].(*parser.Block)
-	addRedirectIfHTTPOnly(srv)
+	addRedirectIfHTTPOnly(srv, []string{"example.com"})
 	out := cfg.String()
 	if strings.Contains(out, "return 301") {
 		t.Errorf("should not add redirect to https-only server:\n%s", out)
