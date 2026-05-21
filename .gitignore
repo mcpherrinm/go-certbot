@@ -11,9 +11,7 @@
 *.out
 coverage.*
 
-# Go workspace / build
-/vendor/
-!/vendor/certbot/
+# Go workspace / build (vendor/certbot is a tracked submodule)
 go.work
 go.work.sum
 
